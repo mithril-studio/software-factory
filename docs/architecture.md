@@ -20,9 +20,12 @@ once it has earned an independent release cycle — build it working first, frag
 |---|---|---|---|
 | `control/` | Control plane | Watch issues, fork VMs, dispatch agents, reap, serve the UI | No |
 | `telemetry/` | Trace | Ingest OTLP, normalize, store runs and token usage | No |
-| `skills/` | Agent capability | Skills the in-VM agent loads (memory) | No |
 
 `control/` rather than `exec/`: `exec` is a Python keyword and cannot name a package.
+
+Skills are **not** a folder here. They live in [agent-skills](https://github.com/mithril-studio/agent-skills) because they
+ship into the VM rather than onto the server — they are the agent's code, installed when a
+golden is built, and are reused by agents that have nothing to do with this project.
 
 Nothing in this system calls a model except the agent running inside a boxd VM. This is the
 **passive-layer principle**: the tools read and write, the caller has the intelligence.
@@ -77,7 +80,7 @@ model-agnostic.
 
 ### §3.3 The memory record schema
 
-Defined in `skills/memory/SKILL.md` §3. The agent appends records to `.mem/domains/*.jsonl`
+Defined by the `memory` skill in [agent-skills](https://github.com/mithril-studio/agent-skills) §3. The agent appends records to `.mem/domains/*.jsonl`
 **in the target repo**, and they ship inside the pull request. No service reads or writes
 memory — it travels with the code, and it is reviewed like code.
 
@@ -100,7 +103,7 @@ Revised from layer-by-layer to a vertical slice: build the thinnest path from is
 first, then thicken it. Layer-by-layer means the system only works at the very end, which is
 the big-bang shape that killed the first attempt.
 
-1. **`skills/memory`** — a markdown file. Complete.
+1. **`memory` skill** — a markdown file, now in its own repo. Complete.
 2. **`control`** — fork, dispatch, collect, reap, plus a UI to watch it. **Done.**
 3. **Golden VM + first real run** — the highest-risk unknown: does an agent in a fork
    actually take an issue and open a PR?

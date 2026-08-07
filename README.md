@@ -22,12 +22,16 @@ out once it has earned its own release cycle — not before.
 | Folder | Layer | State |
 |---|---|---|
 | `control/` | Control plane: watch issues, fork VMs, dispatch agents, reap, and the UI | **working** |
-| `skills/` | Skills the in-VM agent loads | `memory` complete |
 | `telemetry/` | Trace layer: OTLP ingest, normalized usage | spec only |
 | `docs/` | Architecture and the contracts between layers | — |
 
 The folder is `control/` rather than `exec/` because `exec` is a Python keyword and cannot
 be an importable package name.
+
+Skills the agent uses live in a separate repo,
+[mithril-studio/agent-skills](https://github.com/mithril-studio/agent-skills). They ship
+**into the VM**, not onto the server — the agent's code, not the factory's — so they are
+installed when a golden is built rather than deployed with the control plane.
 
 ## Quickstart
 
@@ -61,7 +65,11 @@ Every run forks one long-lived machine. It must have:
 - `claude` authenticated (inherited by every fork — this credential expires, so re-auth and
   re-snapshot on a schedule)
 - `gh` authenticated with push access to the repo
-- `skills/memory/` installed at `~/.claude/skills/memory/`
+- skills installed from [agent-skills](https://github.com/mithril-studio/agent-skills):
+  ```bash
+  git clone --depth 1 https://github.com/mithril-studio/agent-skills /tmp/agent-skills \
+    && /tmp/agent-skills/install.sh
+  ```
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
@@ -92,4 +100,4 @@ Named so they stay unbuilt until something proves they are needed:
 - `docs/architecture.md` — layers, topology, and the contracts between them
 - `control/README.md` — control plane design notes
 - `telemetry/README.md` — trace layer spec
-- `skills/README.md` — why memory is a skill and not a service
+- [agent-skills](https://github.com/mithril-studio/agent-skills) — the skills the in-VM agent loads

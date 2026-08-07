@@ -53,8 +53,8 @@ would otherwise be stdout parsing against a binary that auto-updates underneath 
 
 ### §2.1 Machines
 
-- **One golden per project.** Dependencies pre-installed, skills installed at
-  `~/.claude/skills/`, agent authenticated. Forked per task, never worked in directly.
+- **One golden per project.** Dependencies pre-installed, agent authenticated, skills
+  installed from [agent-skills](https://github.com/mithril-studio/agent-skills). Forked per task, never worked in directly.
 - **No warm pool.** Forks are ~0.2s. Provision on demand.
 - **`auto-suspend.timeout = 0` on every fork.** The default suspends after 30s without
   inbound TCP, and clocks freeze while suspended. A long build or test run with no network
