@@ -1,8 +1,9 @@
-"""FastAPI app: the UI and the API are the same process.
+"""FastAPI app: a JSON API plus the built React UI, served from one process.
 
-Server-rendered HTML, plain fetch for polling, Server-Sent Events for live agent output.
-No build step, no frontend dependency, no separate deploy — and every endpoint that renders
-a page also answers JSON for scripting.
+The API is the contract; the UI in `web/` is a Vite/React/Tailwind/shadcn SPA that consumes
+it and builds to `web/dist`. In production FastAPI serves those static assets and falls back
+to `index.html` for client-side routes. In development, run `vite dev` (it proxies `/api` and
+`/healthz` back here) so the SPA hot-reloads against this same process.
 """
 
 from __future__ import annotations
@@ -12,14 +13,15 @@ import contextlib
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import db, github, poller, runner
-from .config import settings
+from .config import ROOT, settings
 
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+DIST = ROOT / "web" / "dist"
 
 
 @contextlib.asynccontextmanager
@@ -35,127 +37,65 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="software factory", lifespan=lifespan)
 
 
-def _duration(run: dict) -> str:
-    import datetime as dt
-
-    start, end = run.get("started_at"), run.get("finished_at")
-    if not start:
-        return "—"
-    try:
-        begin = dt.datetime.fromisoformat(start)
-        stop = dt.datetime.fromisoformat(end) if end else dt.datetime.now(dt.timezone.utc)
-        total = int((stop - begin).total_seconds())
-    except (TypeError, ValueError):
-        return "—"
-    return f"{total // 60}m {total % 60}s" if total >= 60 else f"{total}s"
+# --------------------------------------------------------------------------- config
 
 
-templates.env.filters["duration"] = _duration
+@app.get("/api/config")
+async def api_config():
+    """What the shell needs: watched repos, the golden, limits, and any missing settings."""
+    return {
+        "repos": list(settings.repos),
+        "golden": settings.golden,
+        "max_concurrent": settings.max_concurrent,
+        "max_attempts": settings.max_attempts,
+        "poll_enabled": settings.poll_enabled,
+        "poll_interval": settings.poll_interval,
+        "missing": settings.missing(),
+    }
 
 
-# --------------------------------------------------------------------------- pages
+# --------------------------------------------------------------------------- runs
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    runs = await db.list_runs()
-    return templates.TemplateResponse(
-        request,
-        "runs.html",
-        {
-            "runs": runs,
-            "missing": settings.missing(),
-            "golden": settings.golden,
-            "active": sum(1 for r in runs if r["status"] not in db.TERMINAL),
-            "max_concurrent": settings.max_concurrent,
-            "watching": settings.repos if settings.poll_enabled else (),
-            "poll_interval": settings.poll_interval,
-        },
-    )
+@app.get("/api/runs")
+async def api_runs():
+    return await db.list_runs()
 
 
-@app.get("/runs/{run_id}", response_class=HTMLResponse)
-async def run_detail(request: Request, run_id: str):
+@app.get("/api/runs/{run_id}")
+async def api_run(run_id: str):
     run = await db.get_run(run_id)
     if not run:
         raise HTTPException(404, "no such run")
-    return templates.TemplateResponse(
-        request,
-        "run.html",
-        {
-            "run": run})
+    return run
 
 
-@app.get("/runs/{run_id}/card", response_class=HTMLResponse)
-async def run_card(request: Request, run_id: str):
-    """The run detail page polls this for status without disturbing the log stream."""
-    run = await db.get_run(run_id)
-    if not run:
-        raise HTTPException(404, "no such run")
-    return templates.TemplateResponse(
-        request,
-        "_card.html",
-        {
-            "run": run})
+class StartRun(BaseModel):
+    repo: str
+    issue_number: int
+    golden: str | None = None
 
 
-@app.get("/machines", response_class=HTMLResponse)
-async def machines_page(request: Request):
-    boxd = runner.client()
-    try:
-        machines = await boxd.machines.list()
-    finally:
-        await boxd.close()
-    active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
-    rows = [
-        {
-            "name": m.name,
-            "status": m.status,
-            "is_run": m.name.startswith("run-"),
-            "orphan": m.name.startswith("run-") and m.name not in active,
-        }
-        for m in machines
-    ]
-    return templates.TemplateResponse(
-        request,
-        "machines.html",
-        {
-            "machines": rows, "quota": len(rows)}
-    )
-
-
-# --------------------------------------------------------------------------- actions
-
-
-@app.post("/runs")
-async def start_run(repo: str = Form(...), issue_number: int = Form(...)):
+@app.post("/api/runs")
+async def api_start_run(body: StartRun):
     gaps = settings.missing()
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
     try:
-        run_id = await runner.create(repo.strip(), issue_number)
+        run_id = await runner.create(body.repo.strip(), body.issue_number, golden=body.golden)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not start run: {exc}") from exc
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+    return {"run_id": run_id}
 
 
-@app.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str):
-    await runner.cancel(run_id)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+@app.post("/api/runs/{run_id}/cancel")
+async def api_cancel_run(run_id: str):
+    return {"ok": await runner.cancel(run_id)}
 
 
-@app.post("/reconcile")
-async def do_reconcile():
-    return JSONResponse(await runner.reconcile())
-
-
-# --------------------------------------------------------------------------- streams
-
-
-@app.get("/runs/{run_id}/stream")
+@app.get("/api/runs/{run_id}/stream")
 async def stream_log(run_id: str):
-    """Tail the run log over SSE until the run reaches a terminal state."""
+    """Tail a run's log over SSE until it reaches a terminal state."""
     run = await db.get_run(run_id)
     if not run:
         raise HTTPException(404, "no such run")
@@ -189,31 +129,115 @@ async def stream_log(run_id: str):
     )
 
 
-# --------------------------------------------------------------------------- json api
-
-
-@app.get("/api/runs")
-async def api_runs():
-    return await db.list_runs()
-
-
-@app.get("/api/runs/{run_id}")
-async def api_run(run_id: str):
-    run = await db.get_run(run_id)
-    if not run:
-        raise HTTPException(404, "no such run")
-    return run
+# --------------------------------------------------------------------------- plan / projects
 
 
 @app.get("/api/issues")
 async def api_issues(repo: str):
-    """Backs the issue picker in the new-run form."""
+    """Open issues for the new-run picker."""
     try:
         return await github.list_open_issues(repo)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.get("/api/plan")
+async def api_plan(repo: str | None = None):
+    """The work queue: open issues with their factory state.
+
+    One repo if `repo` is given, otherwise every watched repo, concatenated.
+    """
+    repos = [repo] if repo else list(settings.repos)
+    out: list[dict] = []
+    for r in repos:
+        try:
+            out.extend(await github.plan(r))
+        except Exception as exc:  # noqa: BLE001 - one bad repo shouldn't blank the page
+            out.append(
+                {
+                    "repo": r,
+                    "number": 0,
+                    "title": f"(could not load: {exc})",
+                    "url": "",
+                    "state": "error",
+                    "labels": [],
+                }
+            )
+    return out
+
+
+@app.get("/api/projects")
+async def api_projects():
+    """Watched repos with their run tallies."""
+    stats = await db.stats_by_repo()
+    out = []
+    for repo in settings.repos:
+        s = stats.get(repo, {})
+        out.append(
+            {
+                "repo": repo,
+                "runs": s.get("runs", 0) or 0,
+                "succeeded": s.get("succeeded", 0) or 0,
+                "failed": s.get("failed", 0) or 0,
+                "active": s.get("active", 0) or 0,
+                "last_run": s.get("last_run"),
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------- agents / fleet
+
+
+@app.get("/api/agents")
+async def api_agents():
+    """Boxd machines: the golden(s) runs fork from, and any live run VMs."""
+    boxd = runner.client()
+    try:
+        machines = await boxd.machines.list()
+    finally:
+        await boxd.close()
+    active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
+    out = []
+    for m in machines:
+        is_run = m.name.startswith("run-")
+        out.append(
+            {
+                "name": m.name,
+                "status": getattr(m, "status", None),
+                "role": "run" if is_run else "golden",
+                "is_golden": m.name == settings.golden,
+                "orphan": is_run and m.name not in active,
+            }
+        )
+    out.sort(key=lambda a: (a["role"] != "golden", a["name"]))
+    return out
+
+
+@app.post("/api/reconcile")
+async def api_reconcile():
+    return JSONResponse(await runner.reconcile())
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "configured": not settings.missing()}
+
+
+# --------------------------------------------------------------------------- static SPA
+
+# Mount built assets, then fall back to index.html for client-side routes. Registered last so
+# it never shadows an /api route. If the app hasn't been built, say so instead of 404ing.
+if (DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(DIST / "assets")), name="assets")
+
+
+@app.get("/{full_path:path}")
+async def spa(full_path: str):
+    index = DIST / "index.html"
+    if index.exists():
+        return FileResponse(index)
+    return JSONResponse(
+        {"detail": "UI not built. Run `npm --prefix web install && npm --prefix web run build`."},
+        status_code=503,
+    )

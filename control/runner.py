@@ -17,6 +17,10 @@ from boxd import AsyncBoxd
 from . import db, github
 from .config import settings
 
+# The coding agent that runs inside the VM. A constant for now — there is exactly one. It
+# becomes meaningful once a review/PR agent joins and runs need to say which one produced them.
+AGENT = "claude-code"
+
 # Run ids of in-flight runs -> their asyncio task, so the UI can cancel them.
 _tasks: dict[str, asyncio.Task] = {}
 _semaphore: asyncio.Semaphore | None = None
@@ -334,6 +338,7 @@ async def create(
         golden=golden or settings.golden,
         status="queued",
         attempt=attempt,
+        agent=AGENT,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
@@ -430,11 +435,17 @@ async def _execute(
                 f"run.id={run_id},issue={repo}#{issue['number']},repo={repo},vm={machine.name}"
             ),
         }
-        exit_code = await asyncio.wait_for(
+        exit_code, usage = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log), timeout=settings.run_timeout
         )
         log.write(f"[factory] agent exited {exit_code}")
-        await db.update_run(run_id, exit_code=exit_code)
+        await db.update_run(
+            run_id,
+            exit_code=exit_code,
+            tokens_in=usage.get("tokens_in"),
+            tokens_out=usage.get("tokens_out"),
+            cost_usd=usage.get("cost_usd"),
+        )
 
         # ---- collect
         pr_url = await github.find_pr(repo, branch)
@@ -469,9 +480,14 @@ async def _execute(
         await boxd.close()
 
 
-async def _stream(boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog) -> int:
-    """Run the agent, formatting its event stream into the log as it arrives."""
+async def _stream(boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog) -> tuple[int, dict]:
+    """Run the agent, formatting its event stream into the log as it arrives.
+
+    Returns the exit code and the usage captured from the final `result` event
+    (input/output tokens and cost), which is what the Runs UI shows as the run's cost.
+    """
     buffer = ""
+    usage: dict = {}
     async with boxd.machines.stream_exec(
         machine_id, command=VM_SCRIPT, env=env, close_stdin=True
     ) as stream:
@@ -490,16 +506,25 @@ async def _stream(boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog) -> i
                     continue
                 if line.startswith("{"):
                     try:
-                        for formatted in format_event(json.loads(line)):
-                            log.write(formatted)
-                        continue
+                        event = json.loads(line)
                     except json.JSONDecodeError:
-                        pass
+                        log.write(line)
+                        continue
+                    if event.get("type") == "result":
+                        u = event.get("usage", {}) or {}
+                        usage = {
+                            "tokens_in": u.get("input_tokens"),
+                            "tokens_out": u.get("output_tokens"),
+                            "cost_usd": event.get("total_cost_usd"),
+                        }
+                    for formatted in format_event(event):
+                        log.write(formatted)
+                    continue
                 log.write(line)
         code = stream.exit_code
         if inspect.isawaitable(code):
             code = await code
-    return int(code or 0)
+    return int(code or 0), usage
 
 
 async def _salvage_transcript(boxd: AsyncBoxd, machine_id: str, run_id: str, log: RunLog) -> None:

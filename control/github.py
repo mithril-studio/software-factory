@@ -119,6 +119,51 @@ async def list_issues_with_label(repo: str, label: str, limit: int = 100) -> lis
     return sorted(issues, key=lambda i: i["number"])
 
 
+def _factory_state(labels: list[str]) -> str:
+    """The factory lifecycle state for an issue, read off its labels. 'none' if untracked."""
+    for label, state in (
+        (LABEL_RUNNING, "running"),
+        (LABEL_QUEUED, "queued"),
+        (LABEL_BLOCKED, "blocked"),
+        (LABEL_FAILED, "failed"),
+        (LABEL_DONE, "done"),
+    ):
+        if label in labels:
+            return state
+    return "none"
+
+
+async def plan(repo: str, limit: int = 100) -> list[dict]:
+    """Open issues for a repo with their factory state — the Plan (work queue) view.
+
+    Lowest number first, since that is the order the poller works through them.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/issues",
+            headers=_headers(),
+            params={"state": "open", "per_page": limit, "sort": "created", "direction": "asc"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    issues = []
+    for i in data:
+        if "pull_request" in i:
+            continue
+        labels = [label["name"] for label in i.get("labels", [])]
+        issues.append(
+            {
+                "repo": repo,
+                "number": i["number"],
+                "title": i.get("title") or "",
+                "url": i.get("html_url") or "",
+                "state": _factory_state(labels),
+                "labels": [label for label in labels if not label.startswith("agent:")],
+            }
+        )
+    return sorted(issues, key=lambda i: i["number"])
+
+
 async def add_labels(repo: str, number: int, labels: list[str]) -> None:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(

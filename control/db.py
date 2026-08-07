@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS runs (
     log_path        TEXT,
     transcript_path TEXT,
     attempt         INTEGER NOT NULL DEFAULT 1,
+    agent           TEXT,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER,
+    cost_usd        REAL,
     created_at      TEXT NOT NULL,
     started_at      TEXT,
     finished_at     TEXT
@@ -44,6 +48,10 @@ CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 # startup and the "duplicate column" error on an already-migrated database is ignored.
 MIGRATIONS = (
     "ALTER TABLE runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE runs ADD COLUMN agent TEXT",
+    "ALTER TABLE runs ADD COLUMN tokens_in INTEGER",
+    "ALTER TABLE runs ADD COLUMN tokens_out INTEGER",
+    "ALTER TABLE runs ADD COLUMN cost_usd REAL",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -132,6 +140,26 @@ async def has_active_run(repo: str) -> bool:
             (repo, *TERMINAL),
         ) as cur:
             return await cur.fetchone() is not None
+
+
+async def stats_by_repo() -> dict[str, dict]:
+    """Per-repo run tallies for the Projects page. Keyed by repo."""
+    marks = ", ".join("?" for _ in TERMINAL)
+    async with connect() as conn:
+        async with conn.execute(
+            f"""
+            SELECT repo,
+                   COUNT(*)                                        AS runs,
+                   SUM(status = 'succeeded')                       AS succeeded,
+                   SUM(status = 'failed')                          AS failed,
+                   SUM(status NOT IN ({marks}))                    AS active,
+                   MAX(created_at)                                 AS last_run
+            FROM runs GROUP BY repo
+            """,
+            TERMINAL,
+        ) as cur:
+            rows = await cur.fetchall()
+    return {r["repo"]: dict(r) for r in rows}
 
 
 async def active_runs() -> list[dict]:

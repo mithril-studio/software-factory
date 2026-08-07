@@ -37,12 +37,20 @@ installed when a golden is built rather than deployed with the control plane.
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python -e .
-cp .env.example .env          # fill in BOXD_API_KEY and FACTORY_GOLDEN
+cp .env.example .env               # fill in BOXD_API_KEY and FACTORY_GOLDEN
+npm --prefix web install && npm --prefix web run build   # build the UI once
 .venv/bin/uvicorn control.app:app --port 8765 --reload
 ```
 
 Then open <http://localhost:8765>. `GITHUB_TOKEN` is optional locally — it falls back to
 `gh auth token`.
+
+For UI work, run the Vite dev server alongside uvicorn so the SPA hot-reloads (it proxies
+`/api` back to :8765):
+
+```bash
+npm --prefix web run dev        # then open the URL Vite prints (:5173)
+```
 
 ## What a run does
 
@@ -75,12 +83,21 @@ Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials
 
 ## The UI
 
-- **Runs** — every run, its status, duration, and PR link. Start a run by picking a repo and
-  an issue.
-- **Run detail** — live agent output over SSE, with tool calls and errors highlighted. The
-  single biggest visibility win: a run that is silent for six minutes is otherwise
-  indistinguishable from one that has hung.
-- **Machines** — the boxd fleet, with orphaned run VMs flagged, and a reconcile button.
+A React + Tailwind + shadcn single-page app in `web/`, built to `web/dist` and served by
+FastAPI — one deployable, at the cost of a `vite build` step. It reads the JSON API under
+`/api`; the control plane holds no HTML.
+
+- **Runs** — every run: state, id, agent, project, duration, token spend, cost, PR link.
+  Start a run by repo + issue number.
+- **Run detail** — live agent output over SSE, tool calls and errors highlighted. The single
+  biggest visibility win: a run silent for six minutes is otherwise indistinguishable from
+  one that has hung.
+- **Plan** — open issues across watched repos with their factory state, in the order the
+  poller works them.
+- **Projects** — watched repos with run tallies.
+- **Agents** — the boxd fleet: the golden runs fork from, live run VMs, orphans flagged, with
+  a reconcile button.
+- **Telemetry** — placeholder until the telemetry layer lands.
 
 ## What V0 deliberately does not have
 
