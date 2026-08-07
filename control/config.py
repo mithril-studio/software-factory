@@ -44,6 +44,12 @@ def _github_token() -> str:
         return ""
 
 
+def _repos() -> tuple[str, ...]:
+    """Repos the poller watches, from a comma-separated FACTORY_REPOS."""
+    raw = os.environ.get("FACTORY_REPOS", "")
+    return tuple(r.strip() for r in raw.split(",") if r.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     boxd_api_key: str = os.environ.get("BOXD_API_KEY", "")
@@ -54,6 +60,12 @@ class Settings:
     run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "3600"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
     keep_failed: bool = os.environ.get("FACTORY_KEEP_FAILED", "0") == "1"
+    # Issue polling. The poller only runs if at least one repo is listed in FACTORY_REPOS.
+    repos: tuple[str, ...] = _repos()
+    poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
+    poll_interval: int = int(os.environ.get("FACTORY_POLL_INTERVAL", "30"))
+    # Public URL of this control plane, used only to link runs from issue comments.
+    base_url: str = os.environ.get("FACTORY_BASE_URL", "").rstrip("/")
     db_path: Path = ROOT / "var" / "factory.db"
     log_dir: Path = ROOT / "var" / "logs"
 

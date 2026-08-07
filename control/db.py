@@ -106,6 +106,22 @@ async def list_runs(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def has_active_run(repo: str) -> bool:
+    """True if `repo` already has a non-terminal run.
+
+    This is the dispatch guard. The poller checks it before claiming, so a repo runs one
+    issue at a time (lowest number first) and a slow label write can never cause a double
+    dispatch — the database, not the issue label, decides what is already in flight.
+    """
+    marks = ", ".join("?" for _ in TERMINAL)
+    async with connect() as conn:
+        async with conn.execute(
+            f"SELECT 1 FROM runs WHERE repo = ? AND status NOT IN ({marks}) LIMIT 1",
+            (repo, *TERMINAL),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
 async def active_runs() -> list[dict]:
     marks = ", ".join("?" for _ in TERMINAL)
     async with connect() as conn:

@@ -16,7 +16,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from . import db, github, runner
+from . import db, github, poller, runner
 from .config import settings
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -25,7 +25,11 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init()
-    yield
+    poller.start()
+    try:
+        yield
+    finally:
+        await poller.stop()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
@@ -64,6 +68,8 @@ async def index(request: Request):
             "golden": settings.golden,
             "active": sum(1 for r in runs if r["status"] not in db.TERMINAL),
             "max_concurrent": settings.max_concurrent,
+            "watching": settings.repos if settings.poll_enabled else (),
+            "poll_interval": settings.poll_interval,
         },
     )
 

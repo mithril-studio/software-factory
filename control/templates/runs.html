@@ -11,6 +11,14 @@
 
 <h1>Runs</h1>
 
+{% if watching %}
+<div class="dim" style="margin:-8px 0 18px; font-size:12.5px">
+  Watching for <span class="mono">agent:queued</span> issues in
+  {% for repo in watching %}<span class="mono">{{ repo }}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+  &middot; every {{ poll_interval }}s
+</div>
+{% endif %}
+
 <div class="panel pad" style="margin-bottom:26px">
   <form class="row" method="post" action="/runs">
     <input type="text" name="repo" id="repo" placeholder="owner/repo" required

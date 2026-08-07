@@ -64,6 +64,35 @@ what blocked you. A run that ends with no PR gives the human nothing to look at.
 """
 
 
+def _run_link(run_id: str) -> str | None:
+    return f"{settings.base_url}/runs/{run_id}" if settings.base_url else None
+
+
+async def _mirror_issue(
+    repo: str,
+    number: int,
+    add: str | None,
+    remove: list[str],
+    log: RunLog,
+    comment: str | None = None,
+) -> None:
+    """Reflect run state onto the issue as a label, optionally leaving a comment.
+
+    Labels mirror the runs table for humans reading GitHub; they are never read back as
+    truth. So this is best-effort by design — a GitHub hiccup is logged and swallowed, never
+    allowed to fail an otherwise good run.
+    """
+    try:
+        for label in remove:
+            await github.remove_label(repo, number, label)
+        if add:
+            await github.add_labels(repo, number, [add])
+        if comment:
+            await github.add_comment(repo, number, comment)
+    except Exception as exc:  # noqa: BLE001
+        log.write(f"[factory] issue update skipped: {exc!r}")
+
+
 def build_prompt(repo: str, issue: dict, branch: str, base: str) -> str:
     return PROMPT_TEMPLATE.format(
         repo=repo,
@@ -214,6 +243,14 @@ async def _guarded(run_id: str, repo: str, issue: dict, branch: str, golden: str
         await db.update_run(
             run_id, status="failed", error=str(exc)[:2000], finished_at=db.utcnow()
         )
+        await _mirror_issue(
+            repo,
+            issue["number"],
+            github.LABEL_FAILED,
+            [github.LABEL_RUNNING, github.LABEL_QUEUED],
+            log,
+            comment=f"Factory run failed before it could finish: {str(exc)[:300]}",
+        )
     finally:
         log.close()
 
@@ -223,9 +260,19 @@ async def _execute(
 ) -> None:
     boxd = client()
     machine = None
+    number = issue["number"]
     try:
         base = await github.default_branch(repo)
         prompt = build_prompt(repo, issue, branch, base)
+
+        # ---- claim: mirror the pickup onto the issue for anyone watching on GitHub
+        started = f"Factory run started on branch `{branch}`."
+        link = _run_link(run_id)
+        if link:
+            started += f"\n\nLive log: {link}"
+        await _mirror_issue(
+            repo, number, github.LABEL_RUNNING, [github.LABEL_QUEUED], log, comment=started
+        )
 
         # ---- fork
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
@@ -279,6 +326,18 @@ async def _execute(
             error=None if ok else f"exit {exit_code}, pr={'yes' if pr_url else 'no'}",
             finished_at=db.utcnow(),
         )
+
+        # ---- mirror the outcome onto the issue
+        if ok:
+            outcome = f"Factory run finished. Pull request: {pr_url}"
+            await _mirror_issue(
+                repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=outcome
+            )
+        else:
+            outcome = f"Factory run failed (exit {exit_code}, {'no ' if not pr_url else ''}pull request)."
+            await _mirror_issue(
+                repo, number, github.LABEL_FAILED, [github.LABEL_RUNNING], log, comment=outcome
+            )
 
         # ---- reap
         if ok or not settings.keep_failed:
