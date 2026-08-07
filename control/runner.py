@@ -93,8 +93,32 @@ async def _mirror_issue(
         log.write(f"[factory] issue update skipped: {exc!r}")
 
 
-def build_prompt(repo: str, issue: dict, branch: str, base: str) -> str:
-    return PROMPT_TEMPLATE.format(
+RETRY_TEMPLATE = """
+
+--- retry context ---
+This is attempt {attempt} of {max_attempts}. Earlier attempts on this issue failed
+({prior_error}). Below is the tail of the previous attempt's log. Read it, work out the root
+cause, and fix *that* — do not blindly repeat what failed.
+
+A previous attempt may already have pushed commits to {branch}. If a normal `git push` is
+rejected as non-fast-forward, reconcile and force-push with `git push --force-with-lease`.
+
+previous attempt log (tail):
+{prior_log}
+--- end retry context ---
+"""
+
+
+def build_prompt(
+    repo: str,
+    issue: dict,
+    branch: str,
+    base: str,
+    attempt: int = 1,
+    prior_error: str | None = None,
+    prior_log: str | None = None,
+) -> str:
+    prompt = PROMPT_TEMPLATE.format(
         repo=repo,
         number=issue["number"],
         title=issue["title"],
@@ -102,6 +126,25 @@ def build_prompt(repo: str, issue: dict, branch: str, base: str) -> str:
         branch=branch,
         base=base,
     )
+    if attempt > 1:
+        prompt += RETRY_TEMPLATE.format(
+            attempt=attempt,
+            max_attempts=settings.max_attempts,
+            prior_error=prior_error or "reason not captured",
+            prior_log=prior_log or "(previous log unavailable)",
+            branch=branch,
+        )
+    return prompt
+
+
+def _log_tail(run_id: str, max_chars: int = 4000) -> str:
+    """The tail of a run's log — the failure context handed to the next attempt."""
+    path = settings.log_dir / f"{run_id}.log"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(previous log unavailable)"
+    return text[-max_chars:]
 
 
 # The script the VM runs. Values arrive as environment variables so nothing needs shell
@@ -203,8 +246,79 @@ def format_event(event: dict) -> list[str]:
 # --------------------------------------------------------------------------- run
 
 
-async def create(repo: str, issue_number: int, golden: str | None = None) -> str:
-    """Register a run and schedule it. Returns the run id immediately."""
+async def _fail_run(
+    run_id: str,
+    repo: str,
+    issue: dict,
+    golden: str,
+    attempt: int,
+    reason: str,
+    log: RunLog,
+    pr_url: str | None = None,
+) -> None:
+    """Mark a run failed, then either schedule a retry or halt the issue.
+
+    Retry ceiling is `settings.max_attempts`. The retry is created *before* this run is
+    marked terminal, so the repo never looks idle to the poller in the gap — which would let
+    the next issue in the sequence jump the queue.
+    """
+    number = issue["number"]
+    scheduled = False
+    if attempt < settings.max_attempts:
+        try:
+            await create(
+                repo,
+                number,
+                golden=golden,
+                attempt=attempt + 1,
+                prior_error=reason,
+                prior_log=_log_tail(run_id),
+            )
+            scheduled = True
+        except Exception as exc:  # noqa: BLE001 - can't retry -> fall through and halt
+            log.write(f"[factory] could not schedule retry: {exc!r}")
+
+    await db.update_run(
+        run_id, status="failed", pr_url=pr_url, error=reason, finished_at=db.utcnow()
+    )
+
+    if scheduled:
+        nxt = attempt + 1
+        log.write(f"[factory] attempt {attempt} failed ({reason}); retry {nxt}/{settings.max_attempts} scheduled")
+        await _mirror_issue(
+            repo,
+            number,
+            None,
+            [],
+            log,
+            comment=f"Attempt {attempt} failed ({reason}). Retrying — attempt {nxt} of {settings.max_attempts}.",
+        )
+    else:
+        log.write(f"[factory] attempt {attempt} failed ({reason}); no retries left, halting")
+        await _mirror_issue(
+            repo,
+            number,
+            github.LABEL_FAILED,
+            [github.LABEL_RUNNING, github.LABEL_QUEUED],
+            log,
+            comment=f"Failed after {attempt} attempt(s) ({reason}). Halting — needs a human.",
+        )
+
+
+async def create(
+    repo: str,
+    issue_number: int,
+    golden: str | None = None,
+    attempt: int = 1,
+    prior_error: str | None = None,
+    prior_log: str | None = None,
+) -> str:
+    """Register a run and schedule it. Returns the run id immediately.
+
+    `attempt` > 1 marks a retry: the previous attempt's error and log tail are woven into
+    the prompt so the agent diagnoses the failure instead of repeating it. Retries reuse the
+    same branch, so the whole chain resolves into one pull request.
+    """
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     branch = f"factory/issue-{issue_number}"
@@ -219,54 +333,66 @@ async def create(repo: str, issue_number: int, golden: str | None = None) -> str
         branch=branch,
         golden=golden or settings.golden,
         status="queued",
+        attempt=attempt,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
-    task = asyncio.create_task(_guarded(run_id, repo, issue, branch, golden or settings.golden))
+    task = asyncio.create_task(
+        _guarded(run_id, repo, issue, branch, golden or settings.golden, attempt, prior_error, prior_log)
+    )
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
     return run_id
 
 
-async def _guarded(run_id: str, repo: str, issue: dict, branch: str, golden: str) -> None:
+async def _guarded(
+    run_id: str,
+    repo: str,
+    issue: dict,
+    branch: str,
+    golden: str,
+    attempt: int,
+    prior_error: str | None,
+    prior_log: str | None,
+) -> None:
     log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
     try:
         async with semaphore():
-            await _execute(run_id, repo, issue, branch, golden, log)
+            await _execute(run_id, repo, issue, branch, golden, log, attempt, prior_error, prior_log)
     except asyncio.CancelledError:
+        # A human stopped this run. Do not retry — cancellation is a decision, not a failure.
         log.write("[factory] run cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
         raise
     except Exception as exc:  # noqa: BLE001 - the UI is where failures get reported
         log.write(f"[factory] run failed: {exc!r}")
-        await db.update_run(
-            run_id, status="failed", error=str(exc)[:2000], finished_at=db.utcnow()
-        )
-        await _mirror_issue(
-            repo,
-            issue["number"],
-            github.LABEL_FAILED,
-            [github.LABEL_RUNNING, github.LABEL_QUEUED],
-            log,
-            comment=f"Factory run failed before it could finish: {str(exc)[:300]}",
-        )
+        await _fail_run(run_id, repo, issue, golden, attempt, f"crashed: {str(exc)[:200]}", log)
     finally:
         log.close()
 
 
 async def _execute(
-    run_id: str, repo: str, issue: dict, branch: str, golden: str, log: RunLog
+    run_id: str,
+    repo: str,
+    issue: dict,
+    branch: str,
+    golden: str,
+    log: RunLog,
+    attempt: int = 1,
+    prior_error: str | None = None,
+    prior_log: str | None = None,
 ) -> None:
     boxd = client()
     machine = None
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
-        prompt = build_prompt(repo, issue, branch, base)
+        prompt = build_prompt(repo, issue, branch, base, attempt, prior_error, prior_log)
 
         # ---- claim: mirror the pickup onto the issue for anyone watching on GitHub
-        started = f"Factory run started on branch `{branch}`."
+        which = f" (attempt {attempt} of {settings.max_attempts})" if attempt > 1 else ""
+        started = f"Factory run started on branch `{branch}`{which}."
         link = _run_link(run_id)
         if link:
             started += f"\n\nLive log: {link}"
@@ -319,25 +445,17 @@ async def _execute(
         await _salvage_transcript(boxd, machine.id, run_id, log)
 
         ok = exit_code == 0 and pr_url is not None
-        await db.update_run(
-            run_id,
-            status="succeeded" if ok else "failed",
-            pr_url=pr_url,
-            error=None if ok else f"exit {exit_code}, pr={'yes' if pr_url else 'no'}",
-            finished_at=db.utcnow(),
-        )
-
-        # ---- mirror the outcome onto the issue
         if ok:
+            await db.update_run(
+                run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
+            )
             outcome = f"Factory run finished. Pull request: {pr_url}"
             await _mirror_issue(
                 repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=outcome
             )
         else:
-            outcome = f"Factory run failed (exit {exit_code}, {'no ' if not pr_url else ''}pull request)."
-            await _mirror_issue(
-                repo, number, github.LABEL_FAILED, [github.LABEL_RUNNING], log, comment=outcome
-            )
+            reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
+            await _fail_run(run_id, repo, issue, golden, attempt, reason, log, pr_url=pr_url)
 
         # ---- reap
         if ok or not settings.keep_failed:

@@ -52,6 +52,7 @@
         <td class="mono">{{ run.repo }}</td>
         <td>
           <a href="/runs/{{ run.id }}">#{{ run.issue_number }}</a>
+          {% if run.attempt and run.attempt > 1 %}<span class="badge s-forking" title="retry">try {{ run.attempt }}</span>{% endif %}
           <span class="dim">{{ (run.issue_title or '')[:58] }}</span>
         </td>
         <td class="dim mono">{{ run | duration }}</td>

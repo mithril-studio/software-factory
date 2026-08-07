@@ -27,9 +27,16 @@ _task: asyncio.Task | None = None
 
 async def _poll_repo(repo: str) -> None:
     # One run per repo at a time. This is what makes a numbered issue list sequential:
-    # #2 does not start until #1 has reached a terminal state.
+    # #2 does not start until #1 has reached a terminal state (its retries included).
     if await db.has_active_run(repo):
         return
+    # A permanently-failed issue (out of retries, labelled agent:failed) blocks the ones
+    # after it in a sequential project. Stop dispatching this repo until a human clears it.
+    if settings.halt_on_failure:
+        failed = await github.list_issues_with_label(repo, github.LABEL_FAILED)
+        if failed:
+            log.info("%s halted: issue #%s failed, needs a human", repo, failed[0]["number"])
+            return
     issues = await github.list_issues_with_label(repo, github.LABEL_QUEUED)
     if not issues:
         return

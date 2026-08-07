@@ -60,6 +60,13 @@ class Settings:
     run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "3600"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
     keep_failed: bool = os.environ.get("FACTORY_KEEP_FAILED", "0") == "1"
+    # Retry a failed issue up to this many attempts total (1 = no retry). Each attempt is
+    # its own run, and the previous attempt's log is fed to the next as context.
+    max_attempts: int = int(os.environ.get("FACTORY_MAX_ATTEMPTS", "3"))
+    # In a sequential project a permanently-failed issue blocks the ones after it. When on,
+    # the poller stops dispatching a repo that has any open `agent:failed` issue until a
+    # human clears it. Turn off if a repo's issues are independent.
+    halt_on_failure: bool = os.environ.get("FACTORY_HALT_ON_FAILURE", "1") == "1"
     # Issue polling. The poller only runs if at least one repo is listed in FACTORY_REPOS.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"

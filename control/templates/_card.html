@@ -20,6 +20,10 @@
     <div class="mono">{{ run | duration }}</div>
   </div>
   <div>
+    <div class="k">Attempt</div>
+    <div class="mono">{{ run.attempt or 1 }}</div>
+  </div>
+  <div>
     <div class="k">Exit</div>
     <div class="mono">{{ run.exit_code if run.exit_code is not none else '—' }}</div>
   </div>

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS runs (
     error           TEXT,
     log_path        TEXT,
     transcript_path TEXT,
+    attempt         INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL,
     started_at      TEXT,
     finished_at     TEXT
@@ -38,6 +39,12 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_created_idx ON runs (created_at DESC);
 CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 """
+
+# Additive migrations for databases created before a column existed. Each is tried once at
+# startup and the "duplicate column" error on an already-migrated database is ignored.
+MIGRATIONS = (
+    "ALTER TABLE runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+)
 
 # Terminal states. Anything else means the run is still in flight.
 TERMINAL = ("succeeded", "failed", "cancelled")
@@ -68,6 +75,11 @@ async def connect() -> AsyncIterator[aiosqlite.Connection]:
 async def init() -> None:
     async with connect() as conn:
         await conn.executescript(SCHEMA)
+        for statement in MIGRATIONS:
+            try:
+                await conn.execute(statement)
+            except Exception:  # noqa: BLE001 - already applied; the column exists
+                pass
         await conn.commit()
 
 
