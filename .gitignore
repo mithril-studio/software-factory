@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# runtime state
+var/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

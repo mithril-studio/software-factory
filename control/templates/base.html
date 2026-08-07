@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}software factory{% endblock %}</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161920; --line: #262b36; --text: #e6e9ef;
+    --dim: #8b93a3; --accent: #6ea8fe; --ok: #4ec9a5; --bad: #f2777a; --warn: #e0af68;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header {
+    border-bottom: 1px solid var(--line); padding: 14px 22px;
+    display: flex; gap: 22px; align-items: baseline;
+  }
+  header .brand { font-weight: 600; letter-spacing: -0.01em; }
+  header nav { display: flex; gap: 16px; }
+  header nav a { color: var(--dim); }
+  header nav a.on { color: var(--text); }
+  main { max-width: 1100px; margin: 0 auto; padding: 26px 22px 60px; }
+  h1 { font-size: 19px; margin: 0 0 18px; font-weight: 600; }
+  h2 { font-size: 14px; margin: 28px 0 12px; color: var(--dim); font-weight: 600;
+       text-transform: uppercase; letter-spacing: 0.06em; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  .pad { padding: 16px 18px; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--dim); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  td { padding: 11px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .dim { color: var(--dim); }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+    font-weight: 600; border: 1px solid transparent; white-space: nowrap;
+  }
+  .s-succeeded { color: var(--ok);   background: #4ec9a51a; border-color: #4ec9a544; }
+  .s-failed,
+  .s-cancelled { color: var(--bad);  background: #f2777a1a; border-color: #f2777a44; }
+  .s-queued    { color: var(--dim);  background: #8b93a31a; border-color: #8b93a344; }
+  .s-forking,
+  .s-running   { color: var(--warn); background: #e0af681a; border-color: #e0af6844; }
+  button, input[type=submit] {
+    background: var(--accent); color: #0b0e14; border: 0; border-radius: 6px;
+    padding: 8px 15px; font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
+  button:hover { filter: brightness(1.08); }
+  input[type=text], input[type=number], select {
+    background: #0c0e13; border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 8px 11px; font-size: 13px; font-family: inherit;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  form.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .notice {
+    border: 1px solid #e0af6844; background: #e0af681a; color: var(--warn);
+    border-radius: 8px; padding: 13px 16px; margin-bottom: 20px; font-size: 13px;
+  }
+  .log {
+    background: #0a0c10; border: 1px solid var(--line); border-radius: 8px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+    padding: 14px 16px; height: 62vh; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .log .l-factory { color: var(--accent); }
+  .log .l-tool    { color: var(--warn); }
+  .log .l-agent   { color: var(--ok); }
+  .log .l-stderr  { color: var(--bad); }
+  .meta { display: flex; flex-wrap: wrap; gap: 26px; }
+  .meta div { min-width: 0; }
+  .meta .k {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--dim); font-weight: 600; margin-bottom: 3px;
+  }
+  .empty { padding: 40px; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">software factory</span>
+  <nav>
+    <a href="/" class="{{ 'on' if nav == 'runs' else '' }}">Runs</a>
+    <a href="/machines" class="{{ 'on' if nav == 'machines' else '' }}">Machines</a>
+  </nav>
+</header>
+<main>{% block body %}{% endblock %}</main>
+</body>
+</html>

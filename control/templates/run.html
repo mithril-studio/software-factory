@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set nav = 'runs' %}
+{% block title %}run {{ run.id[:8] }}{% endblock %}
+{% block body %}
+
+<div style="display:flex; align-items:baseline; gap:14px; margin-bottom:18px">
+  <h1 style="margin:0">{{ run.issue_title or 'Run' }}</h1>
+  <span class="dim mono">{{ run.id[:8] }}</span>
+  <div style="margin-left:auto; display:flex; gap:10px">
+    <a href="/"><button type="button" class="ghost">Back</button></a>
+    <form method="post" action="/runs/{{ run.id }}/cancel" id="cancelForm">
+      <button type="submit" class="ghost" id="cancelBtn">Cancel run</button>
+    </form>
+  </div>
+</div>
+
+<div class="panel pad" id="card">
+  {% include "_card.html" %}
+</div>
+
+<h2>Agent output</h2>
+<div class="log" id="log"><span class="dim">connecting…</span></div>
+
+<script>
+const runId = {{ run.id | tojson }};
+const logEl = document.getElementById('log');
+const cardEl = document.getElementById('card');
+let first = true;
+
+function classify(line) {
+  if (line.startsWith('[factory]')) return 'l-factory';
+  if (line.startsWith('[tool]')) return 'l-tool';
+  if (line.startsWith('[agent]')) return 'l-agent';
+  if (line.startsWith('[stderr]')) return 'l-stderr';
+  return '';
+}
+
+function append(line) {
+  if (first) { logEl.innerHTML = ''; first = false; }
+  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
+  const el = document.createElement('div');
+  const cls = classify(line);
+  if (cls) el.className = cls;
+  el.textContent = line;
+  logEl.appendChild(el);
+  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+}
+
+const source = new EventSource(`/runs/${runId}/stream`);
+source.onmessage = (event) => append(JSON.parse(event.data));
+source.addEventListener('done', () => { source.close(); refreshCard(); });
+source.onerror = () => { /* browser retries on its own */ };
+
+async function refreshCard() {
+  const resp = await fetch(`/runs/${runId}/card`);
+  if (resp.ok) cardEl.innerHTML = await resp.text();
+}
+
+const poll = setInterval(async () => {
+  await refreshCard();
+  const run = await (await fetch(`/api/runs/${runId}`)).json();
+  if (['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+    clearInterval(poll);
+    document.getElementById('cancelForm').style.display = 'none';
+  }
+}, 3000);
+refreshCard();
+</script>
+{% endblock %}
