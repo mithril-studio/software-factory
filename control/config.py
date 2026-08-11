@@ -60,6 +60,12 @@ class Settings:
     run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "3600"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
     keep_failed: bool = os.environ.get("FACTORY_KEEP_FAILED", "0") == "1"
+    # Injected into each run so the agent's `claude` authenticates with a durable API key
+    # instead of the golden's OAuth session (which expires and can't run unattended).
+    anthropic_api_key: str = os.environ.get("ANTHROPIC_API_KEY", "")
+    # Auto-merge a run's PR on success, so the next issue in a sequential backlog branches
+    # from a main that already contains the previous issue's work.
+    auto_merge: bool = os.environ.get("FACTORY_AUTO_MERGE", "0") == "1"
     # Retry a failed issue up to this many attempts total (1 = no retry). Each attempt is
     # its own run, and the previous attempt's log is fed to the next as context.
     max_attempts: int = int(os.environ.get("FACTORY_MAX_ATTEMPTS", "3"))

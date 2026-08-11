@@ -450,6 +450,9 @@ async def _execute(
                 f"run.id={run_id},issue={repo}#{issue['number']},repo={repo},vm={machine.name}"
             ),
         }
+        # Durable auth for the agent's `claude`, overriding the golden's expiring OAuth.
+        if settings.anthropic_api_key:
+            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
         exit_code, usage = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log), timeout=settings.run_timeout
         )
@@ -472,10 +475,24 @@ async def _execute(
 
         ok = exit_code == 0 and pr_url is not None
         if ok:
+            merged = False
+            if settings.auto_merge:
+                # Merge now so the next issue in the sequence branches from a main that
+                # already contains this issue's work. A failed merge is logged, not fatal:
+                # the PR stays open for a human, and the chain simply doesn't advance cleanly.
+                try:
+                    pr_number = int(pr_url.rstrip("/").split("/")[-1])
+                    await github.merge_pr(repo, pr_number)
+                    merged = True
+                    log.write(f"[factory] auto-merged PR #{pr_number} into {base}")
+                except Exception as exc:  # noqa: BLE001
+                    log.write(f"[factory] auto-merge failed (PR left open): {exc!r}")
             await db.update_run(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
             outcome = f"Factory run finished. Pull request: {pr_url}"
+            if merged:
+                outcome += " (auto-merged)"
             await _mirror_issue(
                 repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=outcome
             )

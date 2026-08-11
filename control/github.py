@@ -184,6 +184,22 @@ async def remove_label(repo: str, number: int, label: str) -> None:
             resp.raise_for_status()
 
 
+async def merge_pr(repo: str, number: int, method: str = "squash") -> dict:
+    """Merge a pull request. Raises for status so a failed merge is loud.
+
+    Squash by default: one clean commit per issue on the base branch, which is what the next
+    issue in a sequential backlog branches from.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.put(
+            f"{API}/repos/{repo}/pulls/{number}/merge",
+            headers=_headers(),
+            json={"merge_method": method},
+        )
+        resp.raise_for_status()
+    return resp.json()
+
+
 async def add_comment(repo: str, number: int, body: str) -> None:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
