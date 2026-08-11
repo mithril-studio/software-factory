@@ -38,6 +38,19 @@ def client() -> AsyncBoxd:
     return AsyncBoxd(api_key=settings.boxd_api_key)
 
 
+async def golden_id(boxd: AsyncBoxd, golden: str) -> str:
+    """Resolve the golden's machine id.
+
+    The boxd SDK forks by machine **id**, not name — forking by name fails with
+    `source VM not found` even though the machine lists fine. `FACTORY_GOLDEN` is a
+    human-readable name, so resolve it here. Accepts an id too, so either works in config.
+    """
+    for m in await boxd.machines.list():
+        if m.id == golden or m.name == golden:
+            return m.id
+    raise RuntimeError(f"golden VM {golden!r} not found in the boxd fleet")
+
+
 # --------------------------------------------------------------------------- prompt
 
 
@@ -409,8 +422,9 @@ async def _execute(
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"run-{run_id[:8]}"
         log.write(f"[factory] forking {golden} -> {vm_name}")
+        source_id = await golden_id(boxd, golden)
         machine = await boxd.machines.fork(
-            golden,
+            source_id,
             vm_name,
             # Agent work is CPU-bound and often silent; the default idle suspend would
             # freeze the VM mid-build. Zero disables it.
