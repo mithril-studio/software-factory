@@ -13,12 +13,12 @@ import contextlib
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db, github, poller, runner
+from . import auth, db, github, poller, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -35,6 +35,50 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- auth
+
+
+@app.middleware("http")
+async def require_session(request: Request, call_next):
+    """Gate every /api route behind a valid session cookie, save the auth endpoints."""
+    if not auth.is_public(request.url.path):
+        if not auth.valid_token(request.cookies.get(auth.COOKIE_NAME)):
+            return JSONResponse({"detail": "authentication required"}, status_code=401)
+    return await call_next(request)
+
+
+class Login(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/login")
+async def api_login(body: Login, response: Response):
+    if not auth.check_credentials(body.email, body.password):
+        raise HTTPException(401, "invalid email or password")
+    response.set_cookie(
+        auth.COOKIE_NAME,
+        auth.issue_token(),
+        max_age=auth.SESSION_TTL,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+async def api_logout(response: Response):
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    return {"authenticated": auth.valid_token(request.cookies.get(auth.COOKIE_NAME))}
 
 
 # --------------------------------------------------------------------------- config
