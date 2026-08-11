@@ -57,7 +57,7 @@ export function Agents() {
                   <TableCell>
                     <Badge variant={a.role === "golden" ? "ok" : "muted"}>{a.role}</Badge>
                   </TableCell>
-                  <TableCell className="text-muted-foreground">{a.status ?? "—"}</TableCell>
+                  <TableCell>{a.status ?? "—"}</TableCell>
                   <TableCell className="text-right">
                     {a.is_golden && <Badge variant="outline">golden</Badge>}
                     {a.orphan && <Badge variant="bad">orphan</Badge>}

@@ -166,7 +166,7 @@ export function Runs() {
                       {shortId(r.id)}
                     </Link>
                   </TableCell>
-                  <TableCell className="text-muted-foreground">{r.agent ?? "—"}</TableCell>
+                  <TableCell>{r.agent ?? "—"}</TableCell>
                   <TableCell>
                     <Link to={`/runs/${r.id}`} className="hover:underline">
                       <span className="font-mono">{r.repo}</span>
@@ -176,16 +176,16 @@ export function Runs() {
                       {r.issue_title}
                     </div>
                   </TableCell>
-                  <TableCell className="font-mono text-muted-foreground">
+                  <TableCell className="font-mono">
                     {duration(r)}
                   </TableCell>
-                  <TableCell className="font-mono text-muted-foreground">
+                  <TableCell className="font-mono">
                     {tokens((r.tokens_in ?? 0) + (r.tokens_out ?? 0) || null)}
                   </TableCell>
-                  <TableCell className="font-mono text-muted-foreground">
+                  <TableCell className="font-mono">
                     {cost(r.cost_usd)}
                   </TableCell>
-                  <TableCell className="text-muted-foreground">
+                  <TableCell>
                     {ago(r.started_at ?? r.created_at)}
                   </TableCell>
                   <TableCell>
