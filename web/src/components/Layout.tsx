@@ -74,10 +74,8 @@ export function Layout() {
           </button>
         </div>
       </aside>
-      <main className="ml-60 flex-1 px-8 py-8">
-        <div className="mx-auto max-w-6xl">
-          <Outlet />
-        </div>
+      <main className="ml-60 flex-1 px-4 py-8">
+        <Outlet />
       </main>
     </div>
   )
