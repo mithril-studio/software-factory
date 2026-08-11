@@ -166,8 +166,9 @@ def _log_tail(run_id: str, max_chars: int = 4000) -> str:
 
 # The script the VM runs. Values arrive as environment variables so nothing needs shell
 # quoting here — the prompt in particular can contain anything at all.
+# Runs under /bin/sh (dash) via boxd exec, NOT bash — keep it POSIX. No `set -o pipefail`
+# (a bash-ism dash rejects, which kills the script on line 1); errors are caught per-command.
 VM_SCRIPT = r"""
-set -o pipefail
 cd "$FACTORY_REPO_DIR" || { echo "FACTORY: repo dir $FACTORY_REPO_DIR not found" >&2; exit 90; }
 git config --global --add safe.directory "$FACTORY_REPO_DIR" 2>/dev/null || true
 git config user.name  "software-factory" 2>/dev/null || true
