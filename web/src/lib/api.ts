@@ -61,16 +61,26 @@ export type Config = {
 
 export const TERMINAL = ["succeeded", "failed", "cancelled"]
 
+/** A dropped session anywhere in the app funnels the user back to the login screen. */
+function onUnauthorized() {
+  if (window.location.pathname !== "/login") {
+    window.location.assign("/login")
+  }
+}
+
+async function detail(resp: Response): Promise<string> {
+  try {
+    return (await resp.json()).detail ?? resp.statusText
+  } catch {
+    return resp.statusText
+  }
+}
+
 async function get<T>(url: string): Promise<T> {
   const resp = await fetch(url)
   if (!resp.ok) {
-    let detail = resp.statusText
-    try {
-      detail = (await resp.json()).detail ?? detail
-    } catch {
-      /* keep statusText */
-    }
-    throw new Error(detail)
+    if (resp.status === 401) onUnauthorized()
+    throw new Error(await detail(resp))
   }
   return resp.json()
 }
@@ -82,15 +92,37 @@ export async function post<T>(url: string, body?: unknown): Promise<T> {
     body: body ? JSON.stringify(body) : undefined,
   })
   if (!resp.ok) {
-    let detail = resp.statusText
-    try {
-      detail = (await resp.json()).detail ?? detail
-    } catch {
-      /* keep statusText */
-    }
-    throw new Error(detail)
+    if (resp.status === 401) onUnauthorized()
+    throw new Error(await detail(resp))
   }
   return resp.json()
+}
+
+// ---- auth ----
+
+/** Log in. Throws with the server's message on bad credentials; no redirect. */
+export async function login(email: string, password: string): Promise<void> {
+  const resp = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  })
+  if (!resp.ok) throw new Error(await detail(resp))
+}
+
+export async function logout(): Promise<void> {
+  await fetch("/api/logout", { method: "POST" })
+}
+
+/** Whether the current session cookie is valid. Never redirects — used to decide routing. */
+export async function checkAuth(): Promise<boolean> {
+  try {
+    const resp = await fetch("/api/me")
+    if (!resp.ok) return false
+    return (await resp.json()).authenticated === true
+  } catch {
+    return false
+  }
 }
 
 /** Fetch `url` once, then re-poll every `intervalMs` if given. */
