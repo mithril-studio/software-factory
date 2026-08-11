@@ -74,7 +74,7 @@ export function Layout() {
           </button>
         </div>
       </aside>
-      <main className="ml-60 flex-1 px-4 py-8">
+      <main className="ml-60 flex-1 px-5 py-8">
         <Outlet />
       </main>
     </div>
