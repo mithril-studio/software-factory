@@ -66,6 +66,11 @@ class Settings:
     # or ANTHROPIC_API_KEY for console/API billing. Whichever is set is passed through.
     anthropic_api_key: str = os.environ.get("ANTHROPIC_API_KEY", "")
     claude_code_oauth_token: str = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    # Reasoning effort for the agent. The dominant cost in a run is that every turn re-reads
+    # the whole context, so spend scales with turn count and context size rather than with any
+    # single call. `medium` buys most of `high`'s quality for materially fewer tokens; raise it
+    # if issues start coming back underdone.
+    agent_effort: str = os.environ.get("FACTORY_AGENT_EFFORT", "medium")
     # Auto-merge a run's PR on success, so the next issue in a sequential backlog branches
     # from a main that already contains the previous issue's work.
     auto_merge: bool = os.environ.get("FACTORY_AUTO_MERGE", "0") == "1"
