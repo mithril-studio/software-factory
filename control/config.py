@@ -60,9 +60,12 @@ class Settings:
     run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "3600"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
     keep_failed: bool = os.environ.get("FACTORY_KEEP_FAILED", "0") == "1"
-    # Injected into each run so the agent's `claude` authenticates with a durable API key
-    # instead of the golden's OAuth session (which expires and can't run unattended).
+    # Claude auth injected into each run so the agent authenticates with a durable credential
+    # instead of the golden's short-lived OAuth session (which expires and can't run
+    # unattended). CLAUDE_CODE_OAUTH_TOKEN for a Claude subscription (from `claude setup-token`),
+    # or ANTHROPIC_API_KEY for console/API billing. Whichever is set is passed through.
     anthropic_api_key: str = os.environ.get("ANTHROPIC_API_KEY", "")
+    claude_code_oauth_token: str = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
     # Auto-merge a run's PR on success, so the next issue in a sequential backlog branches
     # from a main that already contains the previous issue's work.
     auto_merge: bool = os.environ.get("FACTORY_AUTO_MERGE", "0") == "1"

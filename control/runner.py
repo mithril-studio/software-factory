@@ -453,6 +453,8 @@ async def _execute(
         # Durable auth for the agent's `claude`, overriding the golden's expiring OAuth.
         if settings.anthropic_api_key:
             env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+        if settings.claude_code_oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
         exit_code, usage = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log), timeout=settings.run_timeout
         )
