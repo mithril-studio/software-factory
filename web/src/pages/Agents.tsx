@@ -53,11 +53,11 @@ export function Agents() {
             <TableBody>
               {agents.map((a) => (
                 <TableRow key={a.name}>
-                  <TableCell className="font-mono text-sm">{a.name}</TableCell>
+                  <TableCell className="font-mono">{a.name}</TableCell>
                   <TableCell>
                     <Badge variant={a.role === "golden" ? "ok" : "muted"}>{a.role}</Badge>
                   </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">{a.status ?? "—"}</TableCell>
+                  <TableCell className="text-muted-foreground">{a.status ?? "—"}</TableCell>
                   <TableCell className="text-right">
                     {a.is_golden && <Badge variant="outline">golden</Badge>}
                     {a.orphan && <Badge variant="bad">orphan</Badge>}

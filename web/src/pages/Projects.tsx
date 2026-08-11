@@ -31,19 +31,19 @@ export function Projects() {
             <TableBody>
               {projects.map((p) => (
                 <TableRow key={p.repo}>
-                  <TableCell className="font-mono text-sm">{p.repo}</TableCell>
+                  <TableCell className="font-mono">{p.repo}</TableCell>
                   <TableCell>
                     <a
                       href={gitUrl(p.repo)}
                       target="_blank"
                       rel="noreferrer"
-                      className="font-mono text-sm text-primary hover:underline"
+                      className="font-mono text-primary hover:underline"
                     >
                       {gitUrl(p.repo)}
                     </a>
                   </TableCell>
-                  <TableCell className="text-right font-mono text-sm">{p.runs}</TableCell>
-                  <TableCell className="text-right font-mono text-sm text-ok">{p.succeeded}</TableCell>
+                  <TableCell className="text-right font-mono">{p.runs}</TableCell>
+                  <TableCell className="text-right font-mono text-ok">{p.succeeded}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
