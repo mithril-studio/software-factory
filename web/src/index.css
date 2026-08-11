@@ -23,22 +23,26 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
+  /* semantic run-state accents */
+  --ok: oklch(0.6 0.14 162);
+  --warn: oklch(0.65 0.15 82);
+  --bad: oklch(0.58 0.22 22);
 }
 
 .dark {
-  --background: oklch(0.16 0.006 285.9);
+  --background: oklch(0 0 0);
   --foreground: oklch(0.985 0 0);
-  --card: oklch(0.2 0.006 285.9);
+  --card: oklch(0.15 0 0);
   --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.2 0.006 285.9);
+  --popover: oklch(0.15 0 0);
   --popover-foreground: oklch(0.985 0 0);
   --primary: oklch(0.62 0.19 259.8);
   --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.27 0.006 286.0);
+  --secondary: oklch(0.22 0 0);
   --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.27 0.006 286.0);
-  --muted-foreground: oklch(0.705 0.015 286.0);
-  --accent: oklch(0.27 0.006 286.0);
+  --muted: oklch(0.22 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.22 0 0);
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.704 0.191 22.216);
   --border: oklch(1 0 0 / 10%);
@@ -76,6 +80,7 @@
   --color-ok: var(--ok);
   --color-warn: var(--warn);
   --color-bad: var(--bad);
+  --font-sans: "Inter Tight", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
@@ -86,6 +91,8 @@
   body {
     background-color: var(--background);
     color: var(--foreground);
-    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    font-family: "Inter Tight", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
   }
 }
