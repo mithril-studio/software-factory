@@ -179,6 +179,7 @@ echo "FACTORY: checking out $FACTORY_BRANCH from origin/$FACTORY_BASE"
 git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BASE" || { echo "FACTORY: checkout failed" >&2; exit 92; }
 echo "FACTORY: starting agent"
 claude -p "$FACTORY_PROMPT" \
+  --effort "$FACTORY_AGENT_EFFORT" \
   --dangerously-skip-permissions \
   --output-format stream-json --verbose < /dev/null
 """
@@ -444,6 +445,7 @@ async def _execute(
             "FACTORY_BRANCH": branch,
             "FACTORY_BASE": base,
             "FACTORY_PROMPT": prompt,
+            "FACTORY_AGENT_EFFORT": settings.agent_effort,
             # Correlation key. Telemetry is not wired yet, but every run carries its id
             # so traces can attach without changing the dispatch contract later.
             "OTEL_RESOURCE_ATTRIBUTES": (
