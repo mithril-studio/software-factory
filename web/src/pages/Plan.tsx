@@ -36,8 +36,8 @@ export function Plan() {
                   <TableCell>
                     <StateBadge state={i.state} />
                   </TableCell>
-                  <TableCell className="font-mono text-sm text-muted-foreground">{i.repo}</TableCell>
-                  <TableCell className="font-mono text-sm">
+                  <TableCell className="font-mono text-muted-foreground">{i.repo}</TableCell>
+                  <TableCell className="font-mono">
                     {i.url ? (
                       <a href={i.url} target="_blank" rel="noreferrer" className="text-primary hover:underline">
                         {i.number}

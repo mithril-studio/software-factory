@@ -157,35 +157,35 @@ export function Runs() {
                     <div className="flex items-center gap-2">
                       <StateBadge state={r.status} />
                       {r.attempt && r.attempt > 1 && (
-                        <span className="text-xs text-muted-foreground">try {r.attempt}</span>
+                        <span className="text-[10px] text-muted-foreground">try {r.attempt}</span>
                       )}
                     </div>
                   </TableCell>
                   <TableCell>
-                    <Link to={`/runs/${r.id}`} className="font-mono text-sm text-primary hover:underline">
+                    <Link to={`/runs/${r.id}`} className="font-mono text-primary hover:underline">
                       {shortId(r.id)}
                     </Link>
                   </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">{r.agent ?? "—"}</TableCell>
+                  <TableCell className="text-muted-foreground">{r.agent ?? "—"}</TableCell>
                   <TableCell>
                     <Link to={`/runs/${r.id}`} className="hover:underline">
-                      <span className="font-mono text-sm">{r.repo}</span>
+                      <span className="font-mono">{r.repo}</span>
                       <span className="text-muted-foreground"> #{r.issue_number}</span>
                     </Link>
-                    <div className="max-w-72 truncate text-xs text-muted-foreground">
+                    <div className="max-w-72 truncate text-[10px] text-muted-foreground">
                       {r.issue_title}
                     </div>
                   </TableCell>
-                  <TableCell className="font-mono text-sm text-muted-foreground">
+                  <TableCell className="font-mono text-muted-foreground">
                     {duration(r)}
                   </TableCell>
-                  <TableCell className="font-mono text-sm text-muted-foreground">
+                  <TableCell className="font-mono text-muted-foreground">
                     {tokens((r.tokens_in ?? 0) + (r.tokens_out ?? 0) || null)}
                   </TableCell>
-                  <TableCell className="font-mono text-sm text-muted-foreground">
+                  <TableCell className="font-mono text-muted-foreground">
                     {cost(r.cost_usd)}
                   </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">
+                  <TableCell className="text-muted-foreground">
                     {ago(r.started_at ?? r.created_at)}
                   </TableCell>
                   <TableCell>
@@ -194,7 +194,7 @@ export function Runs() {
                         href={r.pr_url}
                         target="_blank"
                         rel="noreferrer"
-                        className="text-sm text-primary hover:underline"
+                        className="text-primary hover:underline"
                       >
                         open
                       </a>
