@@ -11,6 +11,8 @@ a label the API refuses must never fail an otherwise good run.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
 from .config import settings
@@ -182,6 +184,66 @@ async def remove_label(repo: str, number: int, label: str) -> None:
         )
         if resp.status_code not in (200, 404):
             resp.raise_for_status()
+
+
+# A check run that ended in one of these did not fail. `neutral` and `skipped` are how a
+# conditional job reports "not applicable here", which must not block a merge.
+CHECK_OK = ("success", "neutral", "skipped")
+
+
+async def pr_head_sha(repo: str, number: int) -> str:
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{API}/repos/{repo}/pulls/{number}", headers=_headers())
+        resp.raise_for_status()
+    return resp.json()["head"]["sha"]
+
+
+async def checks_green(
+    repo: str, sha: str, timeout: int = 900, interval: int = 15
+) -> tuple[bool, str]:
+    """Wait for every check run on `sha` to finish, and report whether all passed.
+
+    Returns (ok, reason). `ok` is True only when at least one check has run and all of them
+    completed acceptably — an unverified commit is never treated as a green one.
+
+    This exists because the merge API does not wait for anything: without it, a PR is merged
+    seconds after `gh pr create`, before CI has even started, and a red main then propagates
+    into every subsequent run (which forks from main).
+
+    Never raises. A GitHub hiccup returns (False, reason) so the caller leaves the PR open
+    for a human rather than failing an otherwise good run.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    last = "no check runs reported"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            while True:
+                resp = await client.get(
+                    f"{API}/repos/{repo}/commits/{sha}/check-runs", headers=_headers()
+                )
+                resp.raise_for_status()
+                runs = resp.json().get("check_runs", [])
+
+                if not runs:
+                    last = "no check runs reported"
+                elif all(r.get("status") == "completed" for r in runs):
+                    failed = [
+                        f"{r.get('name')}={r.get('conclusion')}"
+                        for r in runs
+                        if r.get("conclusion") not in CHECK_OK
+                    ]
+                    if failed:
+                        return False, f"checks failed: {', '.join(failed)}"
+                    return True, f"{len(runs)} checks passed"
+                else:
+                    pending = [r.get("name") for r in runs if r.get("status") != "completed"]
+                    last = f"still running: {', '.join(p for p in pending if p)}"
+
+                if asyncio.get_running_loop().time() >= deadline:
+                    return False, f"timed out after {timeout}s ({last})"
+                await asyncio.sleep(interval)
+    except Exception as exc:  # noqa: BLE001 - a merge we skip is always safer than one we force
+        return False, f"could not read checks: {exc!r}"
 
 
 async def merge_pr(repo: str, number: int, method: str = "squash") -> dict:

@@ -68,13 +68,29 @@ How to work:
 1. Load the `memory` skill first and prime yourself from `.mem/` if it exists. What past
    runs learned about this repo is the most valuable context you have.
 2. Make the change. Stay in scope: resolve this issue, nothing more.
-3. Run whatever tests or checks the repo already has. Do not add a test framework that
-   isn't already there.
-4. Record anything durable you learned into `.mem/`, following the memory skill.
-5. Commit on the branch you are already on ({branch}) and push it:
+3. Commit and push as you go — after each meaningful step, not once at the end:
    git add -A && git commit -m "<message>" && git push -u origin {branch}
-6. Open a pull request with `gh pr create --fill --base {base}`, and reference the issue
-   in the body so it links (e.g. "Closes #{number}").
+   The branch is what survives; this VM is destroyed when you exit. If this run dies
+   half-way, whatever you pushed is what the next attempt continues from, so small
+   commits that build on each other are worth far more than one perfect commit you
+   never got to make.
+4. Verify with the repo's fast checks, and only these:
+   npm run lint · npm run typecheck · npm run test · npm run test:integration · npm run build
+   Do NOT run the end-to-end suite (`npm run test:e2e`) and do NOT install browsers —
+   CI runs end-to-end on your pull request, it is not your job here. Do not add a test
+   framework or test runner that isn't already in the repo.
+5. Record anything durable you learned into `.mem/`, following the memory skill.
+6. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
+   referencing the issue in the body so it links (e.g. "Closes #{number}").
+
+Environment notes:
+- The repository is already installed and configured. `.env` is correct and read-only —
+  do not create, copy or modify it, and do not print its contents.
+- The test database is already running and migrated. Do not start or reset it.
+- Run long commands in the foreground with an explicit timeout, e.g.
+  `timeout 600 npm run build`. Do not put work in the background to wait for it later:
+  background tasks and scheduled wake-ups do not deliver notifications in this
+  environment, so a run that waits for one waits forever and dies having produced nothing.
 
 If you cannot resolve the issue, still push what you have and open a draft PR explaining
 what blocked you. A run that ends with no PR gives the human nothing to look at.
@@ -117,8 +133,9 @@ This is attempt {attempt} of {max_attempts}. Earlier attempts on this issue fail
 ({prior_error}). Below is the tail of the previous attempt's log. Read it, work out the root
 cause, and fix *that* — do not blindly repeat what failed.
 
-A previous attempt may already have pushed commits to {branch}. If a normal `git push` is
-rejected as non-fast-forward, reconcile and force-push with `git push --force-with-lease`.
+You are already checked out on {branch}, including any commits an earlier attempt pushed to
+it — read them first (`git log --oneline origin/{base}..HEAD` and `git diff origin/{base}`)
+and continue from there. Do not start over, and do not force-push over that work.
 
 previous attempt log (tail):
 {prior_log}
@@ -150,6 +167,7 @@ def build_prompt(
             prior_error=prior_error or "reason not captured",
             prior_log=prior_log or "(previous log unavailable)",
             branch=branch,
+            base=base,
         )
     return prompt
 
@@ -175,11 +193,21 @@ git config user.name  "software-factory" 2>/dev/null || true
 git config user.email "factory@users.noreply.github.com" 2>/dev/null || true
 echo "FACTORY: fetching origin"
 git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
-echo "FACTORY: checking out $FACTORY_BRANCH from origin/$FACTORY_BASE"
-git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BASE" || { echo "FACTORY: checkout failed" >&2; exit 92; }
+# On a retry, resume the branch a previous attempt pushed to rather than resetting to the base
+# and throwing that work away. The VM is always fresh; the branch is what carries work forward.
+# Only on a retry: a first attempt always starts from the base, so re-queueing an issue whose
+# branch is still lying around from an earlier merged PR gets a clean start, not a resurrection.
+if [ "$FACTORY_ATTEMPT" -gt 1 ] && git rev-parse --verify --quiet "origin/$FACTORY_BRANCH" > /dev/null; then
+  echo "FACTORY: resuming $FACTORY_BRANCH from origin/$FACTORY_BRANCH"
+  git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BRANCH" || { echo "FACTORY: checkout failed" >&2; exit 92; }
+else
+  echo "FACTORY: checking out $FACTORY_BRANCH from origin/$FACTORY_BASE"
+  git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BASE" || { echo "FACTORY: checkout failed" >&2; exit 92; }
+fi
 echo "FACTORY: starting agent"
 claude -p "$FACTORY_PROMPT" \
   --effort "$FACTORY_AGENT_EFFORT" \
+  --disallowed-tools Agent Task ScheduleWakeup \
   --dangerously-skip-permissions \
   --output-format stream-json --verbose < /dev/null
 """
@@ -388,7 +416,14 @@ async def _guarded(
         raise
     except Exception as exc:  # noqa: BLE001 - the UI is where failures get reported
         log.write(f"[factory] run failed: {exc!r}")
-        await _fail_run(run_id, repo, issue, golden, attempt, f"crashed: {str(exc)[:200]}", log)
+        # str() on an asyncio.TimeoutError is empty, which used to record the least useful
+        # error in the table ("crashed: ") for the one failure mode that says exactly what
+        # happened. Name it, and fall back to the exception class for anything else silent.
+        if isinstance(exc, asyncio.TimeoutError):
+            reason = f"timed out after {settings.run_timeout}s"
+        else:
+            reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
+        await _fail_run(run_id, repo, issue, golden, attempt, reason, log)
     finally:
         log.close()
 
@@ -445,8 +480,17 @@ async def _execute(
             "FACTORY_REPO_DIR": settings.repo_dir,
             "FACTORY_BRANCH": branch,
             "FACTORY_BASE": base,
+            "FACTORY_ATTEMPT": str(attempt),
             "FACTORY_PROMPT": prompt,
             "FACTORY_AGENT_EFFORT": settings.agent_effort,
+            # How long a single shell command may run before the agent's own tooling moves
+            # it to the background. The default (120s) is shorter than an ordinary build or
+            # test run here, and a backgrounded command is what the agent then waits on
+            # forever — under `claude -p` there is no loop to deliver the notification it
+            # expects. Generous values keep everything legitimate in the foreground; a
+            # genuinely stuck command is bounded by FACTORY_RUN_TIMEOUT, not by this.
+            "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
+            "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
             # Correlation key. Telemetry is not wired yet, but every run carries its id
             # so traces can attach without changing the dispatch contract later.
             "OTEL_RESOURCE_ATTRIBUTES": (
@@ -487,9 +531,22 @@ async def _execute(
                 # the PR stays open for a human, and the chain simply doesn't advance cleanly.
                 try:
                     pr_number = int(pr_url.rstrip("/").split("/")[-1])
-                    await github.merge_pr(repo, pr_number)
-                    merged = True
-                    log.write(f"[factory] auto-merged PR #{pr_number} into {base}")
+                    green, why = True, "checks not required"
+                    if settings.merge_require_checks:
+                        # The merge API waits for nothing, so without this the PR is merged
+                        # seconds after `gh pr create` — before CI has even started. Every
+                        # run forks from main, so a red main propagates into all of them.
+                        log.write(f"[factory] waiting for checks on PR #{pr_number}")
+                        sha = await github.pr_head_sha(repo, pr_number)
+                        green, why = await github.checks_green(
+                            repo, sha, timeout=settings.merge_check_timeout
+                        )
+                    if green:
+                        await github.merge_pr(repo, pr_number)
+                        merged = True
+                        log.write(f"[factory] auto-merged PR #{pr_number} into {base} ({why})")
+                    else:
+                        log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
                 except Exception as exc:  # noqa: BLE001
                     log.write(f"[factory] auto-merge failed (PR left open): {exc!r}")
             await db.update_run(

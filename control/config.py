@@ -57,7 +57,18 @@ class Settings:
     golden: str = os.environ.get("FACTORY_GOLDEN", "")
     repo_dir: str = os.environ.get("FACTORY_REPO_DIR", "/home/boxd/repo")
     max_concurrent: int = int(os.environ.get("FACTORY_MAX_CONCURRENT", "3"))
-    run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "3600"))
+    # Hard ceiling on one agent run. Observed successful runs took 27-53 minutes, so 60
+    # minutes killed work that was still going somewhere (and did it silently). 90 leaves
+    # real headroom; it must stay comfortably below FACTORY_AUTO_DESTROY, which is the VM's
+    # own self-destruct. The right long-term ceiling is spend, not wall clock — see
+    # backlog.md §8.
+    run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "5400"))
+    # Seconds a single shell command may run before the agent's tooling backgrounds it, and
+    # the ceiling it may request for one. Both are far above any legitimate command here
+    # (the longest observed build was 153s) because a backgrounded command is what the agent
+    # then waits on forever. A truly stuck command is caught by run_timeout instead.
+    bash_default_timeout: int = int(os.environ.get("FACTORY_BASH_TIMEOUT", "600"))
+    bash_max_timeout: int = int(os.environ.get("FACTORY_BASH_MAX_TIMEOUT", "1800"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
     keep_failed: bool = os.environ.get("FACTORY_KEEP_FAILED", "0") == "1"
     # Claude auth injected into each run so the agent authenticates with a durable credential
@@ -74,6 +85,13 @@ class Settings:
     # Auto-merge a run's PR on success, so the next issue in a sequential backlog branches
     # from a main that already contains the previous issue's work.
     auto_merge: bool = os.environ.get("FACTORY_AUTO_MERGE", "0") == "1"
+    # Wait for the PR's check runs to pass before auto-merging. The merge API waits for
+    # nothing on its own, so with this off a PR is merged seconds after it is opened and CI
+    # reports on a commit that is already in main. Off is only for deliberately testing what
+    # auto-merge does; on is the setting you want once that question is settled.
+    merge_require_checks: bool = os.environ.get("FACTORY_MERGE_REQUIRE_CHECKS", "1") == "1"
+    # How long to wait for those checks before giving up and leaving the PR open.
+    merge_check_timeout: int = int(os.environ.get("FACTORY_MERGE_CHECK_TIMEOUT", "900"))
     # Retry a failed issue up to this many attempts total (1 = no retry). Each attempt is
     # its own run, and the previous attempt's log is fed to the next as context.
     max_attempts: int = int(os.environ.get("FACTORY_MAX_ATTEMPTS", "3"))
