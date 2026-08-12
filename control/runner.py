@@ -233,6 +233,7 @@ def format_event(event: dict) -> list[str]:
                     supplied.get("command")
                     or supplied.get("file_path")
                     or supplied.get("pattern")
+                    or supplied.get("skill")
                     or ""
                 )
                 hint = str(hint).replace("\n", " ")
