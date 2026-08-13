@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import uuid
 from pathlib import Path
 
+import yaml
 from boxd import AsyncBoxd
 
 from . import db, github
@@ -106,6 +108,48 @@ what blocked you. A run that ends with no PR gives the human nothing to look at.
 """
 
 
+# --------------------------------------------------------------------------- criteria
+
+# The acceptance-criteria block an issue carries, per the factory-compose issue template: a
+# fenced yaml list under an "## Acceptance criteria" heading.
+_CRITERIA_BLOCK = re.compile(
+    r"^##\s*Acceptance criteria\s*?\n+```ya?ml\n(.*?)^```", re.S | re.M | re.I
+)
+
+# Modes whose verdict may block a merge. `inspect` needs human judgement, so it is reported
+# and never blocks — an agent's opinion is not a gate.
+BLOCKING_MODES = ("test", "probe", "structure")
+
+
+def parse_criteria(body: str) -> list[dict]:
+    """Extract an issue's acceptance criteria. Returns [] when there are none to run.
+
+    Deliberately done here rather than by the reviewing agent: what the criteria *are* is not
+    a judgement call, and an agent that reads its own contract can also misread it. A malformed
+    block yields [] — which skips review rather than inventing criteria, so the failure mode is
+    "unreviewed like before", never "reviewed against something nobody wrote".
+    """
+    match = _CRITERIA_BLOCK.search(body or "")
+    if not match:
+        return []
+    try:
+        parsed = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        if not {"id", "mode", "statement"} <= set(item):
+            continue
+        if item["mode"] not in (*BLOCKING_MODES, "inspect"):
+            continue
+        out.append(item)
+    return out
+
+
 def _run_link(run_id: str) -> str | None:
     return f"{settings.base_url}/runs/{run_id}" if settings.base_url else None
 
@@ -195,6 +239,82 @@ def _log_tail(run_id: str, max_chars: int = 4000) -> str:
 # quoting here — the prompt in particular can contain anything at all.
 # Runs under /bin/sh (dash) via boxd exec, NOT bash — keep it POSIX. No `set -o pipefail`
 # (a bash-ism dash rejects, which kills the script on line 1); errors are caught per-command.
+REVIEW_PROMPT_TEMPLATE = """You are reviewing a pull request that another agent wrote, alone \
+in a VM, with nobody else looking at it. Whether it merges depends on what you report.
+
+Repository: {repo}
+Issue #{number}: {title}
+Pull request: {pr_url}
+You are checked out on the branch `{branch}`. The base branch is `{base}`.
+
+--- the issue's acceptance criteria ---
+{criteria}
+--- end criteria ---
+
+Your job is to find out whether each criterion is true. Not whether the code looks correct,
+not whether you would have written it that way — whether the criterion holds.
+
+The rule that matters: **every verdict needs evidence you produced by running something.**
+Evidence is a command and its output, a test name that passed, or a `file:line` you read. A
+criterion you did not verify is `cannot_verify`, and `cannot_verify` counts the same as
+`not_met`. Never mark something `met` because the code appears to do it — you have a whole VM
+here, so run it instead.
+
+How to check each criterion, by its `mode`:
+
+- `test` — run the test named in `verify` on this branch. It must pass. Then confirm it would
+  have caught the problem, by running it against the code as it was before this change:
+
+      git rev-parse HEAD > /tmp/head.txt
+      git checkout {base_sha} 2>/dev/null
+      git checkout $(cat /tmp/head.txt) -- <the test file(s) from verify>
+      <run the same test command>          # this MUST fail
+      git checkout $(cat /tmp/head.txt)
+      git checkout -B {branch} $(cat /tmp/head.txt)
+
+  A new test that passes against the old code proves nothing: either the criterion was already
+  satisfied and this change did not do it, or the test asserts nothing. Report the criterion
+  `not_met` if that happens, and say which of the two it looked like. Skip this step only for
+  criteria marked `regression: true`, which exist to prove old behaviour still works.
+- `probe` and `structure` — run the command in `verify`. Exit status 0 is `met`, anything else
+  is `not_met`. Quote the command and its output as evidence.
+- `inspect` — read what `verify` points at and report what you found. This is the one mode that
+  cannot block a merge, so be useful rather than cautious: say what is there and what is missing.
+
+Also run the repo's fast checks once — `npm run lint`, `npm run typecheck`, `npm run test`,
+`npm run test:integration`, `npm run build`. Do not run the end-to-end suite; CI covers it.
+If any of them fail, that is a finding regardless of the criteria.
+
+Then look for two specific things and report them as findings if present:
+
+1. **Scope creep.** Map every changed file (`git diff --name-only {base_sha}...HEAD`) to a
+   criterion or to the issue's stated task. Files that map to neither are findings.
+2. **Rules broken.** Check the change against the repo's own written rules — `CLAUDE.md`,
+   `docs/adr/*`, `.mem/`. Only rules that are actually written down. Do not invent a
+   convention and then report the code for violating it; if it is not written anywhere, it is
+   not a finding.
+
+When you are done, write your verdict to **/tmp/factory-verdict.json** and nothing else:
+
+```json
+{{
+  "verdict": "approve" | "request_changes",
+  "criteria": [
+    {{"id": "AC1", "status": "met" | "not_met" | "cannot_verify",
+      "evidence": "the command you ran and what it printed, or file:line"}}
+  ],
+  "findings": ["one line each — what is wrong and where"],
+  "notes": ["anything advisory that should not block"]
+}}
+```
+
+Include every criterion by its `id`, including `inspect` ones. Say `request_changes` if any
+criterion is not met or you found something that should block; `approve` only if you actually
+verified everything. Do not modify the branch, do not commit, and do not open or close
+anything on GitHub — writing that file is the entirety of your output.
+"""
+
+
 VM_SCRIPT = r"""
 cd "$FACTORY_REPO_DIR" || { echo "FACTORY: repo dir $FACTORY_REPO_DIR not found" >&2; exit 90; }
 git config --global --add safe.directory "$FACTORY_REPO_DIR" 2>/dev/null || true
@@ -237,6 +357,76 @@ claude -p "$FACTORY_PROMPT" \
 
 
 # --------------------------------------------------------------------------- log
+
+
+VERDICT_PATH = "/tmp/factory-verdict.json"
+
+# Review runs check out the PR branch and change nothing. No `-B` from the base, no push: a
+# reviewer that can write to the branch is a reviewer that can make its own findings go away.
+REVIEW_SCRIPT = r"""
+cd "$FACTORY_REPO_DIR" || { echo "FACTORY: repo dir $FACTORY_REPO_DIR not found" >&2; exit 90; }
+git config --global --add safe.directory "$FACTORY_REPO_DIR" 2>/dev/null || true
+rm -f /tmp/factory-verdict.json
+echo "FACTORY: fetching origin"
+git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
+echo "FACTORY: checking out $FACTORY_BRANCH for review"
+git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BRANCH" || { echo "FACTORY: checkout failed" >&2; exit 92; }
+if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
+  want=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
+  have=$(node -v | tr -d 'v' | cut -d. -f1)
+  if [ -n "$want" ] && [ "$want" != "$have" ]; then
+    echo "FACTORY: this machine runs node $have but .nvmrc pins $want — the golden needs rebuilding" >&2
+    exit 93
+  fi
+fi
+echo "FACTORY: starting reviewer"
+claude -p "$FACTORY_PROMPT" \
+  --effort "$FACTORY_AGENT_EFFORT" \
+  --disallowed-tools Agent Task ScheduleWakeup \
+  --dangerously-skip-permissions \
+  --output-format stream-json --verbose < /dev/null
+"""
+
+
+def decide(verdict: dict | None, criteria: list[dict]) -> tuple[bool, str, list[str]]:
+    """Turn a reviewer's verdict into a merge decision. Returns (approved, why, findings).
+
+    The control plane decides, not the agent. The agent reports per-criterion status with
+    evidence; this recomputes the outcome from those statuses, so an "approve" cannot survive a
+    criterion the agent itself marked `not_met`. It can still request changes for something
+    outside the criteria — a reviewer may block for a reason nobody thought to write down, but
+    it may not wave one through.
+
+    Fails closed everywhere: no verdict file, unparseable JSON, or a criterion the reviewer
+    simply didn't mention all mean "not approved".
+    """
+    if not isinstance(verdict, dict):
+        return False, "no usable verdict from the reviewer", []
+
+    findings = [str(f) for f in (verdict.get("findings") or [])][:20]
+    reported = {
+        str(c.get("id")): c
+        for c in (verdict.get("criteria") or [])
+        if isinstance(c, dict) and c.get("id")
+    }
+
+    blocking = [c for c in criteria if c.get("mode") in BLOCKING_MODES]
+    unmet, missing = [], []
+    for criterion in blocking:
+        cid = str(criterion["id"])
+        got = reported.get(cid)
+        if got is None:
+            missing.append(cid)
+        elif got.get("status") != "met":
+            unmet.append(f"{cid} {got.get('status', 'unknown')}")
+
+    if missing:
+        return False, f"reviewer did not report on {', '.join(missing)}", findings
+    if unmet:
+        return False, f"criteria not met: {', '.join(unmet)}", findings
+    if verdict.get("verdict") != "approve":
+        return False, "reviewer requested changes", findings
+    return True, f"{len(blocking)} criteria met", findings
 
 
 class RunLog:
@@ -317,6 +507,32 @@ def format_event(event: dict) -> list[str]:
 # --------------------------------------------------------------------------- run
 
 
+async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> bool:
+    """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
+    than one we force, and the PR simply stays open for a human."""
+    try:
+        pr_number = int(pr_url.rstrip("/").split("/")[-1])
+        green, why = True, "checks not required"
+        if settings.merge_require_checks:
+            # The merge API waits for nothing, so without this the PR is merged seconds after
+            # `gh pr create` — before CI has even started. Every run forks from main, so a red
+            # main propagates into all of them.
+            log.write(f"[factory] waiting for checks on PR #{pr_number}")
+            sha = await github.pr_head_sha(repo, pr_number)
+            green, why = await github.checks_green(
+                repo, sha, timeout=settings.merge_check_timeout
+            )
+        if not green:
+            log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
+            return False
+        await github.merge_pr(repo, pr_number)
+        log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.write(f"[factory] merge failed (PR left open): {exc!r}")
+        return False
+
+
 async def _fail_run(
     run_id: str,
     repo: str,
@@ -383,6 +599,7 @@ async def create(
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
+    review_cycle: int = 1,
 ) -> str:
     """Register a run and schedule it. Returns the run id immediately.
 
@@ -411,11 +628,93 @@ async def create(
     )
 
     task = asyncio.create_task(
-        _guarded(run_id, repo, issue, branch, golden or settings.golden, attempt, prior_error, prior_log)
+        _guarded(
+            run_id, repo, issue, branch, golden or settings.golden,
+            attempt, prior_error, prior_log, review_cycle,
+        )
     )
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
     return run_id
+
+
+async def create_review(
+    repo: str,
+    issue_number: int,
+    pr_url: str,
+    branch: str,
+    golden: str | None = None,
+    cycle: int = 1,
+) -> str:
+    """Register and schedule a review of the pull request a build run opened."""
+    issue = await github.get_issue(repo, issue_number)
+    run_id = uuid.uuid4().hex
+    log_path = settings.log_dir / f"{run_id}.log"
+    log_path.touch()
+
+    await db.create_run(
+        id=run_id,
+        repo=repo,
+        issue_number=issue_number,
+        issue_title=issue["title"],
+        branch=branch,
+        golden=golden or settings.golden,
+        status="queued",
+        kind="review",
+        attempt=cycle,
+        agent=AGENT,
+        pr_url=pr_url,
+        log_path=str(log_path),
+        created_at=db.utcnow(),
+    )
+
+    task = asyncio.create_task(
+        _guarded_review(run_id, repo, issue, branch, pr_url, golden or settings.golden, cycle)
+    )
+    _tasks[run_id] = task
+    task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
+    return run_id
+
+
+async def _guarded_review(
+    run_id: str,
+    repo: str,
+    issue: dict,
+    branch: str,
+    pr_url: str,
+    golden: str,
+    cycle: int,
+) -> None:
+    log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
+    try:
+        async with semaphore():
+            await _execute_review(run_id, repo, issue, branch, pr_url, golden, log, cycle)
+    except asyncio.CancelledError:
+        log.write("[factory] review cancelled")
+        await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # A review that crashes must not merge anything, and must not silently strand the PR
+        # either. Leave it open, labelled, for a human.
+        log.write(f"[factory] review failed: {exc!r}")
+        reason = (
+            f"timed out after {settings.run_timeout}s"
+            if isinstance(exc, asyncio.TimeoutError)
+            else f"crashed: {str(exc)[:200] or type(exc).__name__}"
+        )
+        await db.update_run(
+            run_id, status="failed", error=reason, finished_at=db.utcnow()
+        )
+        await _mirror_issue(
+            repo,
+            issue["number"],
+            github.LABEL_BLOCKED,
+            [github.LABEL_RUNNING],
+            log,
+            comment=f"Review run {reason}. {pr_url} is open and unreviewed — needs a human.",
+        )
+    finally:
+        log.close()
 
 
 async def _guarded(
@@ -427,11 +726,15 @@ async def _guarded(
     attempt: int,
     prior_error: str | None,
     prior_log: str | None,
+    review_cycle: int = 1,
 ) -> None:
     log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
     try:
         async with semaphore():
-            await _execute(run_id, repo, issue, branch, golden, log, attempt, prior_error, prior_log)
+            await _execute(
+                run_id, repo, issue, branch, golden, log,
+                attempt, prior_error, prior_log, review_cycle,
+            )
     except asyncio.CancelledError:
         # A human stopped this run. Do not retry — cancellation is a decision, not a failure.
         log.write("[factory] run cancelled")
@@ -461,6 +764,7 @@ async def _execute(
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
+    review_cycle: int = 1,
 ) -> None:
     boxd = client()
     machine = None
@@ -546,40 +850,37 @@ async def _execute(
         await _salvage_transcript(boxd, machine.id, run_id, log)
 
         ok = exit_code == 0 and pr_url is not None
+        review_next = False
         if ok:
+            criteria = parse_criteria(issue.get("body") or "")
+            review_next = settings.review_enabled and bool(criteria)
             merged = False
-            if settings.auto_merge:
+            if review_next:
+                # Hand the PR to a reviewing agent instead of merging on the builder's word.
+                # An issue with no machine-readable criteria has nothing to review against, so
+                # it falls through to the old path rather than being reviewed against a guess.
+                log.write(f"[factory] {len(criteria)} acceptance criteria; queueing review")
+            elif settings.auto_merge:
                 # Merge now so the next issue in the sequence branches from a main that
-                # already contains this issue's work. A failed merge is logged, not fatal:
-                # the PR stays open for a human, and the chain simply doesn't advance cleanly.
-                try:
-                    pr_number = int(pr_url.rstrip("/").split("/")[-1])
-                    green, why = True, "checks not required"
-                    if settings.merge_require_checks:
-                        # The merge API waits for nothing, so without this the PR is merged
-                        # seconds after `gh pr create` — before CI has even started. Every
-                        # run forks from main, so a red main propagates into all of them.
-                        log.write(f"[factory] waiting for checks on PR #{pr_number}")
-                        sha = await github.pr_head_sha(repo, pr_number)
-                        green, why = await github.checks_green(
-                            repo, sha, timeout=settings.merge_check_timeout
-                        )
-                    if green:
-                        await github.merge_pr(repo, pr_number)
-                        merged = True
-                        log.write(f"[factory] auto-merged PR #{pr_number} into {base} ({why})")
-                    else:
-                        log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
-                except Exception as exc:  # noqa: BLE001
-                    log.write(f"[factory] auto-merge failed (PR left open): {exc!r}")
+                # already contains this issue's work.
+                if not criteria:
+                    log.write("[factory] issue carries no acceptance criteria; skipping review")
+                merged = await _merge(repo, pr_url, base, log)
             await db.update_run(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
             outcome = f"Factory run finished. Pull request: {pr_url}"
             if merged:
                 outcome += " (auto-merged)"
+            elif review_next:
+                outcome += " — under review"
             await _mirror_issue(
-                repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=outcome
+                repo,
+                number,
+                None if review_next else github.LABEL_DONE,
+                [] if review_next else [github.LABEL_RUNNING],
+                log,
+                comment=outcome,
             )
         else:
             reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
@@ -593,11 +894,185 @@ async def _execute(
             log.write(f"[factory] destroyed {machine.name}")
         else:
             log.write(f"[factory] keeping {machine.name} for inspection (FACTORY_KEEP_FAILED=1)")
+
+        # ---- hand off to review, once this run's VM is gone and its slot is free
+        if ok and review_next:
+            try:
+                await create_review(repo, number, pr_url, branch, golden, cycle=review_cycle)
+            except Exception as exc:  # noqa: BLE001 - an unreviewed PR beats a lost one
+                log.write(f"[factory] could not queue review: {exc!r}")
     finally:
         await boxd.close()
 
 
-async def _stream(boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog) -> tuple[int, dict]:
+async def _execute_review(
+    run_id: str,
+    repo: str,
+    issue: dict,
+    branch: str,
+    pr_url: str,
+    golden: str,
+    log: RunLog,
+    cycle: int,
+) -> None:
+    """Fork a VM, review the PR against the issue's criteria, then merge it or send it back."""
+    number = issue["number"]
+    base = await github.default_branch(repo)
+    criteria = parse_criteria(issue.get("body") or "")
+    boxd = client()
+    try:
+        await db.update_run(run_id, status="forking", started_at=db.utcnow())
+        vm_name = f"rev-{run_id[:8]}"
+        log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
+        log.write(f"[factory] forking {golden} -> {vm_name}")
+        machine = await boxd.machines.fork(
+            await golden_id(boxd, golden),
+            vm_name,
+            auto_suspend_timeout=0,
+            auto_destroy_timeout=settings.auto_destroy,
+        )
+        await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
+        await boxd.machines.wait_until_ready(machine.id, timeout=180)
+        log.write(f"[factory] {machine.name} ready ({machine.id})")
+
+        pr_number = int(pr_url.rstrip("/").split("/")[-1])
+        head_sha = await github.pr_head_sha(repo, pr_number)
+        base_sha = await github.merge_base_sha(repo, base, head_sha)
+
+        await db.update_run(run_id, status="running")
+        prompt = REVIEW_PROMPT_TEMPLATE.format(
+            repo=repo,
+            number=number,
+            title=issue["title"],
+            pr_url=pr_url,
+            branch=branch,
+            base=base,
+            base_sha=base_sha,
+            criteria=yaml.safe_dump(criteria, sort_keys=False, allow_unicode=True),
+        )
+        env = {
+            "FACTORY_REPO_DIR": settings.repo_dir,
+            "FACTORY_BRANCH": branch,
+            "FACTORY_BASE": base,
+            "FACTORY_PROMPT": prompt,
+            "FACTORY_AGENT_EFFORT": settings.agent_effort,
+            "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
+            "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
+            "OTEL_RESOURCE_ATTRIBUTES": (
+                f"run.id={run_id},issue={repo}#{number},repo={repo},vm={machine.name},kind=review"
+            ),
+        }
+        if settings.anthropic_api_key:
+            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+        if settings.claude_code_oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
+
+        exit_code, usage = await asyncio.wait_for(
+            _stream(boxd, machine.id, env, log, script=REVIEW_SCRIPT),
+            timeout=settings.run_timeout,
+        )
+        log.write(f"[factory] reviewer exited {exit_code}")
+        verdict = await _read_verdict(boxd, machine.id, log)
+        await _salvage_transcript(boxd, machine.id, run_id, log)
+
+        approved, why, findings = decide(verdict, criteria)
+        await db.update_run(
+            run_id,
+            exit_code=exit_code,
+            tokens_in=usage.get("tokens_in"),
+            tokens_out=usage.get("tokens_out"),
+            cost_usd=usage.get("cost_usd"),
+            verdict=json.dumps(verdict) if verdict else None,
+            status="succeeded",
+            error=None if approved else why,
+            finished_at=db.utcnow(),
+        )
+        log.write(f"[factory] verdict: {'approve' if approved else 'request changes'} — {why}")
+        for finding in findings:
+            log.write(f"[factory]   finding: {finding}")
+
+        await asyncio.sleep(3)
+        await boxd.machines.delete(machine.id)
+        log.write(f"[factory] destroyed {machine.name}")
+
+        # ---- act on the verdict
+        if approved:
+            merged = settings.auto_merge and await _merge(repo, pr_url, base, log)
+            comment = f"Review passed — {why}. {pr_url}"
+            if merged:
+                comment += " (merged)"
+            await _mirror_issue(
+                repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=comment
+            )
+            return
+
+        detail = "\n".join(f"- {f}" for f in findings) or "- (no specific findings recorded)"
+        if cycle < settings.max_review_cycles:
+            # Send it back as an ordinary retry: same branch, one attempt further on, findings
+            # as the context. That reuses the resume-on-retry checkout, so the fix builds on
+            # the commits already pushed rather than starting over.
+            log.write(f"[factory] requesting changes; fix run {cycle + 1} scheduled")
+            await _mirror_issue(
+                repo,
+                number,
+                None,
+                [],
+                log,
+                comment=f"Review {cycle} requested changes ({why}):\n{detail}\n\nFixing.",
+            )
+            await create(
+                repo,
+                number,
+                golden=golden,
+                attempt=cycle + 1,
+                prior_error=f"review requested changes: {why}",
+                prior_log=f"Reviewer findings:\n{detail}",
+                review_cycle=cycle + 1,
+            )
+        else:
+            log.write(f"[factory] requesting changes; review budget spent, halting")
+            await _mirror_issue(
+                repo,
+                number,
+                github.LABEL_BLOCKED,
+                [github.LABEL_RUNNING, github.LABEL_QUEUED],
+                log,
+                comment=(
+                    f"Review still requesting changes after {cycle} cycles ({why}):\n{detail}"
+                    f"\n\nStopping — the issue may be wrong rather than the code. {pr_url}"
+                ),
+            )
+    finally:
+        await boxd.close()
+
+
+async def _read_verdict(boxd: AsyncBoxd, machine_id: str, log: RunLog) -> dict | None:
+    """Read the verdict file out of the VM. Any failure returns None, which `decide` treats
+    as "not approved" — a reviewer that produced nothing readable has approved nothing."""
+    try:
+        result = await boxd.machines.exec(machine_id, f"cat {VERDICT_PATH}", timeout=30)
+        raw = getattr(result, "stdout", None) or ""
+        if inspect.isawaitable(raw):  # pragma: no cover - SDK shape drift
+            raw = await raw
+        text = raw.strip()
+        if not text:
+            log.write("[factory] reviewer wrote no verdict file")
+            return None
+        # The agent sometimes wraps JSON in a ``` fence despite being asked not to.
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n|\n```$", "", text.strip())
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        log.write(f"[factory] verdict file is not valid JSON: {exc}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.write(f"[factory] could not read verdict: {exc!r}")
+        return None
+
+
+async def _stream(
+    boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog, script: str = VM_SCRIPT
+) -> tuple[int, dict]:
     """Run the agent, formatting its event stream into the log as it arrives.
 
     Returns the exit code and the usage captured from the final `result` event
@@ -606,7 +1081,7 @@ async def _stream(boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog) -> t
     buffer = ""
     usage: dict = {}
     async with boxd.machines.stream_exec(
-        machine_id, command=VM_SCRIPT, env=env, close_stdin=True
+        machine_id, command=script, env=env, close_stdin=True
     ) as stream:
         async for chunk in stream.iter_chunks():
             text = chunk.data.decode("utf-8", errors="replace")

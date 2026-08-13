@@ -92,6 +92,14 @@ class Settings:
     merge_require_checks: bool = os.environ.get("FACTORY_MERGE_REQUIRE_CHECKS", "1") == "1"
     # How long to wait for those checks before giving up and leaving the PR open.
     merge_check_timeout: int = int(os.environ.get("FACTORY_MERGE_CHECK_TIMEOUT", "900"))
+    # After a build run opens a PR, run a second agent that checks it against the issue's
+    # acceptance criteria before anything merges. Only applies to issues that actually carry a
+    # machine-readable criteria block — without one there is nothing to check, so the review is
+    # skipped rather than guessed at.
+    review_enabled: bool = os.environ.get("FACTORY_REVIEW", "1") == "1"
+    # How many times a review may send an issue back for changes before it stops and asks for a
+    # human. Two is deliberate: a third failure means the issue is wrong, not the code.
+    max_review_cycles: int = int(os.environ.get("FACTORY_MAX_REVIEW_CYCLES", "2"))
     # Retry a failed issue up to this many attempts total (1 = no retry). Each attempt is
     # its own run, and the previous attempt's log is fed to the next as context.
     max_attempts: int = int(os.environ.get("FACTORY_MAX_ATTEMPTS", "3"))

@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS runs (
     log_path        TEXT,
     transcript_path TEXT,
     attempt         INTEGER NOT NULL DEFAULT 1,
+    kind            TEXT NOT NULL DEFAULT 'build',
+    verdict         TEXT,
     agent           TEXT,
     tokens_in       INTEGER,
     tokens_out      INTEGER,
@@ -52,6 +54,12 @@ MIGRATIONS = (
     "ALTER TABLE runs ADD COLUMN tokens_in INTEGER",
     "ALTER TABLE runs ADD COLUMN tokens_out INTEGER",
     "ALTER TABLE runs ADD COLUMN cost_usd REAL",
+    # 'build' (an agent resolving an issue) or 'review' (an agent checking the resulting PR
+    # against the issue's acceptance criteria). Both are runs on a forked VM, which is why
+    # they share this table rather than getting one of their own.
+    "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'build'",
+    # Review runs only: the verdict JSON the reviewing agent produced.
+    "ALTER TABLE runs ADD COLUMN verdict TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.
