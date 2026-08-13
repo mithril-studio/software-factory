@@ -198,6 +198,26 @@ async def pr_head_sha(repo: str, number: int) -> str:
     return resp.json()["head"]["sha"]
 
 
+async def merge_base_sha(repo: str, base: str, head_sha: str) -> str:
+    """The commit a branch actually diverged from.
+
+    Not the current tip of `base`: main moves while a run works, and a reviewer that ran the
+    branch's new tests against a *later* main would be testing someone else's changes too.
+    The merge base is the code as it was when this work started, which is what "did this test
+    fail before the change" has to mean. Falls back to the base branch name on any error —
+    an approximate comparison beats none.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{API}/repos/{repo}/compare/{base}...{head_sha}", headers=_headers()
+            )
+            resp.raise_for_status()
+        return resp.json()["merge_base_commit"]["sha"]
+    except Exception:  # noqa: BLE001
+        return base
+
+
 async def checks_green(
     repo: str, sha: str, timeout: int = 900, interval: int = 15
 ) -> tuple[bool, str]:
