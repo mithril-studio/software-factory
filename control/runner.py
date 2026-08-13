@@ -83,10 +83,14 @@ How to work:
 6. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
    referencing the issue in the body so it links (e.g. "Closes #{number}").
 
-Environment notes:
-- The repository is already installed and configured. `.env` is correct and read-only —
-  do not create, copy or modify it, and do not print its contents.
-- The test database is already running and migrated. Do not start or reset it.
+Environment notes — this machine is already set up, so setup work is wasted work:
+- Dependencies are installed and the build cache is warm. Do not run `npm ci`, do not
+  delete `node_modules`, and do not clear the build output. Install a package only if the
+  issue genuinely needs a new one.
+- `.env` is correct and read-only. Do not create, copy or modify it, and do not print its
+  contents.
+- The test database is already running, migrated and seeded. Do not start, reset or
+  re-seed it.
 - Run long commands in the foreground with an explicit timeout, e.g.
   `timeout 600 npm run build`. Do not put work in the background to wait for it later:
   background tasks and scheduled wake-ups do not deliver notifications in this
@@ -203,6 +207,20 @@ if [ "$FACTORY_ATTEMPT" -gt 1 ] && git rev-parse --verify --quiet "origin/$FACTO
 else
   echo "FACTORY: checking out $FACTORY_BRANCH from origin/$FACTORY_BASE"
   git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BASE" || { echo "FACTORY: checkout failed" >&2; exit 92; }
+fi
+# Fail fast when the machine's toolchain does not match what the repo pins. This is not
+# cosmetic: two npm majors disagree about what belongs in a lock file, so a mismatched golden
+# has its agents silently write lock files CI cannot install — which surfaces two steps later
+# as an unrelated-looking CI failure rather than as the version problem it is. That exact
+# mismatch killed CI on fourteen consecutive commits before anyone noticed. Skipped when the
+# repo pins nothing or the runtime is absent, so this stays harmless for non-Node projects.
+if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
+  want=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
+  have=$(node -v | tr -d 'v' | cut -d. -f1)
+  if [ -n "$want" ] && [ "$want" != "$have" ]; then
+    echo "FACTORY: this machine runs node $have but .nvmrc pins $want — the golden needs rebuilding" >&2
+    exit 93
+  fi
 fi
 echo "FACTORY: starting agent"
 claude -p "$FACTORY_PROMPT" \
