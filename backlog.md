@@ -20,6 +20,30 @@ and CodeRabbit under item 6.
 
 ## now
 
+### 0. Repair CI and add change guards — ✅ [FE #45](https://github.com/mithril-studio/foundation-e-learning/pull/45)
+
+Three unrelated breakages, all pre-existing: the lock file (see item 2's Node note),
+`secret-scan` 403ing because gitleaks-action's PR mode needs `pull-requests: read`, and
+`dependency-review` requiring GitHub Advanced Security the repo does not have (removed —
+`npm run audit` already covers the lock file more broadly).
+
+Added a `guards` job — five deterministic checks on the *shape* of a change, each with an
+explicit escape hatch, each tested against its own negative case before shipping:
+
+| Guard | Escape hatch |
+|---|---|
+| No silently deleted tests | `Removes-tests: <reason>` in the PR body |
+| No unapproved dependencies | `Adds-dependency: <name> — <why>` |
+| No schema/migration drift | none — should never fail legitimately |
+| Suppressions carry a `-- <why>` | the justification itself |
+| Coverage floor (33% statements) | raise it deliberately in its own PR |
+
+The secret scan is scoped to the commits a change introduces rather than full history: a
+full-history scan reports 8 findings, all fixture passwords in `tests/integration`, so as a
+blocking gate it would have been red on arrival for something no author can fix.
+
+**`main`'s CI is green for the first time since issue #19.**
+
 ### 1. Stop the background-wait deadlock
 
 Three of the last ten runs died the same way: the agent backgrounds a long Playwright suite,
@@ -56,7 +80,8 @@ that it has to.
 
 Bake into the golden:
 
-- Node 22 as the default (`nvm install 22 && nvm alias default 22`)
+- **Node 22 as the default** (`nvm install 22 && nvm alias default 22`) — promoted from a
+  tidiness item to the most urgent one on this list. See below.
 - `npm ci` — `node_modules` present in the snapshot (disk is 88G free, this is cheap)
 - `docker compose up -d db_test` running, migrated and seeded (so `app_user` exists —
   it is created by migration `0000_create-app-role.sql`, not by docker)
@@ -66,6 +91,25 @@ Bake into the golden:
 
 **Deliberately not installed:** Playwright browsers. E2E belongs to a future tester agent and
 to CI, not to the main factory run — see item 7.
+
+#### The Node version is a correctness bug, not a speed one
+
+The golden runs **Node 24 / npm 11**. The target repo's `.nvmrc` says **22**, and CI installs
+from that file, so CI runs **npm 10**. The two npm majors resolve optional peer dependencies
+differently: npm 11 omits the nested `@swc/helpers` entry that npm 10 requires.
+
+So every agent that touched a dependency wrote a lock file that `npm ci` could not install,
+and CI died at its first step — on every PR and on main — from issue #19 onward. Fifteen PRs
+merged with no verification but the agent's own word for it. Nobody noticed because
+auto-merge did not wait for CI (item 6), so the red never blocked anything.
+
+Confirmed the hard way while fixing it: the corrected lock file was regenerated under Node
+22, then silently re-broken by a single local `npm i` under npm 11 before it was pushed.
+
+This makes matching the golden's toolchain to `.nvmrc` a prerequisite for the whole
+pipeline. Every gate downstream — guards, reviewer agent, preview — assumes `npm ci` works.
+A tempting stopgap is to pin `engine-strict` or check the lock file in CI, but the real fix
+is that the machine agents work on should run what CI runs.
 
 Expected: ~10 min/run of tooling, plus a meaningful cut in exploration turns.
 
