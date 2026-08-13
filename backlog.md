@@ -80,8 +80,10 @@ that it has to.
 
 Bake into the golden:
 
-- **Node 22 as the default** (`nvm install 22 && nvm alias default 22`) — promoted from a
-  tidiness item to the most urgent one on this list. See below.
+- ✅ **Node 22 as the default** — done 2026-08-13. Note `nvm alias default` is *not*
+  sufficient on its own: agent runs execute under `/bin/sh`, which never loads nvm. What
+  actually resolves `node` is a set of root-owned symlinks in `/usr/local/bin`
+  (`node`, `npm`, `npx`, `corepack`) that pointed at v24. Both had to be repointed.
 - `npm ci` — `node_modules` present in the snapshot (disk is 88G free, this is cheap)
 - `docker compose up -d db_test` running, migrated and seeded (so `app_user` exists —
   it is created by migration `0000_create-app-role.sql`, not by docker)
@@ -110,6 +112,20 @@ This makes matching the golden's toolchain to `.nvmrc` a prerequisite for the wh
 pipeline. Every gate downstream — guards, reviewer agent, preview — assumes `npm ci` works.
 A tempting stopgap is to pin `engine-strict` or check the lock file in CI, but the real fix
 is that the machine agents work on should run what CI runs.
+
+**Fixed 2026-08-13**, verified in the environment agents actually get (a fresh
+non-interactive `boxd machine exec`, not a login shell):
+
+```
+node: v22.23.2    npm: 10.9.8      # matches .nvmrc and CI exactly
+npm ci                             → added 898 packages
+npm install --package-lock-only    → lock file unchanged, no drift
+```
+
+That second test is the one that matters: an agent running a plain `npm install` no longer
+rewrites the lock file out from under CI, which is the mechanism that broke `main` fourteen
+times in a row. This does not need re-checking per run — but it does need re-checking
+whenever the golden is rebuilt, since it is a property of the machine, not of the repo.
 
 Expected: ~10 min/run of tooling, plus a meaningful cut in exploration turns.
 
