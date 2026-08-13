@@ -92,6 +92,36 @@ diagnosis, and the reason the mechanical half of each fix (env vars, tool flags,
 checkout) matters more than the prompt half. Prompt for things you'd like; use flags and
 harness behaviour for things that cost money when ignored.
 
+### The review pipeline, and why criteria are executable
+
+Joost, on not reviewing diffs by hand: *"Automated development is the whole premise of the
+software-factory."* Agreed shape — layers, cheapest first, and every failure feeds a fix run
+rather than a human inbox:
+
+CI floor → diff-shape guards → reviewer agent → preview + smoke → human, rarely.
+
+The design decision worth preserving, because it is what keeps the reviewer honest: **the
+agent never chooses how hard to look.** Each acceptance criterion declares a `mode`, and the
+reviewer executes that mode. Given the choice it would always pick the cheapest — read the
+diff and reason about it — and that is exactly where hallucination lives. Reading code and
+asserting "this returns 429" is a confident guess; running it and observing a 429 is a fact.
+
+Joost: *"it should be insanely deterministic to prevent hallucinations."* Hence: evidence is a
+`file:line`, a test name, or a command and its output. No evidence means `cannot_verify`, and
+`cannot_verify` counts as not met. `inspect` — the mode that needs judgment — can never block
+on its own.
+
+And the cheap comparison that catches the failure nobody else can: **a new test must fail
+against the old code.** The reviewer checks out base, drops the branch's new tests onto it,
+and runs them. If they pass there, either the criterion was already satisfied and the agent
+did nothing, or the test asserts nothing. Both are invisible in a diff. It is "watch the test
+fail first", mechanised.
+
+What stays human regardless of how green everything is: product judgment, and changes touching
+`drizzle/migrations/`, `src/auth/`, or anything with PII. The factory has already merged +9,072
+lines of GDPR erasure logic unreviewed; automated gates are for correctness, and that class of
+change carries legal exposure, which is a different question.
+
 ### Reference numbers from this analysis
 
 Baseline to measure future changes against. Last 10 runs, 7 issues:

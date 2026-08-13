@@ -19,6 +19,9 @@ An issue is correctly sized when it:
   Usually on the order of a few files.
 - Has **acceptance criteria the VM can verify itself** — a command that runs, a test that passes,
   an endpoint that responds. No criterion needing a human's eyes or a service the VM can't reach.
+  A useful sizing test: if you cannot name the test file that would prove an issue is done, the
+  issue is too vague or too large. Naming it is also what the `verify` field asks for, so the
+  effort is not extra.
 - Describes the work **without "and also"** chaining unrelated changes. "And also" is the signal
   to split into two issues.
 - Is **not churn** — if the PR would be smaller than its own boilerplate (e.g. "add one field"),
@@ -63,6 +66,11 @@ State your chosen granularity and the reasoning in the review step so the human 
 ## Smells to catch
 
 - An issue whose acceptance criteria a VM can't check → rewrite the criteria or cut scope.
+- An issue whose criteria are **all `inspect`** → nothing can block a bad PR for it. Find at
+  least one fact about behaviour that a test can pin down.
+- A criterion phrased as a task ("add validation") rather than a fact ("a request with no `url`
+  field is rejected with 400") → rewrite it. A task is done when the agent says so; a fact is
+  true or it isn't.
 - An issue that assumes work not yet merged → reorder or add the missing predecessor.
 - Issue #1 doing anything beyond "stand up a green skeleton" → thin it down.
 - A criterion needing a real external service/secret → move it out of scope or to a documented
