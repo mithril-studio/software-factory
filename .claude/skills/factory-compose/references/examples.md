@@ -36,9 +36,16 @@ with a test harness, so every later step has a green baseline to build on.
 - Add one test that asserts `/healthz` returns 200.
 
 ## Acceptance criteria
-- [ ] `uvicorn app:app` starts and `GET /healthz` returns 200 `{"ok": true}`.
-- [ ] `pytest` passes with at least the healthz test.
-- [ ] Existing tests still pass and the build is green.
+```yaml
+- id: AC1
+  mode: test
+  statement: "GET /healthz returns 200 with body {\"ok\": true}."
+  verify: "tests/test_healthz.py"
+- id: AC2
+  mode: probe
+  statement: "The app starts under uvicorn without error."
+  verify: "uvicorn app:app --port 8099 & sleep 3; curl -fsS localhost:8099/healthz"
+```
 
 ## Out of scope
 - Any shortening, redirect, database, or persistence logic — later steps own all of that.
@@ -62,10 +69,16 @@ codes resolvable by adding the redirect endpoint.
 - Return 404 with a JSON error when the code doesn't exist.
 
 ## Acceptance criteria
-- [ ] A code created via `POST /shorten` then `GET /{code}` returns 302 with the correct Location.
-- [ ] `GET /{unknown}` returns 404 with a JSON body.
-- [ ] A test covers both the hit and miss paths.
-- [ ] Existing tests still pass and the build is green.
+```yaml
+- id: AC1
+  mode: test
+  statement: "A code created via POST /shorten then fetched via GET /{code} returns 302 with the original URL in Location."
+  verify: "tests/test_redirect.py::test_known_code_redirects"
+- id: AC2
+  mode: test
+  statement: "GET /{unknown} returns 404 with a JSON body."
+  verify: "tests/test_redirect.py::test_unknown_code_404"
+```
 
 ## Out of scope
 - Hit counting (next step) and input validation (its own step).

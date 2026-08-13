@@ -37,6 +37,11 @@ whole repo** until a human clears it. Consequences you must design around:
    `<!-- factory-compose: <slug> step n/total -->`; check for it before creating.
 3. **Halt-aware.** Scrutinize issue #1 hardest, and flag any acceptance criterion that needs
    secrets or networks a VM can't reach — those fail forever and halt the repo.
+4. **Acceptance criteria are executable, not prose.** They are a YAML block where each
+   criterion carries a `mode` (`test` / `probe` / `structure` / `inspect`) and a `verify`
+   naming what proves it. Nobody reads these PRs before they merge — a reviewing agent runs
+   the criteria instead, and it can only run what you made runnable. See
+   `references/issue-template.md`.
 
 ## Procedure
 

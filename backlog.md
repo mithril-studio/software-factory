@@ -13,8 +13,16 @@ resume-on-retry, `checks_green` gating auto-merge, and Sentry removal (PR #44). 
 `FACTORY_RUN_TIMEOUT` to 90 minutes and made a timeout say so instead of recording
 `crashed: ` with an empty message.
 
-**Not yet started:** items 2 (warm golden), 8 (budget ceiling), 9 (memory), 10 (telemetry),
-and CodeRabbit under item 6.
+**Also shipped:** item 0 (CI repaired + change guards), item 2 (golden warm, on Node 22, with a
+toolchain assertion in `VM_SCRIPT`), and executable acceptance criteria in `factory-compose`.
+
+**Not yet started:** 8 (budget ceiling), 8b (dependency safety), 8c (script the golden build),
+9 (memory), 10 (telemetry), CodeRabbit under 6 — and the three pipeline pieces below.
+
+**The pipeline, agreed 2026-08-13** (see `discussion.md` for the design):
+CI floor ✅ → executable acceptance criteria ✅ → smoke suite → reviewer agent → preview.
+CodeRabbit was removed from the account: rate-limited on this plan, so it reviewed some PRs
+and not others while reporting green either way.
 
 ---
 
@@ -290,6 +298,52 @@ turn count. Failed runs currently record `cost_usd = NULL` and `error = "crashed
 real spend is invisible in our own ledger; fix that at the same time.
 
 ---
+
+### 8b. Dependency safety in the target repos
+
+The factory installs dependencies on its own initiative — `pino`, `@sentry/nextjs`, `pdf-lib`,
+`audit-ci` and `@playwright/test` all arrived that way — so supply-chain controls matter more
+here than in a repo where a human types every `npm install`.
+
+`foundation-e-learning` already has more of this than most repos, and none of it should be
+disturbed: Dependabot with grouped production/dev PRs, a committed lock file with `npm ci`,
+`audit-ci` in CI, gitleaks, `engines` + `.nvmrc`, and — unusually — **GitHub Actions pinned by
+commit SHA rather than tag**, which is the control that stops a compromised action from
+executing in the pipeline.
+
+**Do first, it is broken right now:** Dependabot PRs #41 and #42 still fail in seven seconds.
+They branched off the old broken `main`, so they carry the pre-fix lock file. `@dependabot
+rebase` on each, or wait for its next run.
+
+Then, in order of value:
+
+1. **A cooldown before adopting new versions.** The single strongest control available:
+   compromised packages are typically caught within days of publication, so simply not being
+   first to install anything skips nearly every such event. Dependabot supports a cooldown;
+   Renovate calls it `minimumReleaseAge`. 3–7 days.
+2. **`npm audit signatures` in CI** — verifies packages came from who claims to have published
+   them. One line in the `gates` job.
+3. **`ignore-scripts=true` in `.npmrc`** — install scripts are the main execution vector for a
+   malicious package. Third rather than first because some packages genuinely need them, so it
+   takes tuning.
+4. **An automerge policy for dependency PRs** — dev-dependency patches can merge themselves on
+   green CI; production dependencies and majors get a human. Same gating question as item 6,
+   and now answerable, since CI means something again.
+5. **SBOM generation** (`npm sbom`) — matters more here than in most projects given the AVG
+   posture already documented in `docs/security.md`.
+
+Not recommended: switching Dependabot for Renovate. Renovate is more configurable, but
+Dependabot is working and configured, and the gap does not pay for the migration.
+
+### 8c. Provision the golden from a script, not by hand
+
+Everything in item 2 was done by hand over `boxd machine exec`. That makes the golden a pet:
+nobody can reproduce it, and a rebuild loses all of it silently. It should be a
+`scripts/build-golden.sh` that goes from a bare `boxd new` to a warm golden in one run —
+reviewable, repeatable, and the same script the re-sync-after-merge job can call.
+
+This is the difference between "the golden is warm" being a fact about a machine somebody
+once configured, and a property the system maintains.
 
 ## later
 

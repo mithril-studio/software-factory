@@ -68,6 +68,11 @@ How to work:
 1. Load the `memory` skill first and prime yourself from `.mem/` if it exists. What past
    runs learned about this repo is the most valuable context you have.
 2. Make the change. Stay in scope: resolve this issue, nothing more.
+   If the issue carries an `## Acceptance criteria` block, that is the contract. Every
+   criterion must be true when you are done, and a reviewing agent will afterwards run each
+   one rather than take your word for it. For `mode: test` criteria, write the test at the
+   path given in `verify`, and make sure it **fails before your change and passes after** —
+   a test that passes either way proves nothing and will be rejected.
 3. Commit and push as you go — after each meaningful step, not once at the end:
    git add -A && git commit -m "<message>" && git push -u origin {branch}
    The branch is what survives; this VM is destroyed when you exit. If this run dies
