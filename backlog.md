@@ -70,26 +70,48 @@ cannot violate.
 
 Not a skill — see `discussion.md` §"Where rules live".
 
-### 2. Warm the golden
+### 2. Warm the golden — ✅ done 2026-08-13
 
-`factory-golden` is cold. Its repo is pinned at `e21a7b6 Initialize repository` while main is
-~15 PRs ahead; `node_modules` is empty; there is no Playwright cache; no db container; and it
-runs Node v24 against a repo that declares `engines: node 22.x` (hence the `EBADENGINE`
-warnings in every run). Every fork re-pays all of it, and burns discovery turns working out
-that it has to.
+`factory-golden` was cold: repo pinned at `e21a7b6 Initialize repository` while main was ~15
+PRs ahead, no `node_modules`, no db container, and Node v24 against a repo pinning 22. Every
+fork re-paid all of it, and burned discovery turns working out that it had to.
 
-Bake into the golden:
+**A fork inherits running processes, not just disk.** That was the open question, and it is
+worth writing down because it decides how much can be baked in. Verified by forking the warm
+golden and inspecting the fork before touching anything:
+
+```
+commit:       37e58c1 (current main)     node:   v22.23.2
+node_modules: 617 packages               .next:  232M, cache warm
+docker:       repo-db_test-1  Up (healthy)
+psql:         schema present, 2 tenants / 6 users seeded
+npm run test:integration → 19 files, 126 tests passed in 34s, zero setup
+```
+
+The database keeps its data in tmpfs (RAM), so surviving the fork was not a given — a
+cold-booting fork would have come up with an empty database and made the prompt's "already
+migrated" line a lie. It survives, so the prompt can state it.
+
+What was baked in:
 
 - ✅ **Node 22 as the default** — done 2026-08-13. Note `nvm alias default` is *not*
   sufficient on its own: agent runs execute under `/bin/sh`, which never loads nvm. What
   actually resolves `node` is a set of root-owned symlinks in `/usr/local/bin`
   (`node`, `npm`, `npx`, `corepack`) that pointed at v24. Both had to be repointed.
-- `npm ci` — `node_modules` present in the snapshot (disk is 88G free, this is cheap)
-- `docker compose up -d db_test` running, migrated and seeded (so `app_user` exists —
-  it is created by migration `0000_create-app-role.sql`, not by docker)
-- one `npm run build` so `.next/cache` is warm (65 builds across 10 runs at ~32s each)
-- a correct, read-only `.env` (see item 3)
-- the repo checked out at current `origin/main`
+- ✅ `npm ci` — 617 packages present, verified usable by running `npm run typecheck`
+- ✅ `db_test` running, migrated and seeded (`app_user` comes from migration
+  `0000_create-app-role.sql`, not from docker, so migrating is what creates the role)
+- ✅ one `npm run build` — `.next/cache` warm (65 builds across 10 runs at ~32s each)
+- ✅ a correct, read-only `.env` (item 3)
+- ✅ the repo checked out at current `origin/main`
+- ✅ a version assertion in `VM_SCRIPT`, so a golden that drifts off `.nvmrc` fails
+  immediately with a clear message instead of producing a broken lock file
+
+**This is machine state, not repo state.** It does not need re-checking per fork — forks
+inherit it — but all of it must be redone if the golden is ever rebuilt from a base image,
+and it goes stale as `main` advances. A re-sync-after-merge job is the remaining gap
+(`git pull && npm ci && npm run build && npm run db:migrate`, then re-snapshot); without it
+this decays back to where it started, just more slowly.
 
 **Deliberately not installed:** Playwright browsers. E2E belongs to a future tester agent and
 to CI, not to the main factory run — see item 7.
