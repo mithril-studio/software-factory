@@ -1,5 +1,6 @@
-"""The two deterministic pieces of review: reading an issue's criteria, and turning a
-reviewer's verdict into a merge decision.
+"""The three deterministic pieces of review: reading an issue's criteria, turning a
+reviewer's verdict into a merge decision, and routing an approved pull request that did not
+actually land.
 
 Both must fail closed, which is the whole point — everything else in a review run is an agent
 exercising judgement, and these are the two places that decide what its judgement is allowed
@@ -11,7 +12,7 @@ Run it directly, no framework needed:
 """
 import sys
 
-from control.runner import parse_criteria, decide
+from control.runner import parse_criteria, decide, merge_outcome
 
 ISSUE = """<!-- factory-compose: demo step 3/7 -->
 
@@ -91,6 +92,20 @@ check("reviewer may still block for its own reasons",
 check("findings are carried through",
       decide({"verdict": "request_changes", "criteria": blocking_ok,
               "findings": ["a", "b"]}, c)[2], ["a", "b"])
+
+# ---------- routing an approved pull request that did not land
+# The bug this pins down: every ending that was not a merge used to be treated as done,
+# so a pull request broken by CI sat open under an issue labelled `agent:done`.
+check("merged -> done", merge_outcome(True, True, None), "done")
+check("auto-merge off -> done, a human takes it from here",
+      merge_outcome(False, False, None), "done")
+check("auto-merge off is done even if a stale failure is passed in",
+      merge_outcome(False, False, "checks failed: gates=failure"), "done")
+check("CI red on approved code -> fix run",
+      merge_outcome(True, False, "checks failed: gates=failure"), "fix")
+check("not merged, no failure to work from -> human",
+      merge_outcome(True, False, None), "human")
+check("empty string is not a failure -> human", merge_outcome(True, False, ""), "human")
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
