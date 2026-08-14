@@ -220,18 +220,24 @@ async def merge_base_sha(repo: str, base: str, head_sha: str) -> str:
 
 async def checks_green(
     repo: str, sha: str, timeout: int = 900, interval: int = 15
-) -> tuple[bool, str]:
+) -> tuple[bool, str, list[str]]:
     """Wait for every check run on `sha` to finish, and report whether all passed.
 
-    Returns (ok, reason). `ok` is True only when at least one check has run and all of them
-    completed acceptably — an unverified commit is never treated as a green one.
+    Returns (ok, reason, failed). `ok` is True only when at least one check has run and all
+    of them completed acceptably — an unverified commit is never treated as a green one.
+
+    `failed` carries the names of checks that finished and did not pass, and is the caller's
+    signal that the commit is *known* red rather than merely unmerged. It is empty for every
+    other unhappy ending — still pending, timed out, API unreachable — because "we could not
+    find out" and "CI says no" call for different responses: the first needs a human, the
+    second is something an agent can be sent back to fix.
 
     This exists because the merge API does not wait for anything: without it, a PR is merged
     seconds after `gh pr create`, before CI has even started, and a red main then propagates
     into every subsequent run (which forks from main).
 
-    Never raises. A GitHub hiccup returns (False, reason) so the caller leaves the PR open
-    for a human rather than failing an otherwise good run.
+    Never raises. A GitHub hiccup returns ok=False so the caller leaves the PR open for a
+    human rather than failing an otherwise good run.
     """
     deadline = asyncio.get_running_loop().time() + timeout
     last = "no check runs reported"
@@ -253,17 +259,17 @@ async def checks_green(
                         if r.get("conclusion") not in CHECK_OK
                     ]
                     if failed:
-                        return False, f"checks failed: {', '.join(failed)}"
-                    return True, f"{len(runs)} checks passed"
+                        return False, f"checks failed: {', '.join(failed)}", failed
+                    return True, f"{len(runs)} checks passed", []
                 else:
                     pending = [r.get("name") for r in runs if r.get("status") != "completed"]
                     last = f"still running: {', '.join(p for p in pending if p)}"
 
                 if asyncio.get_running_loop().time() >= deadline:
-                    return False, f"timed out after {timeout}s ({last})"
+                    return False, f"timed out after {timeout}s ({last})", []
                 await asyncio.sleep(interval)
     except Exception as exc:  # noqa: BLE001 - a merge we skip is always safer than one we force
-        return False, f"could not read checks: {exc!r}"
+        return False, f"could not read checks: {exc!r}", []
 
 
 async def merge_pr(repo: str, number: int, method: str = "squash") -> dict:

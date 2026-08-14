@@ -429,6 +429,23 @@ def decide(verdict: dict | None, criteria: list[dict]) -> tuple[bool, str, list[
     return True, f"{len(blocking)} criteria met", findings
 
 
+def merge_outcome(auto_merge: bool, merged: bool, ci_failure: str | None) -> str:
+    """What an approved review should do with the pull request: "done", "fix" or "human".
+
+    Kept separate from the code that acts on it because the interesting part is the routing,
+    not the doing, and the routing is where this went wrong: every ending that was not a
+    merge used to be labelled `agent:done`, which left broken pull requests sitting open
+    under issues that claimed to be finished.
+
+    - "done"  — merged, or auto-merge is off and a human was always going to take it from here
+    - "fix"   — CI ran and came back red, which is a defect a fix run can be sent back for
+    - "human" — not merged and no failure to work from: pending, unreachable, or refused
+    """
+    if merged or not auto_merge:
+        return "done"
+    return "fix" if ci_failure else "human"
+
+
 class RunLog:
     """Append-only, human-readable log for one run. The UI tails this file over SSE."""
 
@@ -507,30 +524,80 @@ def format_event(event: dict) -> list[str]:
 # --------------------------------------------------------------------------- run
 
 
-async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> bool:
+async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> tuple[bool, str | None]:
     """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
-    than one we force, and the PR simply stays open for a human."""
+    than one we force, and the PR simply stays open for a human.
+
+    Returns (merged, ci_failure). `ci_failure` is set only when CI ran and came back red,
+    which is a thing an agent can be sent back to fix; every other reason for not merging
+    (checks still pending, GitHub unreachable, the merge itself refused) leaves it None,
+    because those need a human to look rather than another run to guess.
+    """
     try:
         pr_number = int(pr_url.rstrip("/").split("/")[-1])
-        green, why = True, "checks not required"
+        green, why, failed = True, "checks not required", []
         if settings.merge_require_checks:
             # The merge API waits for nothing, so without this the PR is merged seconds after
             # `gh pr create` — before CI has even started. Every run forks from main, so a red
             # main propagates into all of them.
             log.write(f"[factory] waiting for checks on PR #{pr_number}")
             sha = await github.pr_head_sha(repo, pr_number)
-            green, why = await github.checks_green(
+            green, why, failed = await github.checks_green(
                 repo, sha, timeout=settings.merge_check_timeout
             )
         if not green:
             log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
-            return False
+            return False, why if failed else None
         await github.merge_pr(repo, pr_number)
         log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
-        return True
+        return True, None
     except Exception as exc:  # noqa: BLE001
         log.write(f"[factory] merge failed (PR left open): {exc!r}")
-        return False
+        return False, None
+
+
+async def _fix_cycle(
+    repo: str,
+    number: int,
+    golden: str,
+    cycle: int,
+    log: RunLog,
+    *,
+    reason: str,
+    detail: str,
+    going_back: str,
+    giving_up: str,
+) -> None:
+    """Send a pull request back for another pass, or stop if the cycle budget is spent.
+
+    Both things that can send one back — a reviewer that requested changes, and a CI run that
+    came back red — want identical mechanics: reuse the branch so the fix builds on commits
+    already pushed rather than starting over, carry the reason into the next prompt, and cap
+    how many times the factory may try again unsupervised. Only the wording differs, so only
+    the wording is a parameter.
+    """
+    if cycle < settings.max_review_cycles:
+        log.write(f"[factory] {reason}; fix run {cycle + 1} scheduled")
+        await _mirror_issue(repo, number, None, [], log, comment=going_back)
+        await create(
+            repo,
+            number,
+            golden=golden,
+            attempt=cycle + 1,
+            prior_error=reason,
+            prior_log=detail,
+            review_cycle=cycle + 1,
+        )
+    else:
+        log.write(f"[factory] {reason}; cycle budget spent, halting")
+        await _mirror_issue(
+            repo,
+            number,
+            github.LABEL_BLOCKED,
+            [github.LABEL_RUNNING, github.LABEL_QUEUED],
+            log,
+            comment=giving_up,
+        )
 
 
 async def _fail_run(
@@ -865,7 +932,7 @@ async def _execute(
                 # already contains this issue's work.
                 if not criteria:
                     log.write("[factory] issue carries no acceptance criteria; skipping review")
-                merged = await _merge(repo, pr_url, base, log)
+                merged, _ = await _merge(repo, pr_url, base, log)
             await db.update_run(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
@@ -996,52 +1063,88 @@ async def _execute_review(
         log.write(f"[factory] destroyed {machine.name}")
 
         # ---- act on the verdict
+        #
+        # An approved pull request has three possible endings, and they are not the same
+        # thing. Merged is finished. Red CI is a real defect in code a reviewer signed off,
+        # which is exactly what a fix run is for. Anything else — checks still pending,
+        # GitHub unreachable, the merge itself refused — means we do not know what is wrong,
+        # so it stops for a human. Collapsing all three into `agent:done` is how a broken
+        # pull request ends up sitting open under an issue that claims to be finished.
         if approved:
-            merged = settings.auto_merge and await _merge(repo, pr_url, base, log)
-            comment = f"Review passed — {why}. {pr_url}"
-            if merged:
-                comment += " (merged)"
-            await _mirror_issue(
-                repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=comment
+            merged, ci_failure = False, None
+            if settings.auto_merge:
+                merged, ci_failure = await _merge(repo, pr_url, base, log)
+            outcome = merge_outcome(settings.auto_merge, merged, ci_failure)
+
+            if outcome == "done":
+                comment = f"Review passed — {why}. {pr_url}"
+                if merged:
+                    comment += " (merged)"
+                await _mirror_issue(
+                    repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=comment
+                )
+                return
+
+            if outcome == "human":
+                await db.update_run(run_id, error="merge blocked, cause unknown")
+                await _mirror_issue(
+                    repo,
+                    number,
+                    github.LABEL_BLOCKED,
+                    [github.LABEL_RUNNING, github.LABEL_QUEUED],
+                    log,
+                    comment=(
+                        f"Review passed — {why} — but the pull request could not be merged and "
+                        f"CI never reported a failure to work from. Needs a human. {pr_url}"
+                    ),
+                )
+                return
+
+            await db.update_run(run_id, error=ci_failure)
+            await _fix_cycle(
+                repo,
+                number,
+                golden,
+                cycle,
+                log,
+                reason=f"CI failed after an approved review: {ci_failure}",
+                detail=(
+                    f"CI failed on the pull request after the review approved it.\n"
+                    f"{ci_failure}\n\n"
+                    "The reviewer confirmed every acceptance criterion against real command "
+                    "output, so the change itself is sound. What failed is something CI runs "
+                    "that this VM does not — the end-to-end browser suite in particular.\n\n"
+                    "Read the actual failure before changing anything:\n"
+                    f"  gh run list --branch {branch} --limit 1\n"
+                    "  gh run view <run-id> --log-failed\n\n"
+                    "Then fix its cause. Do not delete, skip or weaken a test to make it pass, "
+                    "and do not edit CI configuration — a gate that fails is doing its job."
+                ),
+                going_back=(
+                    f"Review passed, but CI is red ({ci_failure}). Fixing. {pr_url}"
+                ),
+                giving_up=(
+                    f"Review passed, but CI is still red after {cycle} cycles ({ci_failure}).\n\n"
+                    f"Stopping — needs a human. {pr_url}"
+                ),
             )
             return
 
         detail = "\n".join(f"- {f}" for f in findings) or "- (no specific findings recorded)"
-        if cycle < settings.max_review_cycles:
-            # Send it back as an ordinary retry: same branch, one attempt further on, findings
-            # as the context. That reuses the resume-on-retry checkout, so the fix builds on
-            # the commits already pushed rather than starting over.
-            log.write(f"[factory] requesting changes; fix run {cycle + 1} scheduled")
-            await _mirror_issue(
-                repo,
-                number,
-                None,
-                [],
-                log,
-                comment=f"Review {cycle} requested changes ({why}):\n{detail}\n\nFixing.",
-            )
-            await create(
-                repo,
-                number,
-                golden=golden,
-                attempt=cycle + 1,
-                prior_error=f"review requested changes: {why}",
-                prior_log=f"Reviewer findings:\n{detail}",
-                review_cycle=cycle + 1,
-            )
-        else:
-            log.write(f"[factory] requesting changes; review budget spent, halting")
-            await _mirror_issue(
-                repo,
-                number,
-                github.LABEL_BLOCKED,
-                [github.LABEL_RUNNING, github.LABEL_QUEUED],
-                log,
-                comment=(
-                    f"Review still requesting changes after {cycle} cycles ({why}):\n{detail}"
-                    f"\n\nStopping — the issue may be wrong rather than the code. {pr_url}"
-                ),
-            )
+        await _fix_cycle(
+            repo,
+            number,
+            golden,
+            cycle,
+            log,
+            reason=f"review requested changes: {why}",
+            detail=f"Reviewer findings:\n{detail}",
+            going_back=f"Review {cycle} requested changes ({why}):\n{detail}\n\nFixing.",
+            giving_up=(
+                f"Review still requesting changes after {cycle} cycles ({why}):\n{detail}"
+                f"\n\nStopping — the issue may be wrong rather than the code. {pr_url}"
+            ),
+        )
     finally:
         await boxd.close()
 
