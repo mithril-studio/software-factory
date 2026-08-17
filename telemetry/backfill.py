@@ -61,9 +61,7 @@ async def replay(path: Path) -> dict:
 
 async def main(argv: list[str]) -> int:
     await store.init()
-    paths = (
-        [config.log_dir / f"{argv[0]}{SUFFIX}"] if argv else transcripts()
-    )
+    paths = [config.log_dir / f"{argv[0]}{SUFFIX}"] if argv else transcripts()
     if not paths:
         print(f"no transcripts in {config.log_dir}")
         return 1

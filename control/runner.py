@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 from boxd import AsyncBoxd
 
+from telemetry.normalize import summary as telemetry_summary
 from telemetry.recorder import Recorder
 
 from . import db, github
@@ -1256,12 +1257,7 @@ async def _stream(
                         log.write(line)
                         continue
                     if event.get("type") == "result":
-                        u = event.get("usage", {}) or {}
-                        usage = {
-                            "tokens_in": u.get("input_tokens"),
-                            "tokens_out": u.get("output_tokens"),
-                            "cost_usd": event.get("total_cost_usd"),
-                        }
+                        usage = telemetry_summary(event)
                     await recorder.feed(event)
                     for formatted in format_event(event):
                         log.write(formatted)

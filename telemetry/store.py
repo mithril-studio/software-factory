@@ -97,7 +97,9 @@ _SUFFIX = re.compile(r"(\[[^\]]*\])?(-\d{8})?$")
 
 
 def canonical_model(model: str | None) -> str | None:
-    return _SUFFIX.sub("", model).strip() or None if model else None
+    if not model:
+        return None
+    return _SUFFIX.sub("", model).strip() or None
 
 
 @contextlib.asynccontextmanager
