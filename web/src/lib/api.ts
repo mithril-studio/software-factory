@@ -34,6 +34,7 @@ export type PlanIssue = {
 
 export type Project = {
   repo: string
+  golden: string
   runs: number
   succeeded: number
   failed: number
