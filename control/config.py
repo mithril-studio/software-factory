@@ -44,10 +44,48 @@ def _github_token() -> str:
         return ""
 
 
-def _repos() -> tuple[str, ...]:
-    """Repos the poller watches, from a comma-separated FACTORY_REPOS."""
+@dataclass(frozen=True)
+class RepoTarget:
+    """A watched repo together with the machine its runs happen on.
+
+    A run forks a golden and works in one checkout on it, so "which repo" and "which golden"
+    are the same decision — a golden holding project A's checkout cannot build project B. One
+    global golden therefore capped the whole factory at one project. Pairing them here is what
+    lets FACTORY_REPOS list more than one.
+    """
+
+    repo: str
+    golden: str
+    repo_dir: str
+
+
+def _targets() -> tuple[RepoTarget, ...]:
+    """Parse FACTORY_REPOS: comma-separated `owner/repo[=golden[:repo_dir]]`.
+
+    A bare `owner/repo` falls back to FACTORY_GOLDEN and FACTORY_REPO_DIR, so every existing
+    single-project deployment keeps working unchanged.
+    """
     raw = os.environ.get("FACTORY_REPOS", "")
-    return tuple(r.strip() for r in raw.split(",") if r.strip())
+    fallback_golden = os.environ.get("FACTORY_GOLDEN", "")
+    fallback_dir = os.environ.get("FACTORY_REPO_DIR", "/home/boxd/repo")
+    out = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        repo, _, machine = entry.partition("=")
+        golden, _, repo_dir = machine.partition(":")
+        out.append(
+            RepoTarget(
+                repo=repo.strip(),
+                golden=golden.strip() or fallback_golden,
+                repo_dir=repo_dir.strip() or fallback_dir,
+            )
+        )
+    return tuple(out)
+
+
+_TARGETS = _targets()
 
 
 @dataclass(frozen=True)
@@ -108,13 +146,25 @@ class Settings:
     # human clears it. Turn off if a repo's issues are independent.
     halt_on_failure: bool = os.environ.get("FACTORY_HALT_ON_FAILURE", "1") == "1"
     # Issue polling. The poller only runs if at least one repo is listed in FACTORY_REPOS.
-    repos: tuple[str, ...] = _repos()
+    targets: tuple[RepoTarget, ...] = _TARGETS
+    repos: tuple[str, ...] = tuple(t.repo for t in _TARGETS)
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
     poll_interval: int = int(os.environ.get("FACTORY_POLL_INTERVAL", "30"))
     # Public URL of this control plane, used only to link runs from issue comments.
     base_url: str = os.environ.get("FACTORY_BASE_URL", "").rstrip("/")
     db_path: Path = ROOT / "var" / "factory.db"
     log_dir: Path = ROOT / "var" / "logs"
+
+    def target(self, repo: str) -> RepoTarget:
+        """The golden and checkout a run for `repo` uses.
+
+        An unwatched repo (a manual dispatch from the UI) falls back to the global golden, so
+        dispatching something that is not in FACTORY_REPOS still behaves as it always did.
+        """
+        for t in self.targets:
+            if t.repo == repo:
+                return t
+        return RepoTarget(repo=repo, golden=self.golden, repo_dir=self.repo_dir)
 
     def missing(self) -> list[str]:
         """Which required settings are absent. Surfaced in the UI rather than crashing."""
@@ -123,7 +173,12 @@ class Settings:
             gaps.append("BOXD_API_KEY")
         if not self.github_token:
             gaps.append("GITHUB_TOKEN (or `gh auth login`)")
-        if not self.golden:
+        # Per-repo goldens make the global one optional, but a target without any golden can
+        # never run — name the repo so the fix is obvious.
+        homeless = [t.repo for t in self.targets if not t.golden]
+        if homeless:
+            gaps.append(f"a golden for {', '.join(homeless)} (FACTORY_GOLDEN or FACTORY_REPOS)")
+        elif not self.targets and not self.golden:
             gaps.append("FACTORY_GOLDEN")
         return gaps
 

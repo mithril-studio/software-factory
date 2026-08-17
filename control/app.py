@@ -92,6 +92,11 @@ async def api_config():
     """What the shell needs: watched repos, the golden, limits, and any missing settings."""
     return {
         "repos": list(settings.repos),
+        # Which golden and checkout each repo runs on. A repo can only be built on a golden
+        # holding its own checkout, so the pairing is the thing worth seeing.
+        "targets": [
+            {"repo": t.repo, "golden": t.golden, "repo_dir": t.repo_dir} for t in settings.targets
+        ],
         "golden": settings.golden,
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
@@ -268,6 +273,11 @@ async def api_agents():
     finally:
         await boxd.close()
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
+    # Every configured golden, not just the global fallback: with per-repo targets there is
+    # one per project, and a golden the badge does not recognise looks like a stray VM.
+    goldens = {t.golden for t in settings.targets if t.golden}
+    if settings.golden:
+        goldens.add(settings.golden)
     out = []
     for m in machines:
         is_run = m.name.startswith("run-")
@@ -276,7 +286,7 @@ async def api_agents():
                 "name": m.name,
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
-                "is_golden": m.name == settings.golden,
+                "is_golden": m.name in goldens,
                 "orphan": is_run and m.name not in active,
             }
         )

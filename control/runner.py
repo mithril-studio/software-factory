@@ -689,7 +689,7 @@ async def create(
         issue_number=issue_number,
         issue_title=issue["title"],
         branch=branch,
-        golden=golden or settings.golden,
+        golden=golden or settings.target(repo).golden,
         status="queued",
         attempt=attempt,
         agent=AGENT,
@@ -699,7 +699,7 @@ async def create(
 
     task = asyncio.create_task(
         _guarded(
-            run_id, repo, issue, branch, golden or settings.golden,
+            run_id, repo, issue, branch, golden or settings.target(repo).golden,
             attempt, prior_error, prior_log, review_cycle,
         )
     )
@@ -728,7 +728,7 @@ async def create_review(
         issue_number=issue_number,
         issue_title=issue["title"],
         branch=branch,
-        golden=golden or settings.golden,
+        golden=golden or settings.target(repo).golden,
         status="queued",
         kind="review",
         attempt=cycle,
@@ -739,7 +739,10 @@ async def create_review(
     )
 
     task = asyncio.create_task(
-        _guarded_review(run_id, repo, issue, branch, pr_url, golden or settings.golden, cycle)
+        _guarded_review(
+            run_id, repo, issue, branch, pr_url,
+            golden or settings.target(repo).golden, cycle,
+        )
     )
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
@@ -910,7 +913,7 @@ async def _execute(
         # ---- run the agent
         await db.update_run(run_id, status="running")
         env = {
-            "FACTORY_REPO_DIR": settings.repo_dir,
+            "FACTORY_REPO_DIR": settings.target(repo).repo_dir,
             "FACTORY_BRANCH": branch,
             "FACTORY_BASE": base,
             "FACTORY_ATTEMPT": str(attempt),
@@ -1057,7 +1060,7 @@ async def _execute_review(
             criteria=yaml.safe_dump(criteria, sort_keys=False, allow_unicode=True),
         )
         env = {
-            "FACTORY_REPO_DIR": settings.repo_dir,
+            "FACTORY_REPO_DIR": settings.target(repo).repo_dir,
             "FACTORY_BRANCH": branch,
             "FACTORY_BASE": base,
             "FACTORY_PROMPT": prompt,

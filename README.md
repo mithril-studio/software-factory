@@ -89,7 +89,12 @@ possible: fleet state lives in a table, not in an agent's context window.
 
 ## The golden VM
 
-Every run forks one long-lived machine. It must have:
+Every run forks one long-lived machine. A golden holds exactly one project's checkout, so
+picking a golden and picking a repo are the same decision — watching two repos means two
+goldens, paired in `FACTORY_REPOS` as `owner/repo=golden[:repo_dir]`. A bare `owner/repo`
+falls back to `FACTORY_GOLDEN`.
+
+A golden must have:
 
 - the repo cloned at `FACTORY_REPO_DIR` with a working `origin` remote
 - dependencies installed
