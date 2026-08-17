@@ -1,11 +1,12 @@
 import { useEffect, useRef } from "react"
 import { Link, useParams } from "react-router-dom"
 import { ArrowLeft } from "lucide-react"
-import { post, usePoll, useRunLog, TERMINAL, type Run } from "@/lib/api"
+import { post, usePoll, useRunLog, TERMINAL, type Run, type RunTelemetry } from "@/lib/api"
 import { cost, duration, shortId, tokens } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { StateBadge } from "@/components/StateBadge"
+import { Meter } from "@/components/Meter"
 import { PageHeader, ErrorNote } from "@/components/Page"
 import { cn } from "@/lib/utils"
 
@@ -31,6 +32,7 @@ function lineClass(line: string): string {
 export function RunDetail() {
   const { runId = "" } = useParams()
   const { data: run, error, refresh } = usePoll<Run>(`/api/runs/${runId}`, 3000)
+  const { data: trace } = usePoll<RunTelemetry>(`/api/runs/${runId}/telemetry`, 10000)
   const { lines, done } = useRunLog(runId)
   const logRef = useRef<HTMLDivElement>(null)
 
@@ -103,6 +105,53 @@ export function RunDetail() {
             </Field>
           </div>
           {run.error && <div className="mt-4 font-mono text-sm text-bad">{run.error}</div>}
+        </Card>
+      )}
+
+      {/* Everything below the run row. The `Cost` field above is what the runtime
+          reported for the whole run; these are the calls it is made of, and they exist
+          even when the run died before reporting anything. The two disagreeing slightly
+          is expected — the runtime bills side calls that never reach the event stream. */}
+      {trace && (trace.totals.calls ?? 0) > 0 && (
+        <Card className="mb-6 p-5">
+          <div className="grid grid-cols-2 gap-5 sm:grid-cols-4">
+            <Field label="Model calls">{trace.totals.calls}</Field>
+            <Field label="Turns">{trace.totals.turns ?? "—"}</Field>
+            <Field label="Cache read">{tokens(trace.totals.cache_read_tokens ?? null)}</Field>
+            <Field label="Cache write">{tokens(trace.totals.cache_write_tokens ?? null)}</Field>
+            <Field label="Output tokens">{tokens(trace.totals.output_tokens ?? null)}</Field>
+            <Field label="Derived cost">{cost(trace.totals.derived_cost_usd ?? null)}</Field>
+            <Field label="Models">
+              {trace.by_model.map((m) => m.model).join(", ") || "—"}
+            </Field>
+            <Field label="Tool calls">
+              {trace.tools.reduce((s, t) => s + t.calls, 0)}
+              {trace.tools.some((t) => t.failures > 0) && (
+                <span className="text-bad">
+                  {" "}
+                  ({trace.tools.reduce((s, t) => s + t.failures, 0)} failed)
+                </span>
+              )}
+            </Field>
+          </div>
+          {trace.tools.length > 0 && (
+            <div className="mt-5">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Tool time
+              </div>
+              <div className="mt-2 space-y-1.5">
+                {trace.tools.slice(0, 6).map((t) => (
+                  <div key={t.tool} className="flex items-center gap-3">
+                    <span className="w-24 shrink-0 font-mono text-xs">{t.tool}</span>
+                    <Meter value={t.duration_ms} max={trace.tools[0].duration_ms} />
+                    <span className="w-24 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                      {Math.round(t.duration_ms / 1000)}s · {t.calls}×
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </Card>
       )}
 

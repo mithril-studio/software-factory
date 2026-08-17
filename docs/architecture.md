@@ -2,9 +2,10 @@
 
 An agentic development system. GitHub issues go in; reviewed pull requests come out.
 
-A control plane on Hetzner watches repos for work, forks an isolated boxd VM per task, runs
-a coding agent inside it, and reaps the VM when done. The control plane is deterministic and
-contains no LLM. All intelligence lives in the agent, inside the VM.
+A control plane on the boxd VM `software-factory` watches repos for work, forks an isolated
+boxd VM per task, runs a coding agent inside it, and reaps the VM when done. The control
+plane is deterministic and contains no LLM. All intelligence lives in the agent, inside the
+VM.
 
 > **Status:** V0, started 2026-07-30. Second attempt. The first failed on scope — see
 > `../learnings.md`. The governing constraint of this build is *smallness*.
@@ -33,21 +34,24 @@ Nothing in this system calls a model except the agent running inside a boxd VM. 
 ## §2 Topology
 
 ```
-                 Hetzner VM
+        boxd VM "software-factory"  (long-lived)
    ┌─────────────────────────────────────────┐
-   │  exec (FastAPI)          telemetry      │
-   │    │  polls GitHub         ▲  OTLP/HTTP │
+   │  control (FastAPI)       telemetry      │
+   │    │  polls GitHub         ▲  events    │
    │    │                       │            │
-   │    └────── Postgres ───────┘            │
+   │    └────── SQLite ─────────┘            │
    └────┬────────────────────────────────────┘
         │ boxd SDK (gRPC)             ▲
-        ▼                             │ OTLP export
+        ▼                             │ agent event stream
    ┌─────────────────────────────┐    │
    │  boxd VM (fork of golden)   │────┘
    │    agent + skills           │
    │    → pushes branch, opens PR│
    └─────────────────────────────┘
 ```
+
+Both are boxd machines: one long-lived control plane, and one short-lived fork per task.
+The control plane is deployed by `git pull` on `software-factory`; it is not a container.
 
 One fork per task. Forks take ~0.2s, so there is **no warm pool** — provision on demand,
 destroy on completion. The agent's isolation boundary is the VM.
@@ -71,12 +75,17 @@ Every span, metric, and log the agent runtime emits carries these attributes. `t
 uses `run.id` to attach usage to a run without the two layers calling each other.
 **They communicate only through the database and this attribute.**
 
-### §3.2 OTLP — the telemetry wire format
+### §3.2 The adapter — the model-agnostic boundary
 
-`telemetry` accepts OTLP/HTTP. It does not accept a bespoke format, and it is not
-Claude-specific: any agent runtime that speaks OpenTelemetry is a valid producer. Runtime
-specifics are confined to adapters (`telemetry` §2). This is what keeps the system
-model-agnostic.
+Runtime specifics are confined to one adapter (`telemetry/normalize.py`); no table names a
+runtime. Today the adapter is fed in process from the event stream `control` already parses,
+and from salvaged transcripts replayed after the fact. OTLP remains the intended wire format
+for producers outside this process — it becomes a third caller of the same adapter rather
+than a second implementation. See `telemetry/README.md` §2 for why the transport was
+deferred and the boundary built first.
+
+The dependency runs one way: `control` imports `telemetry`, never the reverse. The layers
+still share only the database and `run.id`.
 
 ### §3.3 The memory record schema
 
@@ -106,8 +115,8 @@ the big-bang shape that killed the first attempt.
 1. **`memory` skill** — a markdown file, now in its own repo. Complete.
 2. **`control`** — fork, dispatch, collect, reap, plus a UI to watch it. **Done.**
 3. **Golden VM + first real run** — the highest-risk unknown: does an agent in a fork
-   actually take an issue and open a PR?
-4. **`telemetry`** — once runs exist to observe.
+   actually take an issue and open a PR? **Done.**
+4. **`telemetry`** — once runs exist to observe. **Done**, minus the OTLP ingest (§3.2).
 
 ## §6 Related documents
 

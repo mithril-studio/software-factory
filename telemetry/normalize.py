@@ -1,0 +1,283 @@
+"""The adapter boundary: one runtime's event stream in, vendor-neutral rows out.
+
+Everything that knows what a Claude Code event looks like lives in this file. Nothing
+downstream of it — no table, no query, no page — mentions Claude. That is the whole
+point of §2 of this layer's README, and it is the reason adding a second runtime is one
+more class here rather than a migration.
+
+**Pure by construction.** No I/O, no clock, no database. Feed it events, get rows back.
+That is what lets the same normalizer serve two sources without a second implementation:
+the live stream the runner already parses (`recorder.py`) and a salvaged session
+transcript replayed after the fact (`backfill.py`). An OTLP ingest, when it arrives,
+becomes a third caller rather than a rewrite.
+
+The two sources differ in shape only at the edges — the stream carries
+`parent_tool_use_id` on the envelope, the transcript carries `isSidechain`/`parentUuid`
+instead — so every field is read defensively and an unrecognised event yields no rows
+rather than an exception. The event schema is not a contract; a run must never fail
+because telemetry could not parse something.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass
+
+# Fields worth keeping off a tool's input, in the order we prefer them. Enough to tell
+# two Bash calls apart in a leaderboard; never the whole input, which can be a file.
+HINT_KEYS = ("command", "file_path", "pattern", "skill", "url", "query", "description")
+HINT_MAX = 200
+ERROR_MAX = 500
+
+
+@dataclass(frozen=True)
+class LlmCall:
+    """One model call.
+
+    Cache tokens are split by TTL because they are not priced alike: a 5-minute write
+    costs 1.25x the input rate and a 1-hour write costs 2x. The agent runtime asks for
+    1-hour caching, so collapsing the two would understate the second-largest component
+    of a run's cost by roughly 40%.
+    """
+
+    run_id: str
+    turn: int
+    ts: str | None
+    model: str | None
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_5m_tokens: int
+    cache_write_1h_tokens: int
+    parent_call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One tool invocation, paired with its result.
+
+    `id` is the runtime's own tool-use id, so re-normalizing the same transcript
+    overwrites rather than duplicates — which is what makes backfill idempotent.
+    """
+
+    id: str
+    run_id: str
+    turn: int
+    ts: str | None
+    tool: str
+    ok: bool
+    duration_ms: int | None
+    error: str | None
+    detail: str | None
+    parent_call_id: str | None = None
+
+
+def _int(value: object) -> int:
+    return value if isinstance(value, int) else 0
+
+
+def _text(content: object) -> str:
+    """Flatten a tool_result's content, which is either a string or a block list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text") or ""
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _hint(supplied: dict) -> str | None:
+    """A short, human-readable label for what a tool call was doing."""
+    for key in HINT_KEYS:
+        value = supplied.get(key)
+        if value:
+            return str(value).replace("\n", " ")[:HINT_MAX]
+    return None
+
+
+def elapsed_ms(start: str | None, end: str | None) -> int | None:
+    """Milliseconds between two ISO timestamps, or None if either is unusable.
+
+    Duration is derived rather than reported: the runtime timestamps the event that
+    requests a tool and the event that returns its result, and the gap between them is
+    the tool's wall time. That is the number that answers "what is this run waiting on".
+    """
+    if not start or not end:
+        return None
+    try:
+        delta = dt.datetime.fromisoformat(end) - dt.datetime.fromisoformat(start)
+    except (TypeError, ValueError):
+        return None
+    return int(delta.total_seconds() * 1000)
+
+
+class ClaudeCodeAdapter:
+    """Normalizes one run's worth of Claude Code events.
+
+    Stateful over the stream, because two of the three things we want are only knowable
+    across events: the turn index (a counter, since no event carries one) and a tool
+    call's duration (the gap between the request and its result). One instance per run.
+    """
+
+    name = "claude-code"
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.turn = 0
+        # tool_use_id -> the request half, waiting for its result.
+        self._pending: dict[str, dict] = {}
+        # Message ids whose usage has already been counted. See `_assistant`.
+        self._counted: set[str] = set()
+
+    def feed(self, event: dict) -> list[LlmCall | ToolCall]:
+        """Rows produced by this event. Empty for events that carry no facts."""
+        if not isinstance(event, dict):
+            return []
+        kind = event.get("type")
+        if kind == "assistant":
+            return self._assistant(event)
+        if kind == "user":
+            return self._user(event)
+        return []
+
+    def flush(self) -> list[ToolCall]:
+        """Tool calls that never got a result — the run ended inside them.
+
+        Emitted as failures rather than dropped, because "the run died in Bash at turn
+        41" is exactly the diagnosis the old one-row-per-run ledger could not give.
+        """
+        rows = [
+            ToolCall(
+                id=call_id,
+                run_id=self.run_id,
+                turn=p["turn"],
+                ts=p["ts"],
+                tool=p["tool"],
+                ok=False,
+                duration_ms=None,
+                error="no result (run ended)",
+                detail=p["detail"],
+                parent_call_id=p["parent"],
+            )
+            for call_id, p in self._pending.items()
+        ]
+        self._pending.clear()
+        return rows
+
+    # ------------------------------------------------------------------ internals
+
+    def _assistant(self, event: dict) -> list[LlmCall | ToolCall]:
+        message = event.get("message") or {}
+        ts = event.get("timestamp")
+        parent = event.get("parent_tool_use_id")
+        rows: list[LlmCall | ToolCall] = []
+
+        # One API response can reach us as several entries — the session transcript
+        # writes one per content block (thinking, then text, then each tool_use) and
+        # repeats the *same* `usage` object on every one. Observed up to 13 entries for
+        # a single message. Counting per entry inflated the token totals by ~2x across
+        # 37 real runs; counting per `message.id` is the fix. The live stream sends one
+        # event per message, so this is a no-op there.
+        #
+        # Only the usage is deduplicated. Tool-use blocks are collected from every
+        # entry below, because that is exactly how the split delivers them.
+        usage = message.get("usage") or {}
+        message_id = message.get("id")
+        if message_id is not None and message_id in self._counted:
+            usage = {}
+        elif usage and message_id is not None:
+            self._counted.add(message_id)
+        if usage:
+            self.turn += 1
+            # The runtime reports 1-hour and 5-minute cache writes separately when it
+            # can; older payloads only carry the combined figure, which we attribute to
+            # the 5-minute tier so a missing split can never inflate the derived cost.
+            created = usage.get("cache_creation") or {}
+            write_1h = _int(created.get("ephemeral_1h_input_tokens"))
+            write_5m = _int(created.get("ephemeral_5m_input_tokens"))
+            if not created:
+                write_5m = _int(usage.get("cache_creation_input_tokens"))
+            rows.append(
+                LlmCall(
+                    run_id=self.run_id,
+                    turn=self.turn,
+                    ts=ts,
+                    model=message.get("model"),
+                    input_tokens=_int(usage.get("input_tokens")),
+                    output_tokens=_int(usage.get("output_tokens")),
+                    cache_read_tokens=_int(usage.get("cache_read_input_tokens")),
+                    cache_write_5m_tokens=write_5m,
+                    cache_write_1h_tokens=write_1h,
+                    parent_call_id=parent,
+                )
+            )
+
+        for block in message.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            call_id = block.get("id")
+            if not call_id:
+                continue
+            self._pending[call_id] = {
+                "tool": block.get("name") or "tool",
+                "ts": ts,
+                "turn": self.turn,
+                "detail": _hint(block.get("input") or {}),
+                "parent": parent,
+            }
+        return rows
+
+    def _user(self, event: dict) -> list[LlmCall | ToolCall]:
+        message = event.get("message") or {}
+        ts = event.get("timestamp")
+        rows: list[LlmCall | ToolCall] = []
+
+        for block in message.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            call_id = block.get("tool_use_id")
+            pending = self._pending.pop(call_id, None)
+            if pending is None:
+                # A result with no matching request: a truncated transcript, or a
+                # backfill that started mid-stream. Nothing useful to record.
+                continue
+            failed = bool(block.get("is_error"))
+            rows.append(
+                ToolCall(
+                    id=call_id,
+                    run_id=self.run_id,
+                    turn=pending["turn"],
+                    ts=pending["ts"],
+                    tool=pending["tool"],
+                    ok=not failed,
+                    duration_ms=elapsed_ms(pending["ts"], ts),
+                    error=_text(block.get("content")).strip()[:ERROR_MAX] or None
+                    if failed
+                    else None,
+                    detail=pending["detail"],
+                    parent_call_id=pending["parent"],
+                )
+            )
+        return rows
+
+
+def summary(event: dict) -> dict:
+    """The run-level figures the runtime reports in its final `result` event.
+
+    Kept as the runtime reports them and stored on `runs`, unchanged. They are not the
+    same quantity the rows sum to — the runtime bills side calls (title generation and
+    the like) that never surface as assistant events — so the two disagreeing is signal,
+    not a bug. The rows are what the agent did; this is what the runtime charged for.
+    """
+    usage = event.get("usage") or {}
+    return {
+        "tokens_in": usage.get("input_tokens"),
+        "tokens_out": usage.get("output_tokens"),
+        "cost_usd": event.get("total_cost_usd"),
+        "turns": event.get("num_turns"),
+        "duration_ms": event.get("duration_ms"),
+    }

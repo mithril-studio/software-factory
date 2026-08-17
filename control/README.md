@@ -1,7 +1,7 @@
 # control
 
-The control plane. Runs on Hetzner. Watches GitHub for work, forks an isolated boxd VM per
-task, runs an agent inside it, and reaps it.
+The control plane. Runs on the long-lived boxd VM `software-factory`. Watches GitHub for
+work, forks an isolated boxd VM per task, runs an agent inside it, and reaps it.
 
 **This layer is deterministic and contains no LLM.** It is a state machine over VMs. Every
 intelligent decision happens inside the VM. If a model call ever appears in this repo,
