@@ -16,6 +16,8 @@ from pathlib import Path
 import yaml
 from boxd import AsyncBoxd
 
+from telemetry.recorder import Recorder
+
 from . import db, github
 from .config import settings
 
@@ -743,6 +745,40 @@ async def create_review(
     return run_id
 
 
+async def _salvage_usage(run_id: str, log: RunLog) -> None:
+    """Backstop the run's ledger entry from the telemetry rows.
+
+    A run only reports its own usage in the final `result` event, so a timeout, a crash
+    or a cancelled task used to leave `cost_usd = NULL` — real money spent, recorded as
+    nothing, on exactly the runs worth understanding. The per-call rows were written as
+    the run went, so the spend is still there; this reads it back and fills the gap.
+
+    Only ever fills a gap: a run that reported its own numbers keeps them, so the
+    runtime's figure stays authoritative wherever it exists and the derived one is
+    strictly a fallback. Best effort by design — never raises.
+    """
+    try:
+        run = await db.get_run(run_id)
+        if not run or run.get("cost_usd") is not None:
+            return
+        derived = await Recorder(run_id).totals()
+        if not derived:
+            return
+        await db.update_run(run_id, **derived)
+        log.write(
+            f"[factory] usage recovered from telemetry: "
+            f"${derived.get('cost_usd') or 0:.2f}, "
+            f"{derived.get('tokens_out') or 0} output tokens"
+        )
+    except asyncio.CancelledError:
+        # Called from a `finally` that may already be unwinding a cancelled run. The
+        # caller has re-raised, so cancellation still propagates; give up on the number
+        # rather than block the teardown.
+        return
+    except Exception as exc:  # noqa: BLE001 - a missing number must not mask the failure
+        log.write(f"[factory] usage salvage skipped: {exc!r}")
+
+
 async def _guarded_review(
     run_id: str,
     repo: str,
@@ -781,6 +817,7 @@ async def _guarded_review(
             comment=f"Review run {reason}. {pr_url} is open and unreviewed — needs a human.",
         )
     finally:
+        await _salvage_usage(run_id, log)
         log.close()
 
 
@@ -818,6 +855,7 @@ async def _guarded(
             reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
         await _fail_run(run_id, repo, issue, golden, attempt, reason, log)
     finally:
+        await _salvage_usage(run_id, log)
         log.close()
 
 
@@ -897,7 +935,7 @@ async def _execute(
         if settings.claude_code_oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
         exit_code, usage = await asyncio.wait_for(
-            _stream(boxd, machine.id, env, log), timeout=settings.run_timeout
+            _stream(boxd, machine.id, env, log, run_id), timeout=settings.run_timeout
         )
         log.write(f"[factory] agent exited {exit_code}")
         await db.update_run(
@@ -1035,7 +1073,7 @@ async def _execute_review(
             env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
 
         exit_code, usage = await asyncio.wait_for(
-            _stream(boxd, machine.id, env, log, script=REVIEW_SCRIPT),
+            _stream(boxd, machine.id, env, log, run_id, script=REVIEW_SCRIPT),
             timeout=settings.run_timeout,
         )
         log.write(f"[factory] reviewer exited {exit_code}")
@@ -1174,15 +1212,27 @@ async def _read_verdict(boxd: AsyncBoxd, machine_id: str, log: RunLog) -> dict |
 
 
 async def _stream(
-    boxd: AsyncBoxd, machine_id: str, env: dict, log: RunLog, script: str = VM_SCRIPT
+    boxd: AsyncBoxd,
+    machine_id: str,
+    env: dict,
+    log: RunLog,
+    run_id: str,
+    script: str = VM_SCRIPT,
 ) -> tuple[int, dict]:
     """Run the agent, formatting its event stream into the log as it arrives.
 
     Returns the exit code and the usage captured from the final `result` event
     (input/output tokens and cost), which is what the Runs UI shows as the run's cost.
+
+    The same events also go to the telemetry recorder, which normalizes them into
+    per-call rows and writes them as the run proceeds. That is a second consumer of a
+    stream we were already parsing, not a second stream: the facts telemetry wants are
+    the ones scrolling past here, and the only thing that used to happen to them was
+    being formatted into a log line and forgotten.
     """
     buffer = ""
     usage: dict = {}
+    recorder = Recorder(run_id)
     async with boxd.machines.stream_exec(
         machine_id, command=script, env=env, close_stdin=True
     ) as stream:
@@ -1212,6 +1262,7 @@ async def _stream(
                             "tokens_out": u.get("output_tokens"),
                             "cost_usd": event.get("total_cost_usd"),
                         }
+                    await recorder.feed(event)
                     for formatted in format_event(event):
                         log.write(formatted)
                     continue
@@ -1219,6 +1270,9 @@ async def _stream(
         code = stream.exit_code
         if inspect.isawaitable(code):
             code = await code
+    await recorder.close()
+    if recorder.dropped:
+        log.write(f"[factory] telemetry dropped {recorder.dropped} events")
     return int(code or 0), usage
 
 

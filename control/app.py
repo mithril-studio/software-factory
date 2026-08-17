@@ -18,6 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from telemetry import store as telemetry
+
 from . import auth, db, github, poller, runner
 from .config import ROOT, settings
 
@@ -27,6 +29,7 @@ DIST = ROOT / "web" / "dist"
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init()
+    await telemetry.init()
     poller.start()
     try:
         yield
@@ -112,6 +115,29 @@ async def api_run(run_id: str):
     if not run:
         raise HTTPException(404, "no such run")
     return run
+
+
+@app.get("/api/runs/{run_id}/telemetry")
+async def api_run_telemetry(run_id: str):
+    """Per-call detail for one run: token totals, spend by model, tool time."""
+    return await telemetry.usage_for_run(run_id)
+
+
+@app.get("/api/telemetry")
+async def api_telemetry():
+    """The fleet view.
+
+    Four questions the run table alone could not answer: where the money goes by token
+    class, what it is costing over time, which tools eat the wall clock, and what a
+    merged pull request actually costs. All derived from the event rows — nothing here
+    is a stored aggregate, so any of it can be re-cut without a migration.
+    """
+    return {
+        "composition": await telemetry.cost_composition(),
+        "spend_by_day": await telemetry.spend_by_day(),
+        "tools": await telemetry.tool_leaderboard(),
+        "economics": await telemetry.unit_economics(),
+    }
 
 
 class StartRun(BaseModel):

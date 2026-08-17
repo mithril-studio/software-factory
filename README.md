@@ -22,7 +22,7 @@ out once it has earned its own release cycle — not before.
 | Folder | Layer | State |
 |---|---|---|
 | `control/` | Control plane: watch issues, fork VMs, dispatch agents, reap, and the UI | **working** |
-| `telemetry/` | Trace layer: OTLP ingest, normalized usage | spec only |
+| `telemetry/` | Trace layer: one row per model call and tool call, priced and joined to outcomes | **working** |
 | `docs/` | Architecture and the contracts between layers | — |
 
 The folder is `control/` rather than `exec/` because `exec` is a Python keyword and cannot
@@ -50,6 +50,29 @@ For UI work, run the Vite dev server alongside uvicorn so the SPA hot-reloads (i
 
 ```bash
 npm --prefix web run dev        # then open the URL Vite prints (:5173)
+```
+
+## Deploying
+
+The control plane lives on the long-lived boxd VM **`software-factory`** — a plain checkout
+under `~/software-factory` running uvicorn, not a container. Deploy by pulling:
+
+```bash
+ssh software-factory.boxd.sh
+cd ~/software-factory
+git pull
+.venv/bin/pip install -e .                 # only when dependencies or packages change
+npm --prefix web install && npm --prefix web run build
+pkill -f 'uvicorn control.app' ; sleep 1
+nohup .venv/bin/uvicorn control.app:app --host 0.0.0.0 --port 8765 >> uvicorn.log 2>&1 &
+```
+
+Schema changes apply themselves on boot (`db.init()` and `telemetry.store.init()` are both
+idempotent), so there is no migration step. To load telemetry for runs that finished before
+that layer existed:
+
+```bash
+.venv/bin/python -m telemetry.backfill      # replays every salvaged transcript
 ```
 
 ## What a run does
@@ -97,7 +120,9 @@ FastAPI — one deployable, at the cost of a `vite build` step. It reads the JSO
 - **Projects** — watched repos with run tallies.
 - **Agents** — the boxd fleet: the golden runs fork from, live run VMs, orphans flagged, with
   a reconcile button.
-- **Telemetry** — placeholder until the telemetry layer lands.
+- **Telemetry** — where the money and the time go: cost by token class (cache reads are most
+  of the bill), spend by day, tools by wall time, and cost per shipped issue against spend on
+  runs that shipped nothing.
 
 ## What V0 deliberately does not have
 
@@ -116,5 +141,5 @@ Named so they stay unbuilt until something proves they are needed:
 
 - `docs/architecture.md` — layers, topology, and the contracts between them
 - `control/README.md` — control plane design notes
-- `telemetry/README.md` — trace layer spec
+- `telemetry/README.md` — trace layer design notes
 - [agent-skills](https://github.com/mithril-studio/agent-skills) — the skills the in-VM agent loads

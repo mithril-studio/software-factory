@@ -59,6 +59,56 @@ export type Config = {
   missing: string[]
 }
 
+/** Cost split by token class. Cache reads dominate real runs — that is the finding
+ *  the old one-row-per-run ledger had no column to show. */
+export type Composition = {
+  input: number
+  output: number
+  cache_read: number
+  cache_write: number
+}
+
+export type DaySpend = { day: string; derived_cost_usd: number; runs: number }
+
+export type ToolStat = {
+  tool: string
+  calls: number
+  failures: number
+  duration_ms: number
+}
+
+/** Per repo. `shipped` counts issues that produced a pull request; `wasted` is spend
+ *  on runs that never did — the two halves of what a merged PR actually costs. */
+export type Economics = {
+  repo: string
+  issues: number
+  runs: number
+  spend: number
+  shipped: number
+  wasted: number
+}
+
+export type Telemetry = {
+  composition: Composition
+  spend_by_day: DaySpend[]
+  tools: ToolStat[]
+  economics: Economics[]
+}
+
+export type RunTelemetry = {
+  totals: {
+    calls?: number
+    turns?: number
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_tokens?: number
+    cache_write_tokens?: number
+    derived_cost_usd?: number
+  }
+  by_model: { model: string; calls: number; derived_cost_usd: number }[]
+  tools: ToolStat[]
+}
+
 export const TERMINAL = ["succeeded", "failed", "cancelled"]
 
 /** A dropped session anywhere in the app funnels the user back to the login screen. */

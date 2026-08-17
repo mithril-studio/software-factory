@@ -17,7 +17,10 @@ resume-on-retry, `checks_green` gating auto-merge, and Sentry removal (PR #44). 
 toolchain assertion in `VM_SCRIPT`), and executable acceptance criteria in `factory-compose`.
 
 **Not yet started:** 8 (budget ceiling), 8b (dependency safety), 8c (script the golden build),
-9 (memory), 10 (telemetry), CodeRabbit under 6 — and the three pipeline pieces below.
+9 (memory), CodeRabbit under 6 — and the three pipeline pieces below.
+
+**Shipped 2026-08-17:** item 10, the telemetry layer — per-call rows, derived cost, and the
+ledger fix that item 8 depends on.
 
 **The pipeline, agreed 2026-08-13** (see `discussion.md` for the design):
 CI floor ✅ → executable acceptance criteria ✅ → smoke suite → reviewer agent → preview.
@@ -292,10 +295,13 @@ prompt.
 
 ### 8. Per-run budget ceiling
 
-There is no cost cap today, only a 60-minute wall clock. The runner already streams
-`total_cost_usd` from the result event — abort the run above a threshold (~$12) and above a
-turn count. Failed runs currently record `cost_usd = NULL` and `error = "crashed: "`, so
-real spend is invisible in our own ledger; fix that at the same time.
+There is no cost cap today, only a wall clock. Abort the run above a threshold (~$12) and
+above a turn count.
+
+The ledger half of this is ✅ done by item 10: failed runs no longer record `cost_usd = NULL`,
+because rows are flushed per turn and `_salvage_usage()` reads them back. That also supplies
+the mechanism the ceiling needs — `store.usage_for_run()` returns a live derived cost mid-run,
+so the check is a threshold on a number that already exists rather than new plumbing.
 
 ---
 
@@ -358,10 +364,41 @@ is the only one installed on the golden). What's missing is density: a repo map 
 module purposes, where things live, established conventions — so exploration collapses into
 one read.
 
-### 10. Telemetry layer
+### 10. Telemetry layer — ✅ built 2026-08-17
 
-Spec'd in `telemetry/`, not built. Would close the subagent blind spot (item 5) and give
-per-run cost attribution that doesn't depend on parsing transcripts after the fact.
+One row per model call and per tool call, flushed per turn, priced by a `model_prices` table
+we control, joined to `runs` for outcomes. Built in process against the event stream the
+runner already parses rather than over OTLP — see `telemetry/README.md` §2 for why, and §7
+for what shipped.
+
+**Validated against all 47 production runs** (37 transcripts replayed, 2026-08-17). Derived
+cost reproduces the runtime's own figure to the cent on 15 of 21 comparable runs; token
+counts match exactly on every one. Real numbers for the whole history:
+
+| metric | value |
+|---|---|
+| total spend | $251.63 across 47 runs, 22 issues |
+| cost composition | cache read 73.5%, cache write 13.8%, output 12.6%, input 0.0% |
+| cost per shipped issue | $11.44 |
+| spend on runs that shipped nothing | $22.98 (9.1%) |
+| tool wall time | Bash 210 min / 2,222 calls · nested agents 49 min / 6 calls |
+| ledger gap this closes | 13 of 47 runs recorded no cost at all |
+
+What it changes, concretely:
+
+- **Cache reads are now a column.** 73.5% of all spend, and the old schema had nothing that
+  could show it. Cache writes are split 5m/1h because they price differently.
+- **Failed runs record their spend** (§5.3), which closes the half of item 8 that made real
+  spend invisible in our own ledger. The other half — actually aborting above a threshold —
+  now has a truthful number to enforce against.
+- **Cost per shipped issue** and **spend on runs that shipped nothing** are computed rather
+  than estimated by hand.
+- **The 2026-08-12 analysis is repeatable.** It was excellent and manual; that was the tell.
+
+Still open: the subagent blind spot (item 5) is *not* closed — nested agents are disabled,
+the `parent_call_id` column is in place but empty, and seeing inside them is what OTLP is
+for. Run `python -m telemetry.backfill` on the `software-factory` VM to load history from
+existing transcripts.
 
 ### 11. Remove Sentry — ✅ PR #44 open
 
