@@ -96,21 +96,84 @@ possible: fleet state lives in a table, not in an agent's context window.
 
 ## The golden VM
 
-Every run forks one long-lived machine. It must have:
+Every run boots from a **golden snapshot** — never from a machine it shares with another run,
+and never from something a person configured by hand and hoped to remember.
 
-- `git`, `gh` and the language toolchains the watched repos need — but *not* a repo: a golden
-  is an agent image, and each run clones the repo it was assigned into `$HOME/work/<name>`
-  (`FACTORY_WORKDIR` moves that). A per-repo golden may still carry a warm checkout there,
-  which the run reuses instead of cloning
-- dependencies installed, for the repo a warm golden was built for
-- `claude` authenticated (inherited by every fork — this credential expires, so re-auth and
-  re-snapshot on a schedule)
-- `gh` authenticated with push access to the repo
-- skills installed from [agent-skills](https://github.com/mithril-studio/agent-skills):
-  ```bash
-  git clone --depth 1 https://github.com/mithril-studio/agent-skills /tmp/agent-skills \
-    && /tmp/agent-skills/install.sh
-  ```
+### Two tiers, and which one a run picks
+
+The name is the whole registry. There is no list of goldens anywhere else:
+
+| Snapshot | What it is |
+|---|---|
+| `golden-<agent>` | The **agent image**. Tooling, skills, an agent login, warm toolchain caches — and no repo. Serves every repo. |
+| `golden-<agent>--<owner-repo>` | The **warm tier**: the same image with one repo already cloned at `$HOME/work/<name>` and installed. |
+
+A run resolves in that order, most specific first (`agents.resolve_snapshot`):
+
+1. `golden-<agent>--<owner-repo>` for the repo it was assigned, if that snapshot exists;
+2. otherwise `golden-<agent>`;
+3. otherwise nothing — the dispatch fails rather than borrowing somebody else's golden, and
+   `preflight` says so before you spend a run finding out.
+
+`<agent>` comes from `FACTORY_REPOS` (`owner/repo=agent`) or `FACTORY_AGENT_DEFAULT`.
+`<owner-repo>` is the repo slugged: lowercase, every run of non-alphanumerics collapsed to one
+hyphen. The separator is **two** hyphens precisely so a repo full of hyphens can never be
+misread as part of the agent's name.
+
+**The warm tier is only a speed-up.** Every run installs the repo for itself either way — the
+prompt says so, and says nothing about dependencies being present. So a repo with no warm
+snapshot is not broken, and a warm snapshot that has gone stale costs minutes, not
+correctness. That is the whole reason a golden can be repo-agnostic at all.
+
+### Building one: `scripts/build-golden.sh <agent>`
+
+```bash
+scripts/build-golden.sh claude
+```
+
+Creates a machine from the `factory-base` snapshot, installs that agent's CLI, the skills from
+[agent-skills](https://github.com/mithril-studio/agent-skills), `fnm` and `jq`, warms the
+package-manager download caches (node versions, pnpm/yarn, CPython — toolchains, never a
+project's packages), writes the two files a golden owes the control plane
+(`/usr/local/bin/factory-agent` and `/etc/factory/agent.json`, see `control/README.md` §2.3),
+runs its checks while the machine is still alive, saves `golden-<agent>`, and destroys the
+machine.
+
+It stops once, in the middle, for the one step a script cannot do: **the agent's login is a
+browser OAuth.** It prints how to connect, waits, and only then checks and saves — the
+credential has to be on disk inside the machine before the snapshot captures it. That
+credential expires, which is what re-running this script is for. `--no-login` skips the pause
+for a deployment that sets `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` instead.
+
+An agent the script has never seen needs `--cli-install`, `--launch` and `--manifest`. It
+refuses rather than guessing: a wrong launch line produces a golden that looks built and dies
+at the first dispatch.
+
+### Refreshing a warm one: `scripts/refresh-golden.sh <agent> <owner/repo>`
+
+```bash
+scripts/refresh-golden.sh claude mithril-studio/software-factory
+```
+
+A snapshot cannot be edited in place, so this is restore, update, re-save, destroy: create a
+machine from `golden-<agent>--<slug>`, **refuse if the working tree is dirty**, fetch and hard
+reset to the base branch, run the project's setup command, re-save under the same name (boxd
+captures a new version; the old one stays forkable, so a run dispatched mid-refresh keeps
+working), destroy the machine.
+
+The setup command is never guessed. It is `--setup`, or the command in the repo's own
+`## Setup` section (below). If neither says, the script stops.
+
+### What a golden must carry
+
+- `git`, `gh`, `jq`, `fnm` and warm toolchain caches — but *not* a repo, except on the warm
+  tier. Each run clones the repo it was assigned into `$HOME/work/<name>` (`FACTORY_WORKDIR`
+  moves that), and reuses a checkout already there when it is the right repo
+- `/usr/local/bin/factory-agent` and `/etc/factory/agent.json` — the launch contract, see
+  `control/README.md` §2.3
+- the agent authenticated (inherited by every fork; expires)
+- `gh` authenticated, as the fallback for a deployment that sets no `GITHUB_TOKEN`
+- skills installed from [agent-skills](https://github.com/mithril-studio/agent-skills)
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
@@ -138,9 +201,10 @@ re-snapshot it under the same name.
 
 ## Adding a repo
 
-1. Make sure an agent exists for it — a `golden-<agent>` snapshot with `claude` and `gh`
-   authenticated and skills installed (see below). A repo does not need one of its own; a
-   `golden-claude` serves every repo that names no other agent.
+1. Make sure an agent exists for it — a `golden-<agent>` snapshot, built by
+   `scripts/build-golden.sh <agent>` (above). A repo does not need one of its own; a
+   `golden-claude` serves every repo that names no other agent. A warm
+   `golden-<agent>--<owner-repo>` is optional and only makes runs faster.
 2. Add it to `FACTORY_REPOS`, as `owner/repo` or as `owner/repo=agent`.
 3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
    without checks, auto-merge can never pass its gate and every pull request waits for a
