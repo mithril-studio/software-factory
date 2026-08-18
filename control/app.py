@@ -93,6 +93,7 @@ async def api_config():
     return {
         "repos": list(settings.repos),
         "golden": settings.golden,
+        "watched": [{"repo": r, "golden": g} for r, g in settings.watched],
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
@@ -152,7 +153,12 @@ async def api_start_run(body: StartRun):
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
     try:
-        run_id = await runner.create(body.repo.strip(), body.issue_number, golden=body.golden)
+        repo = body.repo.strip()
+        # A run started by hand forks the same machine the poller would have used, so a
+        # manual dispatch on a watched repo can't land on the wrong repo's golden.
+        run_id = await runner.create(
+            repo, body.issue_number, golden=body.golden or settings.golden_for(repo)
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not start run: {exc}") from exc
     return {"run_id": run_id}
@@ -241,11 +247,12 @@ async def api_projects():
     """Watched repos with their run tallies."""
     stats = await db.stats_by_repo()
     out = []
-    for repo in settings.repos:
+    for repo, golden in settings.watched:
         s = stats.get(repo, {})
         out.append(
             {
                 "repo": repo,
+                "golden": golden,
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -276,7 +283,7 @@ async def api_agents():
                 "name": m.name,
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
-                "is_golden": m.name == settings.golden,
+                "is_golden": m.name in settings.goldens,
                 "orphan": is_run and m.name not in active,
             }
         )

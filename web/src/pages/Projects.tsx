@@ -24,6 +24,7 @@ export function Projects() {
               <TableRow>
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
+                <TableHead>Golden</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
               </TableRow>
@@ -42,6 +43,7 @@ export function Projects() {
                       {gitUrl(p.repo)}
                     </a>
                   </TableCell>
+                  <TableCell className="font-mono text-muted-foreground">{p.golden}</TableCell>
                   <TableCell className="text-right font-mono">{p.runs}</TableCell>
                   <TableCell className="text-right font-mono text-ok">{p.succeeded}</TableCell>
                 </TableRow>

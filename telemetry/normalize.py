@@ -99,6 +99,29 @@ def _hint(supplied: dict) -> str | None:
     return None
 
 
+def _blocks(message: dict, kind: str):
+    """The message's content blocks of one type, skipping anything malformed."""
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == kind:
+            yield block
+
+
+def _cache_writes(usage: dict) -> tuple[int, int]:
+    """Cache-write tokens as (5-minute, 1-hour).
+
+    The runtime reports the two TTLs separately when it can. Older payloads carry only
+    the combined figure, which is attributed to the 5-minute tier — it is the cheaper of
+    the two, so a missing split can never inflate a derived cost.
+    """
+    split = usage.get("cache_creation") or {}
+    if not split:
+        return _int(usage.get("cache_creation_input_tokens")), 0
+    return (
+        _int(split.get("ephemeral_5m_input_tokens")),
+        _int(split.get("ephemeral_1h_input_tokens")),
+    )
+
+
 def elapsed_ms(start: str | None, end: str | None) -> int | None:
     """Milliseconds between two ISO timestamps, or None if either is unusable.
 
@@ -176,31 +199,10 @@ class ClaudeCodeAdapter:
         parent = event.get("parent_tool_use_id")
         rows: list[LlmCall | ToolCall] = []
 
-        # One API response can reach us as several entries — the session transcript
-        # writes one per content block (thinking, then text, then each tool_use) and
-        # repeats the *same* `usage` object on every one. Observed up to 13 entries for
-        # a single message. Counting per entry inflated the token totals by ~2x across
-        # 37 real runs; counting per `message.id` is the fix. The live stream sends one
-        # event per message, so this is a no-op there.
-        #
-        # Only the usage is deduplicated. Tool-use blocks are collected from every
-        # entry below, because that is exactly how the split delivers them.
         usage = message.get("usage") or {}
-        message_id = message.get("id")
-        if message_id is not None and message_id in self._counted:
-            usage = {}
-        elif usage and message_id is not None:
-            self._counted.add(message_id)
-        if usage:
+        if usage and self._first_sighting(message):
             self.turn += 1
-            # The runtime reports 1-hour and 5-minute cache writes separately when it
-            # can; older payloads only carry the combined figure, which we attribute to
-            # the 5-minute tier so a missing split can never inflate the derived cost.
-            created = usage.get("cache_creation") or {}
-            write_1h = _int(created.get("ephemeral_1h_input_tokens"))
-            write_5m = _int(created.get("ephemeral_5m_input_tokens"))
-            if not created:
-                write_5m = _int(usage.get("cache_creation_input_tokens"))
+            write_5m, write_1h = _cache_writes(usage)
             rows.append(
                 LlmCall(
                     run_id=self.run_id,
@@ -216,9 +218,9 @@ class ClaudeCodeAdapter:
                 )
             )
 
-        for block in message.get("content") or []:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
+        # Collected from every entry, including repeats — a split message delivers its
+        # tool uses across the same entries whose usage was deduplicated above.
+        for block in _blocks(message, "tool_use"):
             call_id = block.get("id")
             if not call_id:
                 continue
@@ -231,14 +233,33 @@ class ClaudeCodeAdapter:
             }
         return rows
 
+    def _first_sighting(self, message: dict) -> bool:
+        """Whether this entry's usage should be billed, and remember that it was.
+
+        One API response can reach us as several entries: the session transcript writes
+        one per content block (thinking, then text, then each tool_use) and repeats the
+        *same* `usage` object on every one — observed up to 13 times for one message.
+        Billing per entry inflated token totals by ~2x across 37 real runs. Billing per
+        `message.id` is the fix. The live stream sends one event per message, so this is
+        a no-op there.
+
+        A message with no id cannot be deduplicated, so it is billed: losing a real call
+        from the ledger is the worse error.
+        """
+        message_id = message.get("id")
+        if message_id is None:
+            return True
+        if message_id in self._counted:
+            return False
+        self._counted.add(message_id)
+        return True
+
     def _user(self, event: dict) -> list[LlmCall | ToolCall]:
         message = event.get("message") or {}
         ts = event.get("timestamp")
         rows: list[LlmCall | ToolCall] = []
 
-        for block in message.get("content") or []:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
+        for block in _blocks(message, "tool_result"):
             call_id = block.get("tool_use_id")
             pending = self._pending.pop(call_id, None)
             if pending is None:
@@ -246,6 +267,9 @@ class ClaudeCodeAdapter:
                 # backfill that started mid-stream. Nothing useful to record.
                 continue
             failed = bool(block.get("is_error"))
+            error = None
+            if failed:
+                error = _text(block.get("content")).strip()[:ERROR_MAX] or None
             rows.append(
                 ToolCall(
                     id=call_id,
@@ -255,9 +279,7 @@ class ClaudeCodeAdapter:
                     tool=pending["tool"],
                     ok=not failed,
                     duration_ms=elapsed_ms(pending["ts"], ts),
-                    error=_text(block.get("content")).strip()[:ERROR_MAX] or None
-                    if failed
-                    else None,
+                    error=error,
                     detail=pending["detail"],
                     parent_call_id=pending["parent"],
                 )
@@ -268,16 +290,15 @@ class ClaudeCodeAdapter:
 def summary(event: dict) -> dict:
     """The run-level figures the runtime reports in its final `result` event.
 
-    Kept as the runtime reports them and stored on `runs`, unchanged. They are not the
-    same quantity the rows sum to — the runtime bills side calls (title generation and
-    the like) that never surface as assistant events — so the two disagreeing is signal,
-    not a bug. The rows are what the agent did; this is what the runtime charged for.
+    Returned as `runs` column names, so the caller can hand it straight to an update.
+    Kept exactly as the runtime reports them: they are not the same quantity the rows
+    sum to — the runtime bills side calls (title generation and the like) that never
+    surface as assistant events — so the two disagreeing is signal, not a bug. The rows
+    are what the agent did; this is what the runtime charged for.
     """
     usage = event.get("usage") or {}
     return {
         "tokens_in": usage.get("input_tokens"),
         "tokens_out": usage.get("output_tokens"),
         "cost_usd": event.get("total_cost_usd"),
-        "turns": event.get("num_turns"),
-        "duration_ms": event.get("duration_ms"),
     }
