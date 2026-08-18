@@ -71,6 +71,34 @@ auth error, so it is worth a health check that runs before the credential's expe
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
+### §2.3 What a golden owes the control plane
+
+Two files, and nothing else. Adding a second coding agent is then building a snapshot, not
+editing this layer.
+
+- **`/usr/local/bin/factory-agent`** — executable, on `PATH`. The dispatch script `exec`s it
+  as its last act, with no arguments: it reads `$FACTORY_PROMPT` and the rest of the
+  environment itself, and it must emit its agent's event stream on stdout. The launch line
+  belongs to the golden because that is the only place that knows what is installed.
+- **`/etc/factory/agent.json`** — the manifest, announced on the line before the handoff as
+  `FACTORY-MANIFEST {…}` with its newlines stripped. Known keys:
+
+      {"agent": "claude", "transcript": "\"$HOME\"/.claude/projects/*/*.jsonl",
+       "telemetry": "claude-code"}
+
+  `agent` is written onto the run row, so a run records what actually ran and not only what
+  was asked for. `transcript` is the glob the salvage step reaches for before the VM is
+  reaped. Every key has a default and the whole file may be missing or broken: an
+  unparseable manifest is `{}`, and a run whose real work succeeded never fails over one.
+
+The prompt is multi-kilobyte and quotes arbitrarily, so nothing re-quotes it through another
+shell. An executable on `PATH` is what keeps that class of bug impossible; parsing the
+manifest in the dispatch script and building a command out of it would reintroduce it.
+
+A golden captured before the wrapper existed still runs: the dispatch scripts fall back to
+the `claude -p` line the control plane used to carry. That fallback is the rollback for this
+migration and goes away once every golden carries `factory-agent`.
+
 ## §3 Dispatch environment
 
 What `exec` injects into every agent run. The telemetry half is specified in
