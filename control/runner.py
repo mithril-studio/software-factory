@@ -507,12 +507,56 @@ else
 fi
 """ + NODE_GUARD + r"""
 echo "FACTORY: starting agent"
-claude -p "$FACTORY_PROMPT" \
+# The rollback for this step, and nothing more: a golden captured before the wrapper existed
+# still launches the way the control plane used to launch it, and exits with the agent's own
+# status. It goes away once every golden carries factory-agent.
+command -v factory-agent >/dev/null 2>&1 || { claude -p "$FACTORY_PROMPT" \
   --effort "$FACTORY_AGENT_EFFORT" \
   --disallowed-tools Agent Task ScheduleWakeup \
   --dangerously-skip-permissions \
-  --output-format stream-json --verbose < /dev/null
+  --output-format stream-json --verbose < /dev/null; exit $?; }
+echo "FACTORY-MANIFEST $(tr -d '\n' < /etc/factory/agent.json 2>/dev/null)"
+exec factory-agent
 """
+
+
+# --------------------------------------------------------------------------- manifest
+
+# What a golden says about itself, on one line, immediately before it becomes the agent.
+# The prefix is what lets the stream parser tell the announcement from the agent's own
+# output without guessing: every other line on stdout belongs to the agent.
+MANIFEST_PREFIX = "FACTORY-MANIFEST"
+
+# Where a transcript lives when the manifest names no path. Claude Code's own layout, kept
+# as the default so a golden built before any of this still gives its transcript up.
+CLAUDE_TRANSCRIPT_GLOB = '"$HOME"/.claude/projects/*/*.jsonl'
+
+
+def parse_manifest(line: str) -> dict:
+    """The manifest a golden announced, or `{}` when the line does not carry a usable one.
+
+    Never raises, for the same reason the transcript salvage is best-effort: the manifest
+    says where the transcript is and which agent to credit, and a run whose real work
+    succeeded must not be failed by a hand-edited `/etc/factory/agent.json`, a wrapper that
+    forgot to strip the file's newlines, or an image that echoed the prefix and nothing
+    after it. `{}` is a complete answer — every reader of a manifest has a default.
+    """
+    _, _, payload = str(line or "").partition(MANIFEST_PREFIX)
+    try:
+        manifest = json.loads(payload)
+    except (TypeError, ValueError):
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def transcript_glob(manifest: dict | None = None) -> str:
+    """The shell glob that finds the agent's session transcript inside the VM.
+
+    The manifest wins when it names one, because only the golden knows where its agent
+    writes; an agent that is not Claude Code does not keep a `~/.claude` directory at all.
+    """
+    named = (manifest or {}).get("transcript")
+    return named.strip() if isinstance(named, str) and named.strip() else CLAUDE_TRANSCRIPT_GLOB
 
 
 # --------------------------------------------------------------------------- log
@@ -528,11 +572,13 @@ echo "FACTORY: checking out $FACTORY_BRANCH for review"
 git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BRANCH" || { echo "FACTORY: checkout failed" >&2; exit 92; }
 """ + NODE_GUARD + r"""
 echo "FACTORY: starting reviewer"
-claude -p "$FACTORY_PROMPT" \
+command -v factory-agent >/dev/null 2>&1 || { claude -p "$FACTORY_PROMPT" \
   --effort "$FACTORY_AGENT_EFFORT" \
   --disallowed-tools Agent Task ScheduleWakeup \
   --dangerously-skip-permissions \
-  --output-format stream-json --verbose < /dev/null
+  --output-format stream-json --verbose < /dev/null; exit $?; }
+echo "FACTORY-MANIFEST $(tr -d '\n' < /etc/factory/agent.json 2>/dev/null)"
+exec factory-agent
 """
 
 
@@ -1109,7 +1155,7 @@ async def _execute(
             env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
         if settings.claude_code_oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
-        exit_code, usage = await asyncio.wait_for(
+        exit_code, usage, manifest = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log, run_id), timeout=settings.run_timeout
         )
         log.write(f"[factory] agent exited {exit_code}")
@@ -1127,7 +1173,7 @@ async def _execute(
             log.write(f"[factory] pull request: {pr_url}")
         else:
             log.write("[factory] no pull request found for this branch")
-        await _salvage_transcript(boxd, machine.id, run_id, log)
+        await _salvage_transcript(boxd, machine.id, run_id, log, manifest)
 
         ok = exit_code == 0 and pr_url is not None
         review_next = False
@@ -1246,13 +1292,13 @@ async def _execute_review(
         if settings.claude_code_oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
 
-        exit_code, usage = await asyncio.wait_for(
+        exit_code, usage, manifest = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log, run_id, script=REVIEW_SCRIPT),
             timeout=settings.run_timeout,
         )
         log.write(f"[factory] reviewer exited {exit_code}")
         verdict = await _read_verdict(boxd, machine.id, log)
-        await _salvage_transcript(boxd, machine.id, run_id, log)
+        await _salvage_transcript(boxd, machine.id, run_id, log, manifest)
 
         approved, why, findings = decide(verdict, criteria)
         await db.update_run(
@@ -1410,11 +1456,13 @@ async def _stream(
     log: RunLog,
     run_id: str,
     script: str = VM_SCRIPT,
-) -> tuple[int, dict]:
+) -> tuple[int, dict, dict]:
     """Run the agent, formatting its event stream into the log as it arrives.
 
-    Returns the exit code and the usage captured from the final `result` event
-    (input/output tokens and cost), which is what the Runs UI shows as the run's cost.
+    Returns the exit code, the usage captured from the final `result` event
+    (input/output tokens and cost), which is what the Runs UI shows as the run's cost,
+    and the manifest the golden announced before handing off — `{}` when it announced
+    none, which is every golden captured before the wrapper existed.
 
     The same events also go to the telemetry recorder, which normalizes them into
     per-call rows and writes them as the run proceeds. That is a second consumer of a
@@ -1424,6 +1472,7 @@ async def _stream(
     """
     buffer = ""
     usage: dict = {}
+    manifest: dict = {}
     recorder = Recorder(run_id)
     async with boxd.machines.stream_exec(
         machine_id, command=script, env=env, close_stdin=True
@@ -1440,6 +1489,29 @@ async def _stream(
                 line, _, buffer = buffer.partition("\n")
                 line = line.strip()
                 if not line:
+                    continue
+                if line.startswith(MANIFEST_PREFIX):
+                    # The golden speaking about itself, not the agent speaking. It is
+                    # handled before the JSON branch and consumed here: the telemetry
+                    # recorder normalizes agent events and would count this as a dropped
+                    # one, and logging it raw would put a line of machine handshake in
+                    # the middle of a log a human reads.
+                    manifest = parse_manifest(line)
+                    named = str(manifest.get("agent") or "").strip()
+                    if manifest:
+                        log.write(
+                            f"[factory] manifest: agent {named or 'unnamed'}, "
+                            f"transcript {transcript_glob(manifest)}"
+                        )
+                    else:
+                        log.write("[factory] agent manifest unreadable; using defaults")
+                    await db.update_run(
+                        run_id,
+                        manifest=json.dumps(manifest),
+                        # What actually ran, overwriting what was asked for. They differ
+                        # when a golden was rebuilt onto another agent under the same name.
+                        **({"agent": named} if named else {}),
+                    )
                     continue
                 if line.startswith("{"):
                     try:
@@ -1460,17 +1532,23 @@ async def _stream(
     await recorder.close()
     if recorder.dropped:
         log.write(f"[factory] telemetry dropped {recorder.dropped} events")
-    return int(code or 0), usage
+    return int(code or 0), usage, manifest
 
 
-async def _salvage_transcript(boxd: AsyncBoxd, machine_id: str, run_id: str, log: RunLog) -> None:
+async def _salvage_transcript(
+    boxd: AsyncBoxd, machine_id: str, run_id: str, log: RunLog, manifest: dict | None = None
+) -> None:
     """Copy the agent's session transcript out before the VM is destroyed.
 
     The live stream is for watching; this file is the complete, replayable record. Best
     effort by design — a missing transcript must never fail an otherwise good run.
+
+    Where to look comes from the manifest, because the control plane no longer knows what
+    is running inside the VM. Without that, this reaches for `~/.claude` on every machine
+    and quietly salvages nothing from any agent that is not Claude Code.
     """
     script = (
-        'f=$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1); '
+        f'f=$(ls -t {transcript_glob(manifest)} 2>/dev/null | head -1); '
         '[ -n "$f" ] && [ "$(wc -c < "$f")" -lt 20000000 ] && cat "$f" || true'
     )
     try:

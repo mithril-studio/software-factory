@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS runs (
     attempt         INTEGER NOT NULL DEFAULT 1,
     kind            TEXT NOT NULL DEFAULT 'build',
     verdict         TEXT,
+    manifest        TEXT,
     agent           TEXT,
     tokens_in       INTEGER,
     tokens_out      INTEGER,
@@ -77,6 +78,11 @@ MIGRATIONS = (
     "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'build'",
     # Review runs only: the verdict JSON the reviewing agent produced.
     "ALTER TABLE runs ADD COLUMN verdict TEXT",
+    # What the golden said about itself on the way into the run: which agent it launches,
+    # where that agent writes its transcript, which telemetry shape it emits. Stored raw
+    # rather than spread across columns, because the control plane is not the authority on
+    # what a manifest may contain — the golden is, and it gains keys without a migration.
+    "ALTER TABLE runs ADD COLUMN manifest TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.

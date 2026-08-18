@@ -73,10 +73,17 @@ check("only the review script clears the stale verdict",
       ["rm -f /tmp/factory-verdict.json" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [False, True])
 check("the review script never pushes", "git push" in REVIEW_SCRIPT, False)
 
+# The launch itself moved into the golden as `factory-agent`, so what stays checkable here is
+# that each script still launches exactly one agent and does it last. The direct `claude -p`
+# line survives only as the fallback for goldens captured before the wrapper existed, which is
+# why it is now behind a `command -v` test rather than at the start of a line of its own.
+# `control/manifest_test.py` owns the shape of that handoff.
+
 for name, script in SCRIPTS.items():
-    check(f"{name}: launches the agent exactly once", len(re.findall(r"^claude -p ", script, re.MULTILINE)), 1)
-    check(f"{name}: launches the agent last",
-          script.rstrip().endswith("--output-format stream-json --verbose < /dev/null"))
+    check(f"{name}: launches the agent exactly once", script.count("exec factory-agent"), 1)
+    check(f"{name}: launches the agent last", script.rstrip().endswith("exec factory-agent"))
+    check(f"{name}: keeps the pre-wrapper fallback exactly once",
+          len(re.findall(r"claude -p ", script)), 1)
 
 # ---------- exit codes
 # 90 no repo dir · 91 fetch failed · 92 checkout failed · 93 toolchain mismatch. Each one is a
