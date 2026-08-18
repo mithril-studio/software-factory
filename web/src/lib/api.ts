@@ -35,6 +35,10 @@ export type PlanIssue = {
 export type Project = {
   repo: string
   golden: string
+  golden_checked_at: string | null
+  golden_behind: number | null
+  golden_stale_deps: string | null
+  golden_error: string | null
   runs: number
   succeeded: number
   failed: number
@@ -48,6 +52,8 @@ export type Agent = {
   role: "golden" | "run"
   is_golden: boolean
   orphan: boolean
+  behind: number | null
+  stale_deps: string | null
 }
 
 export type Config = {

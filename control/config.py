@@ -124,6 +124,9 @@ class Settings:
     # Each entry carries the machine its runs fork from — see _watched().
     watched: tuple[tuple[str, str], ...] = _watched()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
+    # How often to check each golden for drift, in seconds. 0 switches the sweep off. Hourly
+    # because what it watches moves on the timescale of merges, not of runs.
+    golden_sweep_interval: int = int(os.environ.get("FACTORY_GOLDEN_SWEEP", "3600"))
     poll_interval: int = int(os.environ.get("FACTORY_POLL_INTERVAL", "30"))
     # Public URL of this control plane, used only to link runs from issue comments.
     base_url: str = os.environ.get("FACTORY_BASE_URL", "").rstrip("/")

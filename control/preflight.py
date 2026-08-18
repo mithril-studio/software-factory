@@ -19,7 +19,7 @@ import asyncio
 import sys
 from dataclasses import dataclass
 
-from . import github, runner
+from . import github, probe, runner
 from .config import settings
 
 
@@ -41,8 +41,7 @@ class Check:
         return "ok  " if self.ok else ("FAIL" if self.fatal else "warn")
 
 
-# One round trip instead of ten. Each line is `key=value`; a missing key means the command
-# before it failed, which the parser reports rather than guessing about.
+# One round trip instead of ten. Each line is `key=value`, read back by `probe.parse`.
 VM_PROBE = r"""
 cd "$REPO_DIR" 2>/dev/null || { echo "repo_dir=missing"; exit 0; }
 echo "repo_dir=ok"
@@ -60,15 +59,6 @@ echo "gh=$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)"
 """
 
 
-def _parse(stdout: str) -> dict[str, str]:
-    out = {}
-    for line in stdout.splitlines():
-        key, sep, value = line.partition("=")
-        if sep:
-            out[key.strip()] = value.strip()
-    return out
-
-
 async def _vm_checks(repo: str, golden: str, repo_dir: str, base: str) -> list[Check]:
     """What only the machine can answer. All of it from one `exec`."""
     boxd = runner.client()
@@ -84,7 +74,7 @@ async def _vm_checks(repo: str, golden: str, repo_dir: str, base: str) -> list[C
     finally:
         await boxd.close()
 
-    p = _parse(result.stdout)
+    p = probe.parse(result.stdout)
     if p.get("repo_dir") != "ok":
         checks.append(Check("checkout present", False, f"{repo_dir} is not there on {golden}"))
         return checks

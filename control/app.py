@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import auth, db, github, poller, preflight, runner
+from . import auth, db, github, goldens, poller, preflight, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -31,10 +31,12 @@ async def lifespan(app: FastAPI):
     await db.init()
     await telemetry.init()
     poller.start()
+    goldens.start()
     try:
         yield
     finally:
         await poller.stop()
+        await goldens.stop()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
@@ -242,6 +244,12 @@ async def api_plan(repo: str | None = None):
     return out
 
 
+@app.post("/api/goldens/sweep")
+async def api_golden_sweep():
+    """Check every golden for drift now, rather than waiting for the next sweep."""
+    return await goldens.sweep()
+
+
 @app.get("/api/preflight")
 async def api_preflight(repo: str):
     """Whether `repo` is ready to be dispatched to, and its golden ready to build it.
@@ -261,15 +269,22 @@ async def api_preflight(repo: str):
 
 @app.get("/api/projects")
 async def api_projects():
-    """Watched repos with their run tallies."""
+    """Watched repos with their run tallies, and how fresh the machine they fork is."""
     stats = await db.stats_by_repo()
+    fresh = await db.goldens()
     out = []
     for repo, golden in settings.watched:
         s = stats.get(repo, {})
+        g = fresh.get(golden) or {}
         out.append(
             {
                 "repo": repo,
                 "golden": golden,
+                # What the last sweep saw. Absent until the first one has run.
+                "golden_checked_at": g.get("checked_at"),
+                "golden_behind": g.get("behind"),
+                "golden_stale_deps": g.get("stale_deps") or None,
+                "golden_error": g.get("error"),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -292,6 +307,7 @@ async def api_agents():
     finally:
         await boxd.close()
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
+    fresh = await db.goldens()
     out = []
     for m in machines:
         is_run = runner.is_run_vm(m.name)
@@ -301,6 +317,8 @@ async def api_agents():
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
                 "is_golden": m.name in settings.goldens,
+                "behind": (fresh.get(m.name) or {}).get("behind"),
+                "stale_deps": (fresh.get(m.name) or {}).get("stale_deps") or None,
                 "orphan": is_run and m.name not in active,
             }
         )

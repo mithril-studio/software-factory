@@ -104,6 +104,23 @@ Every run forks one long-lived machine. It must have:
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
+### Keeping a golden warm
+
+A golden is warm on purpose, and the prompt tells the agent so — *dependencies are installed,
+do not reinstall them*. That is true only while the install still matches the repo, and
+nothing kept it true. The control plane now sweeps every golden hourly
+(`FACTORY_GOLDEN_SWEEP`) and records what it finds: how far behind the checkout is, whether
+the tree is dirty, and whether a dependency manifest moved in the commits it is missing. The
+Projects page shows it, and `POST /api/goldens/sweep` runs one on demand.
+
+The sweep **observes only**. A run checks its own branch out from `origin/<base>` anyway, so
+the code on a golden is never what goes stale — the install is, and how to redo that is
+project-specific. Repairing is one command:
+
+```bash
+scripts/sync-golden.sh factory-golden /home/boxd/repo main 'npm ci && npm run build'
+```
+
 ## Adding a repo
 
 1. Build or fork a golden for it: the repo cloned at `FACTORY_REPO_DIR`, dependencies
