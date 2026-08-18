@@ -91,12 +91,28 @@ check("a profile is read from the base branch",
       asyncio.run(fetch(found)).startswith("# a/repo:.factory.md@main"), True)
 
 # ---------- the reviewer is told the same thing, and its template still formats
+REVIEW_BODY = (
+    "## Objective\nShorten urls, so links fit in a tweet.\n\n"
+    "## Where this goes\n- `src/shorten.ts` — new: the endpoint\n\n"
+    "## Boundaries\n- **Never:** touch the schema.\n"
+)
 rev = runner.REVIEW_PROMPT_TEMPLATE.format(
     project_notes=PROFILE, repo="a/repo", number=7, title="t", pr_url="u",
     branch="b", base="main", base_sha="deadbeef", criteria="- id: AC1\n",
+    body=REVIEW_BODY,
 )
 check("the reviewer gets the project's own checks", "npm test` is the whole suite" in rev, True)
 check("and not another project's", "test:integration" in rev, False)
+
+# The reviewer was told to map every changed file against "the issue's stated task" while being
+# handed only the title and the criteria — the task, the file map and the boundaries were all in
+# a body it never saw. It gets the body now, subordinate to the criteria.
+check("the issue body reaches the reviewer", "**Never:** touch the schema." in rev, True)
+check("including the file map it checks scope against", "`src/shorten.ts`" in rev, True)
+check("the body is context, not a second contract",
+      "do not mine it for extra gates" in rev, True)
+check("a criterion is still the only thing that blocks on its own",
+      "prose in the body is not one" in rev, True)
 
 # ---------- which machines the factory owns
 # The leak this pins down: reconcile swept `run-` only, so an orphaned review VM survived on

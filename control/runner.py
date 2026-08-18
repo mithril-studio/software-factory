@@ -302,6 +302,16 @@ You are checked out on the branch `{branch}`. The base branch is `{base}`.
 {criteria}
 --- end criteria ---
 
+--- the issue body the change was written against ---
+{body}
+--- end issue body ---
+
+The criteria are the contract; the body is context for reading the change. It tells you what
+the step was for, where its author expected the work to land, and where its lane ended. Use it
+to judge scope — do not mine it for extra gates. A criterion is the only thing that blocks on
+its own; prose in the body is not one. Where the body and the criteria disagree, the criteria
+win: record the disagreement in `notes` rather than acting on it.
+
 Your job is to find out whether each criterion is true. Not whether the code looks correct,
 not whether you would have written it that way — whether the criterion holds.
 
@@ -341,7 +351,15 @@ If any of them fail, that is a finding regardless of the criteria.
 Then look for two specific things and report them as findings if present:
 
 1. **Scope creep.** Map every changed file (`git diff --name-only {base_sha}...HEAD`) to a
-   criterion or to the issue's stated task. Files that map to neither are findings.
+   criterion, to the issue's `## Task`, or to its `## Where this goes` map if it has one.
+   Files that map to none of those are findings. Two things about that map, when present:
+   - It is **advisory**. It was written before the code existed, and the issue itself tells the
+     builder to follow the repo where the two disagree. So a changed file that is not on the
+     map is a reason to look closer, not a finding by itself.
+   - A file that is **on** the map but was never touched belongs in `notes`: either the step is
+     unfinished or the map was wrong. Both are worth knowing; neither blocks on its own.
+   Anything the issue's `## Boundaries` section puts in its `Never:` lane **is** a finding if
+   the change does it. That is the issue's own written rule, not an opinion you formed.
 2. **Rules broken.** Check the change against the repo's own written rules — `CLAUDE.md`,
    `docs/adr/*`, `.mem/`. Only rules that are actually written down. Do not invent a
    convention and then report the code for violating it; if it is not written anywhere, it is
@@ -1138,6 +1156,7 @@ async def _execute_review(
             base=base,
             base_sha=base_sha,
             criteria=yaml.safe_dump(criteria, sort_keys=False, allow_unicode=True),
+            body=issue.get("body") or "(no description given)",
         )
         env = {
             "FACTORY_REPO_DIR": settings.repo_dir,

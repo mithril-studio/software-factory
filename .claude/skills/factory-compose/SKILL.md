@@ -29,7 +29,7 @@ whole repo** until a human clears it. Consequences you must design around:
   failed run → halted repo. Body quality is the whole game.
 - Create issues **in dependency order** so their numbers ascend with the sequence.
 
-## Three hard rules
+## Five hard rules
 
 1. **Never create issues before explicit human approval.** You are a drafting tool with a
    mandatory review gate. Draft in chat; create on GitHub only after a clear yes.
@@ -40,8 +40,15 @@ whole repo** until a human clears it. Consequences you must design around:
 4. **Acceptance criteria are executable, not prose.** They are a YAML block where each
    criterion carries a `mode` (`test` / `probe` / `structure` / `inspect`) and a `verify`
    naming what proves it. Nobody reads these PRs before they merge — a reviewing agent runs
-   the criteria instead, and it can only run what you made runnable. See
-   `references/issue-template.md`.
+   the criteria instead, and it can only run what you made runnable. A malformed block is
+   worse than a missing one: the control plane drops what it cannot parse and skips review
+   silently, so the PR merges with no gate at all. `scripts/validate_backlog.py` is what
+   stands between a typo and an ungated merge, and `create_backlog.sh` runs it before
+   creating anything. See `references/issue-template.md`.
+5. **Never invent a file path.** `## Where this goes` is only worth having when it is grounded
+   in a repo you actually read. A guessed path sends the building agent off to build a
+   structure the repo does not use, and it corrupts the reviewer's scope-creep check. Read the
+   tree, or omit the section.
 
 ## Procedure
 
@@ -52,12 +59,19 @@ whole repo** until a human clears it. Consequences you must design around:
 - **Refuse a too-vague brief.** If it can't yield acceptance-testable issues, ask targeted
   questions (stack/language, what "done" means, key constraints) *before* drafting. A vague
   brief is the root cause of failed runs.
+- **Ground yourself in the repo, if it already has code.** Read the tree, the test layout, the
+  scripts a `probe` could call, `CLAUDE.md`, and `.mem/` if it exists. This is what makes
+  `verify:` paths and `## Where this goes` real rather than plausible — the difference between
+  a file map that saves the building agent a third of its run and one that misdirects it. Note
+  the branch and short sha you read; each file map is stamped with it.
 
 ### 2. Decompose
 Read `references/decomposition.md` and apply it. Produce a **linear, ordered** backlog where each
 issue is one PR-sized unit an autonomous agent can finish in one VM run against the *merged*
 result of all prior issues. Aim for ~5–15 issues (state your granularity and why). Every issue
-body follows `references/issue-template.md` exactly. See `references/examples.md` for worked
+body follows `references/issue-template.md` exactly — `## Objective` (what and why), `## Task`,
+`## Where this goes` (the grounded file map), `## Acceptance criteria`, `## Boundaries`
+(always / stop and flag / never), `## Sequence`. See `references/examples.md` for worked
 brief→backlog examples.
 
 ### 3. Review in chat (not on GitHub)
@@ -65,6 +79,11 @@ Present:
 - A numbered table: `# | Title | Depends on | one-line scope`.
 - Then the **full body of each issue**.
 - A short rationale: chosen granularity, why this order, dependencies/assumptions surfaced.
+
+- **Open questions** — anything still unresolved. This is the only place they may exist: an
+  open question left inside an issue body is an ambiguity handed to an agent alone in a VM,
+  which is how repos get halted. Resolve every one here; do not proceed to step 4 while any
+  remain.
 
 Invite the human to reorder, split, merge, rescope, or edit any title/body/criterion. **Re-render
 the whole list after each change** so they always see the final state.
@@ -88,10 +107,17 @@ Then run:
 bash scripts/create_backlog.sh <owner/repo> <slug> <workdir>
 ```
 
+Validate while drafting, not only at creation time:
+
+```bash
+python3 scripts/validate_backlog.py <slug> <workdir>
+```
+
 The script: validates auth + repo (fails early), ensures the five `agent:*` labels exist with
 the exact colors the control plane uses, **aborts if the slug's marker already exists**
-(idempotency), creates issues in `NN` order capturing their numbers, back-fills `Depends on: #N`,
-and prints a report. It **stops on the first failure** (a gap is worse than a short backlog).
+(idempotency), **runs `validate_backlog.py` over every drafted file and refuses to create
+anything if one is malformed**, creates issues in `NN` order capturing their numbers,
+back-fills `Depends on: #N`, and prints a report. It **stops on the first failure** (a gap is worse than a short backlog).
 
 If the script aborts because a backlog for this slug already exists, do NOT force-duplicate.
 Handle it by talking to the human: create only the genuinely missing steps, or update existing

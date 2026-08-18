@@ -59,6 +59,17 @@ files=("$WORKDIR"/[0-9]*.md)
 shopt -u nullglob
 [ "${#files[@]}" -gt 0 ] || { echo "no NN.md step files found in $WORKDIR"; exit 1; }
 
+# Validate before anything is created. Every defect in a drafted issue degrades silently
+# downstream — a malformed criteria block makes the control plane skip review for that PR
+# altogether — so this is the last place it can be caught. A gap is worse than a short backlog,
+# and a backlog that disarms the reviewer is worse than both.
+echo "==> validating ${#files[@]} drafted issues"
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+python3 "$SCRIPT_DIR/validate_backlog.py" "$SLUG" "$WORKDIR" || {
+  echo "ABORT: the drafted backlog did not validate. Nothing was created."
+  exit 1
+}
+
 echo "==> creating ${#files[@]} issues in $REPO"
 numbers=(); urls=(); bodyfiles=(); titles=()
 for f in "${files[@]}"; do

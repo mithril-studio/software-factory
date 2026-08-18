@@ -20,8 +20,9 @@ An issue is correctly sized when it:
 - Has **acceptance criteria the VM can verify itself** — a command that runs, a test that passes,
   an endpoint that responds. No criterion needing a human's eyes or a service the VM can't reach.
   A useful sizing test: if you cannot name the test file that would prove an issue is done, the
-  issue is too vague or too large. Naming it is also what the `verify` field asks for, so the
-  effort is not extra.
+  issue is too vague or too large. Naming it is also what the `verify` field and the
+  `## Where this goes` map ask for, so the effort is not extra — and if the file map for an
+  issue runs past a handful of entries, that is the same signal by a different route.
 - Describes the work **without "and also"** chaining unrelated changes. "And also" is the signal
   to split into two issues.
 - Is **not churn** — if the PR would be smaller than its own boilerplate (e.g. "add one field"),
@@ -49,8 +50,8 @@ this from a fresh checkout?"* Every prerequisite you name must be an **earlier**
 isn't, either:
 
 - it's a **missing issue** — add it earlier in the sequence, or
-- it's an **out-of-scope assumption** — state it explicitly in that issue's `Out of scope` or
-  `Context`.
+- it's an **out-of-scope assumption** — state it explicitly in that issue's `Boundaries`
+  (`Never:`) or `Objective`.
 
 This pass is what converts a flat feature list into a safe linear order.
 
@@ -75,3 +76,8 @@ State your chosen granularity and the reasoning in the review step so the human 
 - Issue #1 doing anything beyond "stand up a green skeleton" → thin it down.
 - A criterion needing a real external service/secret → move it out of scope or to a documented
   manual step; it will fail forever inside the VM and halt the repo.
+- A `## Where this goes` map you wrote without reading the repo → delete it. Silence costs the
+  building agent some grepping; a wrong map costs a bad PR and a wrong scope-creep report.
+- A `Boundaries → Always:` line that would be true of every issue in every repo ("commit as you
+  go", "stay in scope") → cut it. It already lives in the builder's prompt, and repeating it
+  dilutes the lines that are specific to this step.
