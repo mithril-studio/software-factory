@@ -305,15 +305,15 @@ async def api_plan(repo: str | None = None):
     return out
 
 
-@app.post("/api/goldens/sweep")
-async def api_golden_sweep():
-    """Check every golden for drift now, rather than waiting for the next sweep."""
-    return await goldens.sweep()
+@app.post("/api/agents/refresh")
+async def api_agent_refresh():
+    """Re-list the golden snapshots now, rather than waiting for the next refresh."""
+    return await goldens.refresh()
 
 
 @app.get("/api/preflight")
 async def api_preflight(repo: str):
-    """Whether `repo` is ready to be dispatched to, and its golden ready to build it.
+    """Whether `repo` is ready to be dispatched to, and an agent exists to take it.
 
     Read-only: it reports, it never repairs. Answers here cost a second; the same answers
     found during a run cost a VM and forty minutes.
@@ -330,12 +330,11 @@ async def api_preflight(repo: str):
 
 @app.get("/api/projects")
 async def api_projects():
-    """Watched repos with their run tallies, and how fresh the machine they fork is."""
+    """Watched repos with their run tallies and the snapshot their runs boot."""
     stats = await db.stats_by_repo()
-    fresh = await db.goldens()
     # `watched` names an agent, not a machine, so the golden is derived the same way a
-    # dispatch derives it — otherwise this column reports an agent and the sweep's rows,
-    # which are keyed by snapshot, never match it.
+    # dispatch derives it — otherwise this column would report an agent where the fleet
+    # views report a snapshot name.
     boxd = runner.client()
     try:
         sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
@@ -347,17 +346,11 @@ async def api_projects():
     for repo, _ in settings.watched:
         golden = sources.get(repo, "")
         s = stats.get(repo, {})
-        g = fresh.get(golden) or {}
         out.append(
             {
                 "repo": repo,
                 "agent": settings.agent_for(repo),
                 "golden": golden,
-                # What the last sweep saw. Absent until the first one has run.
-                "golden_checked_at": g.get("checked_at"),
-                "golden_behind": g.get("behind"),
-                "golden_stale_deps": g.get("stale_deps") or None,
-                "golden_error": g.get("error"),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -380,7 +373,7 @@ async def api_agents():
     finally:
         await boxd.close()
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
-    fresh = await db.goldens()
+    known = await db.agents()
     out = []
     for m in machines:
         is_run = runner.is_run_vm(m.name)
@@ -390,8 +383,9 @@ async def api_agents():
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
                 "is_golden": agents.parse_golden(m.name) is not None,
-                "behind": (fresh.get(m.name) or {}).get("behind"),
-                "stale_deps": (fresh.get(m.name) or {}).get("stale_deps") or None,
+                # When a run last finished on it having produced usage. The credential is
+                # what expires on these, and a run using one is the only proof it still works.
+                "verified_at": (known.get(m.name) or {}).get("verified_at"),
                 "orphan": is_run and m.name not in active,
             }
         )

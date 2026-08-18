@@ -71,6 +71,9 @@ The golden carries an interactive agent login on disk, inherited by every fork. 
 Rotation is: re-authenticate the golden, re-snapshot, done — a scheduled chore, not a
 one-time setup step. A stale credential surfaces as a mysteriously broken agent, not as an
 auth error, so it is worth a health check that runs before the credential's expected expiry.
+The `agents` table carries the cheapest one there is: `verified_at`, the last time a run
+finished on that snapshot having produced usage. No probe boots a VM to ask — a run using the
+credential is the only test of it that proves anything, and the runs happen anyway.
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 

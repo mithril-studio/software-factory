@@ -1,9 +1,16 @@
-"""Is this repo ready for the factory, and is its golden ready for this repo?
+"""Is this repo ready for the factory?
 
 Every check here answers a question that otherwise gets answered by a run: forty minutes, a
-VM, and an agent's context window spent discovering that the checkout on the golden belongs
-to a different project, or that nothing on GitHub will ever report a check run so the pull
-request can never merge. Cheap to ask now, expensive to learn later.
+VM, and an agent's context window spent discovering that the token cannot push, or that
+nothing on GitHub will ever report a check run so the pull request can never merge. Cheap to
+ask now, expensive to learn later.
+
+It used to ask half its questions of the golden, over an `exec`: is the checkout the right
+repo, is it clean, is it on the base branch, how far behind, does node match `.nvmrc`. A
+golden is a repo-agnostic snapshot now and carries no checkout, so five of those were about
+a thing that no longer exists and the sixth — the toolchain — is what a run's own setup step
+installs. What is left of the machine half is one question that costs no VM at all: does a
+golden snapshot exist for the agent this repo's runs would use.
 
 It inspects, it does not repair — what it reports is what a human then fixes, because a
 preflight that quietly repairs things is one nobody can trust the verdict of. The single
@@ -18,9 +25,10 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 
-from . import github, probe, runner
+from . import agents, github, runner
 from .config import settings
 
 
@@ -40,101 +48,6 @@ class Check:
     @property
     def mark(self) -> str:
         return "ok  " if self.ok else ("FAIL" if self.fatal else "warn")
-
-
-# One round trip instead of ten. Each line is `key=value`, read back by `probe.parse`.
-VM_PROBE = r"""
-cd "$REPO_DIR" 2>/dev/null || { echo "repo_dir=missing"; exit 0; }
-echo "repo_dir=ok"
-echo "origin=$(git config --get remote.origin.url 2>/dev/null | sed 's#.*[:/]\([^/]*/[^/]*\)$#\1#; s#\.git$##')"
-echo "branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-echo "head=$(git rev-parse --short HEAD 2>/dev/null)"
-echo "dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
-git fetch --prune origin >/dev/null 2>&1 && echo "fetch=ok" || echo "fetch=failed"
-echo "behind=$(git rev-list --count HEAD..origin/$BASE 2>/dev/null)"
-echo "nvmrc=$([ -f .nvmrc ] && tr -dc '0-9.' < .nvmrc | cut -d. -f1 || echo none)"
-echo "node=$(command -v node >/dev/null 2>&1 && node -v | tr -d 'v' | cut -d. -f1 || echo none)"
-echo "claude=$(command -v claude >/dev/null 2>&1 && echo ok || echo missing)"
-echo "skills=$(ls ~/.claude/skills 2>/dev/null | tr '\n' ' ')"
-echo "gh=$(gh auth status >/dev/null 2>&1 && echo ok || echo missing)"
-"""
-
-
-async def _vm_checks(repo: str, golden: str, repo_dir: str, base: str) -> list[Check]:
-    """What only the machine can answer. All of it from one `exec`."""
-    boxd = runner.client()
-    try:
-        try:
-            machine_id = await runner.machine_id(boxd, golden)
-        except Exception as exc:  # noqa: BLE001 - the message is the finding
-            return [Check("golden exists", False, f"{golden}: {exc}")]
-        checks = [Check("golden exists", True, f"{golden} ({machine_id[:8]})")]
-        result = await boxd.machines.exec(
-            machine_id, command=VM_PROBE, env={"REPO_DIR": repo_dir, "BASE": base}, timeout=180
-        )
-    finally:
-        await boxd.close()
-
-    p = probe.parse(result.stdout)
-    if p.get("repo_dir") != "ok":
-        checks.append(Check("checkout present", False, f"{repo_dir} is not there on {golden}"))
-        return checks
-    checks.append(Check("checkout present", True, repo_dir))
-
-    origin = p.get("origin", "")
-    checks.append(
-        Check(
-            "checkout is this repo",
-            origin.lower() == repo.lower(),
-            f"origin is {origin or 'unset'}, expected {repo}",
-        )
-    )
-    checks.append(
-        Check("origin reachable", p.get("fetch") == "ok", f"git fetch {p.get('fetch', '?')}")
-    )
-    checks.append(
-        Check(
-            "on the base branch",
-            p.get("branch") == base,
-            f"on {p.get('branch') or '?'} at {p.get('head') or '?'}, base is {base}",
-        )
-    )
-    # How stale the warm checkout is. Not fatal — a run checks out its own branch from
-    # `origin/base` anyway — but it is what `node_modules` and the build cache were installed
-    # against, so a golden far behind is one whose warmth has stopped being an advantage.
-    behind = p.get("behind", "?")
-    checks.append(
-        Check(
-            "golden is current",
-            behind == "0",
-            f"{behind} commit(s) behind origin/{base}",
-            fatal=False,
-        )
-    )
-    # A dirty golden is inherited by every fork, so uncommitted noise becomes something the
-    # agent may commit without ever having touched it.
-    checks.append(
-        Check("checkout is clean", p.get("dirty") == "0", f"{p.get('dirty', '?')} modified file(s)")
-    )
-    # The mismatch that broke CI on fourteen consecutive commits, and the one VM_SCRIPT
-    # already refuses to start on (exit 93) — better found here than there.
-    want, have = p.get("nvmrc", "none"), p.get("node", "none")
-    checks.append(
-        Check(
-            "toolchain matches .nvmrc",
-            want == "none" or want == have,
-            f".nvmrc pins {want}, machine runs node {have}",
-        )
-    )
-    checks.append(Check("claude installed", p.get("claude") == "ok", p.get("claude", "?")))
-    skills = p.get("skills", "")
-    checks.append(
-        Check("memory skill installed", "memory" in skills.split(), f"skills: {skills or 'none'}")
-    )
-    # The agent opens the pull request itself with `gh`; without this the run does all the
-    # work and then has nowhere to put it.
-    checks.append(Check("gh authenticated in the VM", p.get("gh") == "ok", p.get("gh", "?")))
-    return checks
 
 
 # A `## Setup` heading in the profile, at any level. What follows it is the command the
@@ -172,6 +85,29 @@ def profile_checks(profile: str | None) -> list[Check]:
     ]
 
 
+def agent_check(repo: str, agent: str, available: Iterable[str] = ()) -> Check:
+    """Is there a golden snapshot for the agent this repo's runs would boot?
+
+    The cheapest question the old VM probe was standing in for, and the only one of them
+    still worth asking: a repo whose agent resolves to nothing does not fail slowly, it fails
+    at the first dispatch, having spent nothing. Blocking, therefore — unlike the profile
+    warnings, this is not a run that goes worse, it is a run that cannot start.
+
+    `available` is passed in rather than fetched so the decision is testable without
+    credentials; `run()` is the one place that talks to the fleet.
+    """
+    snapshot = agents.resolve_snapshot(agent, repo, available)
+    if snapshot:
+        return Check("an agent is resolvable", True, f"{agent} boots {snapshot}")
+    fleet = ", ".join(sorted(available)) or "no golden snapshots at all"
+    return Check(
+        "an agent is resolvable",
+        False,
+        f"{repo} resolves to agent {agent!r}, which has no {agents.golden_name(agent)}; "
+        f"the fleet holds {fleet}",
+    )
+
+
 async def _repo_checks(repo: str, base: str) -> list[Check]:
     """What only GitHub can answer."""
     info = await github.repo_info(repo)
@@ -204,20 +140,33 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
     return checks
 
 
-async def run(repo: str) -> list[Check]:
-    """Every check for `repo`, against the golden its runs would actually fork."""
+async def _fleet() -> tuple[tuple[str, ...], Check | None]:
+    """The golden snapshot names, plus a failing check when the fleet could not be read.
+
+    Kept apart from `agent_check` on purpose: "boxd is unreachable" and "this agent has no
+    snapshot" are different repairs, and an outage reported as a missing agent sends whoever
+    reads it to build a snapshot that is already there.
+    """
     boxd = runner.client()
     try:
-        golden = await runner.source_for(boxd, repo)
+        return await agents.available(boxd), None
     except Exception as exc:  # noqa: BLE001 - the message is the finding
-        return [Check("golden configured", False, f"no golden resolved for {repo}: {exc}")]
+        return (), Check("fleet readable", False, f"could not list snapshots: {exc}")
     finally:
         await boxd.close()
-    base = await github.default_branch(repo)
-    repo_checks, vm_checks = await asyncio.gather(
-        _repo_checks(repo, base), _vm_checks(repo, golden, settings.repo_dir, base)
+
+
+async def run(repo: str) -> list[Check]:
+    """Every check for `repo`, and for the agent its runs would boot."""
+    base, (available, outage) = await asyncio.gather(
+        github.default_branch(repo), _fleet()
     )
-    return repo_checks + vm_checks
+    checks = await _repo_checks(repo, base)
+    if outage:
+        checks.append(outage)
+    else:
+        checks.append(agent_check(repo, settings.agent_for(repo), available))
+    return checks
 
 
 def report(repo: str, checks: list[Check]) -> bool:

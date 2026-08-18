@@ -1,144 +1,116 @@
-"""Watch the machines runs fork from, so staleness is visible instead of discovered.
+"""Which agents this deployment can run, and how far any of them can be trusted.
 
-A per-repo golden is warm on purpose: it carries that repo's checkout with its dependencies
-already installed. That warmth is only warmth while the install still matches the repo, and
-nothing keeps it true or says when it stopped. The prompt no longer promises the agent any of
-it — it says the download caches are warm and sends the run to install once — so a stale
-golden costs a run minutes rather than sending it to build against the wrong tree. Minutes
-per run, across every repo, is still what caps how many repos the factory can carry.
+This used to be a freshness sweep: hourly, it forked nothing but `exec`d into every golden
+*machine* and asked how far behind its checkout was, whether the tree was dirty, whether a
+dependency manifest had moved. A golden is a repo-agnostic snapshot now. It has no checkout,
+so every one of those questions stopped having an answer at the same moment — and the one
+that killed goldens was never on the list.
 
-This sweep **observes**. It does not reset the checkout and does not install anything: a run
-already checks its own branch out from `origin/<base>`, so the *code* on a golden is never
-what goes stale — the *install* is, and how to redo that is project-specific (`npm ci`, `uv
-sync`, something else). Guessing it here is how a control plane that contains no intelligence
-starts containing some. What the sweep does instead is name the drift, including whether a
-dependency manifest moved, so a human knows a golden needs rebuilding rather than finding out
-from a run that quietly reinstalls 900 packages on every attempt.
+What kills a golden is credential expiry. The only real test of a credential is using it,
+and the runs are already doing that, on the exact machine the question is about, for free.
+So this grades by evidence: `verified_at` is when a run last finished on a snapshot having
+produced usage, which is proof that its `claude` login and its `gh` token both still work.
+Nothing here boots a VM, and nothing here repairs anything.
+
+What is left costs one list call, which is why it runs every five minutes rather than every
+hour: discovering an agent late is the cost that replaced discovering staleness late, and a
+snapshot built by hand should be dispatchable within a poll or two of existing.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
-from . import db, github, probe, runner
+from . import agents, db, runner
 from .config import settings
 
 log = logging.getLogger("factory.goldens")
 
 _task: asyncio.Task | None = None
 
-# Files whose movement means the warm install is out of date. Deliberately a fixed list of
-# manifests across ecosystems rather than anything clever: a name that is missing costs a
-# missed warning, a name that is wrong costs a false one.
-MANIFESTS = (
-    "package.json",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "requirements.txt",
-    "pyproject.toml",
-    "uv.lock",
-    "poetry.lock",
-    "go.mod",
-    "go.sum",
-    "Gemfile.lock",
-    "Cargo.lock",
-)
 
-PROBE = r"""
-cd "$REPO_DIR" 2>/dev/null || { echo "error=repo dir $REPO_DIR not found"; exit 0; }
-git fetch --prune origin >/dev/null 2>&1 || { echo "error=git fetch failed"; exit 0; }
-echo "head=$(git rev-parse --short HEAD)"
-echo "behind=$(git rev-list --count HEAD..origin/$BASE 2>/dev/null)"
-echo "dirty=$(git status --porcelain | wc -l | tr -d ' ')"
-echo "stale_deps=$(git diff --name-only HEAD "origin/$BASE" -- $MANIFESTS 2>/dev/null | tr '\n' ' ')"
-echo "toolchain=$(command -v node >/dev/null 2>&1 && node -v || echo 'no node')"
-"""
+def _manifest(raw: str | None) -> dict:
+    """The manifest a run recorded, or `{}`. Never raises — it is stored input, not ours."""
+    try:
+        parsed = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
-async def check(name: str, repo: str, repo_dir: str, base: str) -> dict:
-    """Probe one golden. Returns the row recorded for it."""
-    row: dict = {"repo": repo, "checked_at": db.utcnow(), "ok": 0}
+async def refresh() -> dict[str, dict]:
+    """List the golden snapshots and record one row each. Returns the rows it wrote.
+
+    Never raises: a boxd outage is a refresh that recorded nothing, not a control plane that
+    fell over. It writes one row per *discovered* name and no rows for anything else, so a
+    snapshot that has been deleted keeps its last row rather than being resurrected with an
+    empty one — the fleet listing, not this table, is what `available()` answers from.
+    """
     boxd = runner.client()
     try:
-        machine_id = await runner.machine_id(boxd, name)
-        result = await boxd.machines.exec(
-            machine_id,
-            command=PROBE,
-            env={"REPO_DIR": repo_dir, "BASE": base, "MANIFESTS": " ".join(MANIFESTS)},
-            timeout=180,
-        )
-        seen = probe.parse(result.stdout)
-    except Exception as exc:  # noqa: BLE001 - an unreachable golden is a finding, not a crash
-        row["error"] = f"{type(exc).__name__}: {exc}"
-        await db.record_golden(name, **row)
-        return row
+        # The refresh is the one caller that must not read a memoised fleet: it exists to
+        # notice change, and a listing up to `CACHE_TTL` old is exactly what it is looking for.
+        agents.forget()
+        names = await agents.available(boxd)
+    except Exception:  # noqa: BLE001 - a fleet nobody can list is nothing to record
+        log.exception("could not list the golden snapshots")
+        return {}
     finally:
         await boxd.close()
 
-    if seen.get("error"):
-        row["error"] = seen["error"]
-    else:
-        row.update(
-            ok=1,
-            head_sha=seen.get("head"),
-            behind=int(seen.get("behind") or 0),
-            dirty=int(seen.get("dirty") or 0),
-            stale_deps=seen.get("stale_deps", "").strip(),
-            toolchain=seen.get("toolchain"),
-        )
-    await db.record_golden(name, **row)
-    return row
+    evidence = await db.agent_evidence()
+    checked_at = db.utcnow()
+    rows: dict[str, dict] = {}
+    for name in names:
+        parsed = agents.parse_golden(name)
+        seen = evidence.get(name, {})
+        manifest = _manifest(seen.get("manifest"))
+        rows[name] = {
+            "agent": parsed[0] if parsed else None,
+            "version": agents.version(name),
+            # What the golden announced on the way into its last run. Read back from the
+            # run rather than from the machine, because asking the machine means booting it.
+            "events": manifest.get("events"),
+            "transcript": manifest.get("transcript"),
+            "manifest": seen.get("manifest"),
+            "agent_version": manifest.get("version"),
+            # `ok=0` with no error is a golden nothing has run on yet: unproven, not broken.
+            "ok": seen.get("ok", 0),
+            "error": seen.get("error"),
+            "last_run": seen.get("last_run"),
+            "verified_at": seen.get("verified_at"),
+            "checked_at": checked_at,
+        }
+        await db.record_agent(name, **rows[name])
 
-
-async def sweep() -> dict[str, dict]:
-    """Check every configured golden once. Never raises — one bad machine is one bad row."""
-    results = {}
-    boxd = runner.client()
-    try:
-        sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
-    except Exception:  # noqa: BLE001 - a fleet the sweep cannot read is nothing to sweep
-        log.exception("could not resolve the goldens to sweep")
-        return results
-    finally:
-        await boxd.close()
-    for repo, golden in sources.items():
-        if not golden:
-            continue
-        # A golden being forked right now is busy, and a `git fetch` on it is one more thing
-        # competing with a run. Staleness keeps.
-        if await db.has_active_run(repo):
-            log.info("%s busy, skipping %s", repo, golden)
-            continue
-        try:
-            base = await github.default_branch(repo)
-            results[golden] = await check(golden, repo, settings.repo_dir, base)
-        except Exception:  # one bad golden must not stop the sweep
-            log.exception("sweep failed for %s", golden)
-    for name, row in results.items():
-        if row.get("error"):
-            log.warning("%s: %s", name, row["error"])
-        elif row.get("stale_deps"):
-            log.warning(
-                "%s: %s behind, dependencies moved (%s)", name, row["behind"], row["stale_deps"]
-            )
-        elif row.get("behind"):
-            log.info("%s: %s commits behind", name, row["behind"])
-    return results
+    unproven = [n for n, r in rows.items() if not r["verified_at"]]
+    log.info(
+        "%s golden snapshot(s): %s",
+        len(rows),
+        ", ".join(sorted(agents.discover(rows))) or "none",
+    )
+    if unproven:
+        log.warning("no run has yet proved: %s", ", ".join(sorted(unproven)))
+    return rows
 
 
 async def _loop() -> None:
-    log.info("sweeping goldens every %ss", settings.golden_sweep_interval)
+    log.info("refreshing agents every %ss", settings.agent_refresh_interval)
     while True:
-        await sweep()
-        await asyncio.sleep(settings.golden_sweep_interval)
+        await refresh()
+        await asyncio.sleep(settings.agent_refresh_interval)
 
 
 def start() -> None:
-    """Launch the sweep loop, unless it is switched off or nothing is watched."""
+    """Launch the refresh loop, unless it is switched off.
+
+    No longer conditional on a repo being watched: which agents exist is a fact about the
+    fleet, and the UI asks it of a deployment that watches nothing yet.
+    """
     global _task
-    if _task is not None or not settings.golden_sweep_interval or not settings.repos:
+    if _task is not None or not settings.agent_refresh_interval:
         return
     _task = asyncio.create_task(_loop())
 
