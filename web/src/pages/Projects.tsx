@@ -1,4 +1,5 @@
 import { usePoll, type Project } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { PageHeader, Empty, ErrorNote } from "@/components/Page"
@@ -25,7 +26,6 @@ export function Projects() {
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
                 <TableHead>Agent</TableHead>
-                <TableHead>Golden</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
               </TableRow>
@@ -44,8 +44,14 @@ export function Projects() {
                       {gitUrl(p.repo)}
                     </a>
                   </TableCell>
-                  <TableCell className="font-mono">{p.agent}</TableCell>
-                  <TableCell className="font-mono text-muted-foreground">{p.golden}</TableCell>
+                  <TableCell className="font-mono">
+                    {p.agent}
+                    {p.warm && (
+                      <Badge variant="outline" className="ml-2" title={p.golden}>
+                        warm
+                      </Badge>
+                    )}
+                  </TableCell>
                   <TableCell className="text-right font-mono">{p.runs}</TableCell>
                   <TableCell className="text-right font-mono text-ok">{p.succeeded}</TableCell>
                 </TableRow>

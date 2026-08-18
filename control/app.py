@@ -346,11 +346,15 @@ async def api_projects():
     for repo, _ in settings.watched:
         golden = sources.get(repo, "")
         s = stats.get(repo, {})
+        agent = settings.agent_for(repo)
         out.append(
             {
                 "repo": repo,
-                "agent": settings.agent_for(repo),
+                "agent": agent,
                 "golden": golden,
+                # Whether the snapshot that boots is this repo's own warm tier rather than
+                # the bare agent image. Decided here, where the naming contract lives.
+                "warm": bool(golden) and golden == agents.golden_name(agent, repo),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -363,33 +367,45 @@ async def api_projects():
 
 # --------------------------------------------------------------------------- agents / fleet
 
+# Two different questions, and they stopped having the same answer when goldens became
+# snapshots. What the factory *can run* is a list of snapshots (`/api/agents`); what is
+# *running* is a list of machines (`/api/machines`). The old endpoint answered the second and
+# was named for the first, which is why nothing in the fleet view could tell you an agent
+# existed until a run had already failed to find it.
+
 
 @app.get("/api/agents")
 async def api_agents():
-    """Boxd machines: any golden still held as one, plus the live run VMs."""
+    """The golden snapshots this deployment can dispatch onto, as the refresh loop last saw them.
+
+    Served from the table rather than from boxd, so this stays cheap enough to poll and says
+    the same thing a dispatch would: `goldens.refresh()` is the one place that reads the fleet.
+    """
+    return agents.api_rows(await db.agents(), settings.agent_default)
+
+
+@app.get("/api/machines")
+async def api_machines():
+    """Boxd machines: the VMs runs are happening on, plus anything else in the fleet."""
     boxd = runner.client()
     try:
         machines = await boxd.machines.list()
     finally:
         await boxd.close()
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
-    known = await db.agents()
     out = []
     for m in machines:
-        is_run = runner.is_run_vm(m.name)
+        role = runner.vm_role(m.name)
         out.append(
             {
                 "name": m.name,
                 "status": getattr(m, "status", None),
-                "role": "run" if is_run else "golden",
-                "is_golden": agents.parse_golden(m.name) is not None,
-                # When a run last finished on it having produced usage. The credential is
-                # what expires on these, and a run using one is the only proof it still works.
-                "verified_at": (known.get(m.name) or {}).get("verified_at"),
-                "orphan": is_run and m.name not in active,
+                "role": role,
+                # A run VM with no run behind it any more. What reconcile reaps.
+                "orphan": role != "other" and m.name not in active,
             }
         )
-    out.sort(key=lambda a: (a["role"] != "golden", a["name"]))
+    out.sort(key=lambda m: (m["role"] == "other", m["name"]))
     return out
 
 

@@ -28,6 +28,7 @@ from control.agents import (
     golden_name,
     parse_golden,
     resolve_agent,
+    api_rows,
     resolve_snapshot,
     slug,
     version,
@@ -141,6 +142,65 @@ check("resolve_agent: one discovered agent and no claude is unambiguous",
       resolve_agent(REPO, {}, available=("golden-codex", "golden-codex--acme-api")), "codex")
 check("resolve_agent: two discovered agents and no claude asks a human",
       resolve_agent(REPO, {}, available=("golden-codex", "golden-cursor")), None)
+
+# ---------- api rows  (AC1)
+# What the fleet page is handed. The rows come from the refresh loop's table, which is the
+# only registry there is — so this is a pure function over rows and the default agent's name,
+# and the whole thing is testable without a database, a fleet or a clock.
+
+KNOWN = {
+    "golden-claude": {
+        "agent": "claude", "version": "3", "events": "claude-code", "agent_version": "2.1",
+        "ok": 1, "error": None, "verified_at": "2026-08-18T10:00:00+00:00",
+        "manifest": "{}", "checked_at": "2026-08-18T12:00:00+00:00",
+    },
+    "golden-codex": {
+        "agent": "codex", "version": "1", "events": "codex", "agent_version": None,
+        "ok": 0, "error": "boom", "verified_at": None,
+        "manifest": None, "checked_at": "2026-08-18T12:00:00+00:00",
+    },
+    WARM: {
+        "agent": "claude", "version": "7", "events": None, "agent_version": None,
+        "ok": 0, "error": None, "verified_at": None,
+        "manifest": None, "checked_at": "2026-08-18T12:00:00+00:00",
+    },
+}
+
+rows = api_rows(KNOWN, "claude")
+check("api rows: one row per discovered golden snapshot",
+      [r["snapshot"] for r in rows], ["golden-claude", WARM, "golden-codex"])
+check("api rows: nothing is invented and nothing is dropped", len(rows), len(KNOWN))
+check("api rows: the default agent's snapshots are marked, and only those",
+      {r["snapshot"]: r["default"] for r in rows},
+      {"golden-claude": True, WARM: True, "golden-codex": False})
+check("api rows: and they sort first, so the agent a repo gets by default is at the top",
+      rows[0]["agent"], "claude")
+check("api rows: each row carries what the refresh recorded",
+      {k: rows[0][k] for k in ("agent", "version", "events", "agent_version", "ok", "error")},
+      {"agent": "claude", "version": "3", "events": "claude-code", "agent_version": "2.1",
+       "ok": True, "error": None})
+check("api rows: verified_at is passed through as the evidence it is",
+      rows[0]["verified_at"], "2026-08-18T10:00:00+00:00")
+check("api rows: a golden no run has proved reads unproven, not broken",
+      (rows[1]["ok"], rows[1]["error"], rows[1]["verified_at"]), (False, None, None))
+check("api rows: a golden whose last run failed carries that error",
+      (rows[2]["ok"], rows[2]["error"]), (False, "boom"))
+check("api rows: the columns are exactly what the page asks for",
+      sorted(rows[0]),
+      ["agent", "agent_version", "default", "error", "events", "ok", "snapshot", "verified_at",
+       "version"])
+
+# The registry is the name. A row for something that is not a golden is a row the refresh
+# should never have written, and rendering it would put a machine in a table of agents.
+check("api rows: a row whose name is not a golden is dropped",
+      api_rows({"goldenrod": {"agent": "x"}, "golden-claude": {"agent": "claude"}}, "claude"),
+      [r for r in api_rows({"golden-claude": {"agent": "claude"}}, "claude")])
+check("api rows: an empty table is an empty list, not an error", api_rows({}), [])
+check("api rows: with no default configured nothing is marked as one",
+      [r["default"] for r in api_rows(KNOWN, "")], [False, False, False])
+check("api rows: the agent falls back to the one its name carries",
+      api_rows({"golden-pi": {}}, "claude")[0]["agent"], "pi")
+
 
 # ---------- available
 
