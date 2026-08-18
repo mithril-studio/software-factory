@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react"
 import { Link, useParams } from "react-router-dom"
 import { ArrowLeft } from "lucide-react"
-import { post, usePoll, useRunLog, TERMINAL, type Run, type RunTelemetry } from "@/lib/api"
+import { post, usePoll, useRunLog, TERMINAL, runOutcome, type Run, type RunTelemetry } from "@/lib/api"
 import { cost, duration, shortId, tokens } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -81,14 +81,15 @@ export function RunDetail() {
         <Card className="mb-6 p-5">
           <div className="grid grid-cols-2 gap-5 sm:grid-cols-4">
             <Field label="Status">
-              <StateBadge state={run.status} />
+              <StateBadge state={runOutcome(run)} />
             </Field>
             <Field label="Issue">
               {run.repo}#{run.issue_number}
             </Field>
+            <Field label="Kind">{run.kind}</Field>
             <Field label="Branch">{run.branch || "—"}</Field>
             <Field label="Machine">{run.vm_name || "—"}</Field>
-            <Field label="Attempt">{run.attempt ?? 1}</Field>
+            <Field label={run.kind === "review" ? "Cycle" : "Attempt"}>{run.attempt ?? 1}</Field>
             <Field label="Duration">{duration(run)}</Field>
             <Field label="Tokens">{tokens(totalTokens)}</Field>
             <Field label="Cost">{cost(run.cost_usd)}</Field>
