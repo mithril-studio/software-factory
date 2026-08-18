@@ -9,6 +9,9 @@ const VARIANT: Record<string, "ok" | "warn" | "bad" | "muted" | "default"> = {
   queued: "muted",
   failed: "bad",
   cancelled: "bad",
+  // A review that ran fine and refused the change. Its run status is `succeeded`; the
+  // outcome is not, and the list is where that difference has to be visible.
+  "changes requested": "bad",
   // issue (plan) states
   done: "ok",
   blocked: "warn",

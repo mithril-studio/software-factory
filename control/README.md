@@ -55,6 +55,9 @@ would otherwise be stdout parsing against a binary that auto-updates underneath 
 
 - **One golden per project.** Dependencies pre-installed, agent authenticated, skills
   installed from [agent-skills](https://github.com/mithril-studio/agent-skills). Forked per task, never worked in directly.
+  Which machine a repo forks is written next to the repo in `FACTORY_REPOS`
+  (`owner/repo=golden`), because a golden holds exactly one repo at `FACTORY_REPO_DIR` —
+  pairing them anywhere else lets a repo and its fork source drift apart silently.
 - **No warm pool.** Forks are ~0.2s. Provision on demand.
 - **`auto-suspend.timeout = 0` on every fork.** The default suspends after 30s without
   inbound TCP, and clocks freeze while suspended. A long build or test run with no network
@@ -142,5 +145,6 @@ multi-agent orchestration of any kind.
       part that quietly grows into a monster, so keep it dumb and let memory carry the
       context instead.
 - [ ] Result callback: agent POSTs on completion vs. `exec` awaiting the exec stream.
-- [ ] One golden per project, or per project-and-branch?
+- [x] One golden per project, or per project-and-branch? — per project, named in
+      `FACTORY_REPOS`. Branch never enters it: a run checks out its own branch from the base.
 - [ ] Which GitHub identity opens the PR, and how the token reaches the fork.
