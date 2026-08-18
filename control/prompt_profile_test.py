@@ -47,8 +47,48 @@ for invariant in ("foreground", "gh pr create", "git push -u origin", "memory"):
 
 # ---------- a repo with no profile
 d = prompt(runner.DEFAULT_PROJECT_NOTES)
-check("the default names no build tool", "npm" in d, False)
+# The default used to name no build tool at all, because naming one project's tool as
+# universal is the bug this file exists for. It names several now — but each is the answer to
+# a question about the checkout ("which lock file is at the root?"), never an assertion that
+# this repo uses it, so the agent still finds out rather than being told wrong.
+for lock, install in (
+    ("package-lock.json", "npm ci"),
+    ("uv.lock", "uv sync --frozen"),
+    ("Cargo.lock", "cargo fetch"),
+):
+    check(f"the default names {install!r} only as what {lock} implies",
+          f"`{lock}` -> `{install}`" in " ".join(d.split()), True)
 check("the default points at the repo's own rules files", "CLAUDE.md" in d, True)
+
+# ---------- setup step  (AC1)
+# The prompt used to tell the agent the machine was already set up for this project and that
+# setup work was therefore wasted work. On a repo-agnostic golden that is false, and a false
+# fact costs more than a missing one: the agent acts on it, then spends turns discovering it
+# needs an install and guessing the command, and every one of those turns re-reads the whole
+# context. Both prompts get the step — a repo with a profile and a repo without one.
+for kind, built in (("with a profile", p), ("without one", d)):
+    flat = " ".join(built.split())
+    where_install = flat.find("Install this project's dependencies")
+    where_change = flat.find("Make the change")
+    check(f"setup step: {kind}, the prompt has one", where_install != -1, True)
+    check(f"setup step: {kind}, it comes before making the change",
+          -1 < where_install < where_change, True)
+    check(f"setup step: {kind}, it points at the project notes for the command",
+          'named under "This project"' in flat, True)
+    check(f"setup step: {kind}, in the foreground with an explicit timeout",
+          "in the foreground, with an explicit timeout" in flat, True)
+    check(f"setup step: {kind}, and only once", "Run it **once**" in flat, True)
+    check(f"setup step: {kind}, warm now means the download caches, not this repo",
+          "download caches on this machine are warm" in flat, True)
+    check(f"setup step: {kind}, nothing is claimed to be installed already",
+          "nothing is installed for this repo yet" in flat, True)
+    # Spelled in halves on purpose: the structural criterion for this change is a grep for
+    # that first phrase over `control/`, and a test that quotes it would be the only hit.
+    check(f"setup step: {kind}, and the old promise is gone",
+          any(claim in flat for claim in
+              ("Dependencies are " + "installed", "the machine is already set up",
+               "setup work is wasted work")),
+          False)
 
 # ---------- the retry context still lands after the notes, not inside them
 r = runner.build_prompt(

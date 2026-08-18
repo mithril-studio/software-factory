@@ -116,12 +116,13 @@ Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials
 
 ### Keeping a golden warm
 
-A golden is warm on purpose, and the prompt tells the agent so — *dependencies are installed,
-do not reinstall them*. That is true only while the install still matches the repo, and
-nothing kept it true. The control plane now sweeps every golden hourly
-(`FACTORY_GOLDEN_SWEEP`) and records what it finds: how far behind the checkout is, whether
-the tree is dirty, and whether a dependency manifest moved in the commits it is missing. The
-Projects page shows it, and `POST /api/goldens/sweep` runs one on demand.
+A per-repo golden carries a warm checkout and a warm install, and that stays true only while
+the install still matches the repo — nothing kept it true. (The prompt no longer promises the
+agent any of it: it says the download caches are warm and sends it to install once. A stale
+golden is now a slower run rather than a wrong one.) The control plane sweeps every golden
+hourly (`FACTORY_GOLDEN_SWEEP`) and records what it finds: how far behind the checkout is,
+whether the tree is dirty, and whether a dependency manifest moved in the commits it is
+missing. The Projects page shows it, and `POST /api/goldens/sweep` runs one on demand.
 
 The sweep **observes only**. A run checks its own branch out from `origin/<base>` anyway, so
 the code on a golden is never what goes stale — the install is, and how to redo that is
@@ -157,18 +158,43 @@ scripts/sync-golden.sh factory-golden /home/boxd/repo main 'npm ci && npm run bu
 
 A repo can describe itself to the agent in a `.factory.md` at its root. The control plane
 reads it from the base branch at dispatch and splices it into the build and review prompts,
-so it is the one place that says how *this* project is verified and what is already set up:
+so it is the one place that says how *this* project is set up and how it is verified:
 
 ```markdown
+## Setup
+
+`cd app && npm ci` — about 90 seconds. Run it once, before anything else.
+
+## Verify
+
 - Everything runs from `app/`: `npm run lint`, `npm run typecheck`, `npm test`.
-- Dependencies are installed and `app/.env.local` is present. Do not reinstall or print it.
+- `app/.env.local` is already there. Do not print it, do not regenerate it.
 - There is no local database — Supabase is remote. Do not try to start one.
 ```
 
+### `## Setup`
+
+The single highest-value line in the file. A golden is an agent image, not a project image:
+it carries the toolchains and a warm package-manager download cache, and nothing installed
+for your repo. The prompt sends the agent to run this command once, in the foreground, before
+it touches any code — so naming it here is the difference between one install and a run that
+spends turns discovering it needs one, guessing a command, and re-reading its whole context
+between each guess.
+
+Name the command, and say roughly how long it takes so the agent picks a sane timeout. Put it
+above the verify commands: it runs first, and a file is read in the order it is written.
+
+Without it the agent still gets there — the default tells it to find the lock file and run
+that package manager's frozen install — but it gets there by inference, and inference is the
+expensive half.
+
 It lives in the repo rather than in this one because it describes that repo, and because
 editing it is then a pull request there rather than a control-plane deploy. A repo without
-one gets a deliberately vague default that names no build tool — a wrong fact costs more
-than a missing one, since the agent acts on it before it can find out.
+one gets a deliberately vague default that asserts nothing about this project in particular —
+a wrong fact costs more than a missing one, since the agent acts on it before it can find out.
+
+`preflight` reports a repo with no `.factory.md`, and a `.factory.md` with no `## Setup`
+section, as warnings. Neither blocks a run; both cost it turns.
 
 Keep harness invariants out of it. Anything that would hang or corrupt *any* run (do not
 background long commands, commit and push as you go) belongs in the prompt, not here; see

@@ -10,7 +10,7 @@ Run it directly, no framework needed:
 """
 import sys
 
-from control.preflight import Check, report
+from control.preflight import Check, profile_checks, report
 from control.probe import parse
 
 fails: list[str] = []
@@ -52,6 +52,48 @@ check("nothing checked -> ready is vacuous but honest", report("r", []), True)
 # ---------- how each is shown
 check("a blocking failure reads FAIL", bad.mark, "FAIL")
 check("a non-blocking one reads warn", warn.mark, "warn")
+
+# ---------- setup warning  (AC3)
+# The profile's most valuable line is the one naming how to install the repo, because the
+# prompt now sends the agent to run it before it touches any code. A repo that names none
+# still builds — the agent works it out from the lock file — so this is a warning, and a
+# preflight that blocked onboarding over it would be refusing a repo no run would fail on.
+WITH_SETUP = "## Setup\n\n`npm ci`\n\n## Verify\n\n`npm test`\n"
+NO_SETUP = "## Verify\n\n`npm test`\n"
+
+
+def profile(text):
+    return {c.name: c for c in profile_checks(text)}
+
+
+named = profile(WITH_SETUP)
+check("setup warning: a profile naming one is quiet",
+      named[".factory.md names a setup command"].ok, True)
+check("setup warning: and the profile itself counts as present",
+      named["has .factory.md"].ok, True)
+
+silent = profile(NO_SETUP)
+check("setup warning: a profile naming none is reported",
+      silent[".factory.md names a setup command"].ok, False)
+check("setup warning: as a warning, never a blocking failure",
+      silent[".factory.md names a setup command"].fatal, False)
+check("setup warning: so the repo is still ready",
+      report("r", profile_checks(NO_SETUP)), True)
+check("setup warning: and it reads warn, not FAIL",
+      silent[".factory.md names a setup command"].mark, "warn")
+
+check("setup warning: any heading level names it, and the spelling is not the point",
+      profile("### set-up\n`uv sync --frozen`\n")[".factory.md names a setup command"].ok, True)
+check("setup warning: the word in a sentence is not a section",
+      profile("- run the setup command yourself\n")[".factory.md names a setup command"].ok,
+      False)
+
+check("setup warning: no profile at all is a warning too, and only one",
+      [(c.ok, c.fatal) for c in profile_checks(None)], [(False, False)])
+check("setup warning: a whitespace-only profile is no profile",
+      [(c.ok, c.fatal) for c in profile_checks("   \n")], [(False, False)])
+check("setup warning: a missing profile is not also blamed for the setup line",
+      any("setup" in c.name for c in profile_checks(None)), False)
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
