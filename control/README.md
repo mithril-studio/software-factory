@@ -158,5 +158,6 @@ multi-agent orchestration of any kind.
       part that quietly grows into a monster, so keep it dumb and let memory carry the
       context instead.
 - [ ] Result callback: agent POSTs on completion vs. `exec` awaiting the exec stream.
-- [ ] One golden per project, or per project-and-branch?
+- [x] One golden per project, or per project-and-branch? — per project, named in
+      `FACTORY_REPOS`. Branch never enters it: a run checks out its own branch from the base.
 - [ ] Which GitHub identity opens the PR, and how the token reaches the fork.

@@ -12,6 +12,7 @@ a label the API refuses must never fail an otherwise good run.
 from __future__ import annotations
 
 import asyncio
+import re
 
 import httpx
 
@@ -90,6 +91,53 @@ async def find_pr(repo: str, branch: str) -> str | None:
             return None
         data = resp.json()
     return data[0]["html_url"] if data else None
+
+
+async def file(repo: str, path: str, ref: str) -> str | None:
+    """Fetch one file's raw contents from `repo` at `ref`. None when it is not there.
+
+    Used for a repo's `.factory.md` profile, which is why a missing file is an ordinary
+    answer rather than an error: most repos will not have one, and the caller has a default.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/contents/{path}",
+            headers={**_headers(), "Accept": "application/vnd.github.raw"},
+            params={"ref": ref},
+            follow_redirects=True,
+        )
+    if resp.status_code != 200:
+        return None
+    return resp.text
+
+
+async def repo_info(repo: str) -> dict | None:
+    """The repository object, or None when the token cannot even read it."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{API}/repos/{repo}", headers=_headers())
+    return resp.json() if resp.status_code == 200 else None
+
+
+async def workflow_count(repo: str, ref: str) -> int:
+    """How many Actions workflow files exist on `ref`.
+
+    Zero is the interesting answer: `checks_green` reports success only once at least one
+    check run has finished, so a repo with no workflows can never satisfy the merge gate.
+
+    Counted from the tree rather than from `/actions/workflows`, which also lists workflows
+    it has only ever seen on a branch — a pull request adding CI would otherwise make the
+    repo look like it already had some.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/contents/.github/workflows",
+            headers=_headers(),
+            params={"ref": ref},
+        )
+    if resp.status_code != 200:
+        return 0
+    body = resp.json()
+    return sum(1 for f in body if f.get("name", "").endswith((".yml", ".yaml")))
 
 
 async def default_branch(repo: str) -> str:
@@ -272,20 +320,162 @@ async def checks_green(
         return False, f"could not read checks: {exc!r}", []
 
 
-async def merge_pr(repo: str, number: int, method: str = "squash") -> dict:
-    """Merge a pull request. Raises for status so a failed merge is loud.
+# GitHub was unavailable or throttling, rather than refusing. Everything else — 405 (not
+# mergeable), 409 (head moved), 422 — is an answer, and answers are not retried.
+TRANSIENT_STATUS = (429, 500, 502, 503, 504)
+
+
+async def merge_pr(
+    repo: str,
+    number: int,
+    sha: str | None = None,
+    method: str = "squash",
+    attempts: int = 4,
+    backoff: float = 2.0,
+) -> dict:
+    """Merge a pull request, retrying for as long as GitHub is merely unavailable.
 
     Squash by default: one clean commit per issue on the base branch, which is what the next
     issue in a sequential backlog branches from.
+
+    `sha` pins the commit. GitHub refuses with 409 if the head has moved since, so passing
+    the sha the checks were verified on means a merge can never land a commit CI did not
+    test. That pin is also what makes retrying safe: a retry cannot pick up a newer,
+    unverified head while it is waiting.
+
+    Retries exist because a transient outage used to be permanent. An approved pull request
+    with every check green was stranded for a human because the merge call happened to hit a
+    503 — the API came back a minute later, and nothing ever tried again.
+
+    Raises for status once the retries are spent, so a failed merge is still loud.
     """
+    payload: dict[str, str] = {"merge_method": method}
+    if sha:
+        payload["sha"] = sha
+
+    delay, last = backoff, None
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.put(
-            f"{API}/repos/{repo}/pulls/{number}/merge",
-            headers=_headers(),
-            json={"merge_method": method},
-        )
-        resp.raise_for_status()
-    return resp.json()
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = await client.put(
+                    f"{API}/repos/{repo}/pulls/{number}/merge",
+                    headers=_headers(),
+                    json=payload,
+                )
+                if resp.status_code not in TRANSIENT_STATUS:
+                    resp.raise_for_status()  # a refusal, not an outage - surface it now
+                    return resp.json()
+                last = httpx.HTTPStatusError(
+                    f"merge API returned {resp.status_code}",
+                    request=resp.request,
+                    response=resp,
+                )
+            except httpx.TransportError as exc:  # connect/read timeouts and network errors
+                last = exc
+            if attempt == attempts:
+                raise last
+            await asyncio.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+# GitHub Actions marks a failure with this, and puts the cause in the lines just above it.
+_ERROR_MARK = "##[error]"
+# Every log line is prefixed with an ISO timestamp we never read. At ~30 characters a line it
+# is pure cache-read cost in the next agent's prompt, so it goes.
+_LOG_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?")
+
+
+def extract_failure(log: str, max_chars: int = 4000, before: int = 40, after: int = 5) -> str:
+    """The part of an Actions job log that says why the job failed.
+
+    Taking the tail does not work: a job log ends with credential teardown and "Cleaning up
+    orphan processes", so the last 4000 characters of a failed run are reliably the least
+    informative 4000 characters in it. The cause sits just above the first `##[error]`.
+
+    Falls back to the tail when nothing is marked, which is the right answer for a check that
+    is not an Actions job and for a runner that died without writing a marker.
+    """
+    lines = [_LOG_TS.sub("", line) for line in log.splitlines()]
+    marks = [i for i, line in enumerate(lines) if _ERROR_MARK in line]
+    if not marks:
+        return log[-max_chars:].strip()
+
+    windows: list[list[int]] = []
+    for i in marks:
+        lo, hi = max(0, i - before), min(len(lines), i + after + 1)
+        if windows and lo <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], hi)
+        else:
+            windows.append([lo, hi])
+
+    # Later failures are the ones worth keeping when the budget is tight: the first error in a
+    # job often cascades, and the last is usually the step that actually stopped it.
+    chunks: list[str] = []
+    budget = max_chars
+    for lo, hi in reversed(windows):
+        chunk = "\n".join(lines[lo:hi]).strip()
+        if not chunk:
+            continue
+        if len(chunk) > budget:
+            chunk = chunk[-budget:]
+        chunks.insert(0, chunk)
+        budget -= len(chunk)
+        if budget <= 0:
+            break
+    return "\n[...]\n".join(chunks)
+
+
+async def failing_check_logs(
+    repo: str, sha: str, limit: int = 2, max_chars: int = 4000
+) -> str:
+    """The tail of each failed check's log on `sha`, as plain text for an agent to read.
+
+    The routing decision only ever saw a check's *name*. "gates=failure" cannot distinguish
+    a defect in the change from a container registry that timed out, and both were sent to a
+    fix agent as if they were the same thing — which is how two full runs were spent trying
+    to repair a Docker Hub outage. Fetch the log once here and hand it to the next agent
+    instead of making it go and find it, or guess.
+
+    Best effort by design: context is a bonus, and never a reason to fail a run. A check that
+    is not a GitHub Actions job has no log endpoint, so its reported output is used instead.
+    """
+    sections: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(
+                f"{API}/repos/{repo}/commits/{sha}/check-runs", headers=_headers()
+            )
+            resp.raise_for_status()
+            failed = [
+                r
+                for r in resp.json().get("check_runs", [])
+                if r.get("status") == "completed" and r.get("conclusion") not in CHECK_OK
+            ][:limit]
+
+            for run in failed:
+                body = ""
+                try:
+                    # A check run's id is the Actions job id. Anything else 404s here.
+                    got = await client.get(
+                        f"{API}/repos/{repo}/actions/jobs/{run.get('id')}/logs",
+                        headers=_headers(),
+                    )
+                    if got.status_code == 200:
+                        body = extract_failure(got.text, max_chars)
+                except httpx.HTTPError:
+                    body = ""
+                if not body:
+                    out = run.get("output") or {}
+                    body = f"{out.get('summary') or ''}\n{out.get('text') or ''}".strip()
+                    body = body[:max_chars]
+                sections.append(
+                    f"### {run.get('name', 'check')} = {run.get('conclusion')}"
+                    f"  ({run.get('html_url', '')})\n{body or '(no log available)'}"
+                )
+    except Exception as exc:  # noqa: BLE001 - never fail a run over missing context
+        return f"(could not fetch check logs: {exc!r})"
+    return "\n\n".join(sections) or "(no failing check produced a log)"
 
 
 async def add_comment(repo: str, number: int, body: str) -> None:

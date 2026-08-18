@@ -10,6 +10,8 @@ export type Run = {
   branch: string | null
   status: string
   attempt: number | null
+  kind: string
+  verdict: string | null
   agent: string | null
   tokens_in: number | null
   tokens_out: number | null
@@ -23,6 +25,16 @@ export type Run = {
   finished_at: string | null
 }
 
+// A run's `status` is the *process* outcome — did the agent complete — which is not the same
+// question as whether the result was good. A reviewer that runs cleanly and rejects the pull
+// request records `succeeded` with the reason in `error`, so in the runs list a rejected
+// review was indistinguishable from an approved one: both green. Fold the verdict back in
+// here rather than at each call site, so the list and the detail page cannot disagree.
+export function runOutcome(r: Run): string {
+  if (r.kind === "review" && r.status === "succeeded" && r.error) return "changes requested"
+  return r.status
+}
+
 export type PlanIssue = {
   repo: string
   number: number
@@ -34,6 +46,14 @@ export type PlanIssue = {
 
 export type Project = {
   repo: string
+  /** The agent that takes this repo's issues. */
+  agent: string
+  /** The snapshot that agent actually boots for this repo. */
+  golden: string
+  golden_checked_at: string | null
+  golden_behind: number | null
+  golden_stale_deps: string | null
+  golden_error: string | null
   runs: number
   succeeded: number
   failed: number
@@ -47,16 +67,25 @@ export type Agent = {
   role: "golden" | "run"
   is_golden: boolean
   orphan: boolean
+  behind: number | null
+  stale_deps: string | null
 }
 
 export type Config = {
   repos: string[]
-  golden: string
+  /** Each watched repo with the agent that takes its issues. */
+  watched: { repo: string; agent: string }[]
+  /** Every agent the snapshot fleet can name. */
+  agents: string[]
+  agent_default: string
   max_concurrent: number
   max_attempts: number
   poll_enabled: boolean
   poll_interval: number
+  /** A setting nobody filled in. Blocks starting a run. */
   missing: string[]
+  /** A complete configuration with nothing to run on — an agent with no snapshot yet. */
+  problems: string[]
 }
 
 /** Cost split by token class. Cache reads dominate real runs — that is the finding

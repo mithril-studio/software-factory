@@ -1,10 +1,11 @@
 import { useMemo, useRef, useState, useEffect } from "react"
 import { Link } from "react-router-dom"
 import { Filter, ChevronDown, Check } from "lucide-react"
-import { usePoll, type Run } from "@/lib/api"
+import { usePoll, runOutcome, type Run } from "@/lib/api"
 import { ago, cost, duration, shortId, tokens } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { StateBadge } from "@/components/StateBadge"
@@ -155,9 +156,11 @@ export function Runs() {
                 <TableRow key={r.id}>
                   <TableCell>
                     <div className="flex items-center gap-2">
-                      <StateBadge state={r.status} />
+                      <StateBadge state={runOutcome(r)} />
                       {r.attempt && r.attempt > 1 && (
-                        <span className="text-[10px] text-muted-foreground">try {r.attempt}</span>
+                        <span className="text-[10px] text-muted-foreground">
+                          {r.kind === "review" ? "cycle" : "try"} {r.attempt}
+                        </span>
                       )}
                     </div>
                   </TableCell>
@@ -168,10 +171,15 @@ export function Runs() {
                   </TableCell>
                   <TableCell>{r.agent ?? "—"}</TableCell>
                   <TableCell>
-                    <Link to={`/runs/${r.id}`} className="hover:underline">
-                      <span className="font-mono">{r.repo}</span>
-                      <span className="text-muted-foreground"> #{r.issue_number}</span>
-                    </Link>
+                    <div className="flex items-center gap-1.5">
+                      <Link to={`/runs/${r.id}`} className="hover:underline">
+                        <span className="font-mono">{r.repo}</span>
+                        <span className="text-muted-foreground"> #{r.issue_number}</span>
+                      </Link>
+                      <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
+                        {r.kind}
+                      </Badge>
+                    </div>
                     <div className="max-w-72 truncate text-[10px] text-muted-foreground">
                       {r.issue_title}
                     </div>
