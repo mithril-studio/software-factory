@@ -61,7 +61,7 @@ async def check(name: str, repo: str, repo_dir: str, base: str) -> dict:
     row: dict = {"repo": repo, "checked_at": db.utcnow(), "ok": 0}
     boxd = runner.client()
     try:
-        machine_id = await runner.golden_id(boxd, name)
+        machine_id = await runner.machine_id(boxd, name)
         result = await boxd.machines.exec(
             machine_id,
             command=PROBE,

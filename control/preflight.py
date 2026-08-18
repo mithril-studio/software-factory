@@ -64,7 +64,7 @@ async def _vm_checks(repo: str, golden: str, repo_dir: str, base: str) -> list[C
     boxd = runner.client()
     try:
         try:
-            machine_id = await runner.golden_id(boxd, golden)
+            machine_id = await runner.machine_id(boxd, golden)
         except Exception as exc:  # noqa: BLE001 - the message is the finding
             return [Check("golden exists", False, f"{golden}: {exc}")]
         checks = [Check("golden exists", True, f"{golden} ({machine_id[:8]})")]
