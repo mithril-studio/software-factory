@@ -53,8 +53,11 @@ would otherwise be stdout parsing against a binary that auto-updates underneath 
 
 ### §2.1 Machines
 
-- **One golden per project.** Dependencies pre-installed, agent authenticated, skills
-  installed from [agent-skills](https://github.com/mithril-studio/agent-skills). Forked per task, never worked in directly.
+- **One golden per agent, not per project.** Tooling and auth pre-installed, skills installed
+  from [agent-skills](https://github.com/mithril-studio/agent-skills). Forked per task, never
+  worked in directly. The run brings its own repo: it clones the one it was assigned into
+  `$HOME/work/<name>` unless a checkout of that repo is already there, which is the whole
+  difference between a warm `golden-<agent>--<repo-slug>` and a bare `golden-<agent>`.
 - **No warm pool.** Forks are ~0.2s. Provision on demand.
 - **`auto-suspend.timeout = 0` on every fork.** The default suspends after 30s without
   inbound TCP, and clocks freeze while suspended. A long build or test run with no network
@@ -103,9 +106,22 @@ migration and goes away once every golden carries `factory-agent`.
 
 ## §3 Dispatch environment
 
-What `exec` injects into every agent run. The telemetry half is specified in
-`../telemetry/README.md` §6 and the correlation key in `../README.md` §3.1.
+What `exec` injects into every agent run, built by `runner.dispatch_env` for both the build
+and the review path — one function, because a review VM that clones a different repo or
+authenticates as somebody else than the build VM whose work it checks is not reviewing that
+work. The telemetry half is specified in `../telemetry/README.md` §6 and the correlation key
+in `../README.md` §3.1.
 
+- `FACTORY_REPO` — the repo this run is for. The golden does not know; the run does.
+- `FACTORY_WORKDIR` — where checkouts live. Empty means `$HOME/work`.
+- `FACTORY_REPO_DIR` — a pre-clone checkout to reuse, honoured only when it holds
+  `FACTORY_REPO`. The rollback for repo-agnostic goldens; it goes away with them.
+- `FACTORY_BRANCH`, `FACTORY_BASE`, `FACTORY_ATTEMPT` (build runs only), `FACTORY_PROMPT`
+- `GH_TOKEN` — the control plane's durable credential, covering the clone, the push and
+  `gh pr create` from one source. Left unset rather than empty when unconfigured, so the
+  golden's own `gh` login stays as the fallback instead of being shadowed.
+- `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` — durable agent auth, overriding the
+  golden's expiring OAuth login
 - `run.id` and issue/repo/vm identity, as OTel resource attributes
 - OTLP endpoint, protocol, and ingest token
 - `OTEL_LOGS_EXPORT_INTERVAL=1000` — so an ephemeral VM flushes before it is destroyed
