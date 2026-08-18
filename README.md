@@ -104,6 +104,28 @@ Every run forks one long-lived machine. It must have:
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
+## Adding a repo
+
+1. Build or fork a golden for it: the repo cloned at `FACTORY_REPO_DIR`, dependencies
+   installed, `claude` and `gh` authenticated, skills installed (see below).
+2. Add it to `FACTORY_REPOS` as `owner/repo=golden-name`.
+3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
+   without checks, auto-merge can never pass its gate and every pull request waits for a
+   human.
+4. Ask, before trusting any of it:
+
+   ```bash
+   .venv/bin/python -m control.preflight mithril-studio/legal-ai-app
+   ```
+
+   It reports on the repo (readable, pushable, has CI, has a profile, labels) and on the
+   golden its runs would actually fork (checkout is the right repo, clean, on the base
+   branch, how far behind, toolchain against `.nvmrc`, `claude`, `gh`, skills). Exit status
+   0 means ready. Same answers over HTTP at `/api/preflight?repo=owner/repo`.
+
+   These are the questions a run answers the expensive way — after forking a VM and spending
+   forty minutes finding out that the checkout belongs to another project.
+
 ## What a watched repo tells the factory: `.factory.md`
 
 A repo can describe itself to the agent in a `.factory.md` at its root. The control plane
