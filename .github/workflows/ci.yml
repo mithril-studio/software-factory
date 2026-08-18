@@ -1,0 +1,44 @@
+name: CI
+
+# The floor, not the ceiling: undefined names, syntax errors, and the test modules this repo
+# already carries. It exists because an `F821` — a bare `ci_failure` where every sibling line
+# says `merge_attempt.ci_failure` — reached main and would have raised NameError on the one
+# path it guards, the fix run after CI goes red on an approved pull request.
+#
+# `ruff check` in full still reports pre-existing findings, so the gate selects the rules that
+# catch real errors rather than style. Widen it when the backlog is clean, not before: a gate
+# that is red on arrival teaches everyone to ignore it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -e . ruff
+
+      - name: Errors (undefined names, unused imports, syntax)
+        run: ruff check --select F,E9 control telemetry
+
+      # Every *_test.py in the repo, run as a module the way its own docstring says to. A new
+      # test file is picked up by existing here, not by being added to a list.
+      - name: Tests
+        run: |
+          set -e
+          for f in control/*_test.py telemetry/*_test.py; do
+            m=$(echo "${f%.py}" | tr / .)
+            echo "== $m"
+            python -m "$m"
+          done

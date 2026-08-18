@@ -33,6 +33,12 @@ Skills the agent uses live in a separate repo,
 **into the VM**, not onto the server — the agent's code, not the factory's — so they are
 installed when a golden is built rather than deployed with the control plane.
 
+The skill that *fills* this repo's queue lives there too: **`factory-compose`** turns a brief
+into the ordered backlog the factory builds. It is the one skill that runs outside a VM —
+on a laptop, or on the `planner` box over SSH — so it is installed like any other skill
+rather than shipped with a golden. It is not vendored here; there is one copy, in
+agent-skills, because two would drift.
+
 ## Quickstart
 
 ```bash
@@ -103,6 +109,66 @@ Every run forks one long-lived machine. It must have:
   ```
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
+
+### Keeping a golden warm
+
+A golden is warm on purpose, and the prompt tells the agent so — *dependencies are installed,
+do not reinstall them*. That is true only while the install still matches the repo, and
+nothing kept it true. The control plane now sweeps every golden hourly
+(`FACTORY_GOLDEN_SWEEP`) and records what it finds: how far behind the checkout is, whether
+the tree is dirty, and whether a dependency manifest moved in the commits it is missing. The
+Projects page shows it, and `POST /api/goldens/sweep` runs one on demand.
+
+The sweep **observes only**. A run checks its own branch out from `origin/<base>` anyway, so
+the code on a golden is never what goes stale — the install is, and how to redo that is
+project-specific. Repairing is one command:
+
+```bash
+scripts/sync-golden.sh factory-golden /home/boxd/repo main 'npm ci && npm run build'
+```
+
+## Adding a repo
+
+1. Build or fork a golden for it: the repo cloned at `FACTORY_REPO_DIR`, dependencies
+   installed, `claude` and `gh` authenticated, skills installed (see below).
+2. Add it to `FACTORY_REPOS` as `owner/repo=golden-name`.
+3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
+   without checks, auto-merge can never pass its gate and every pull request waits for a
+   human.
+4. Ask, before trusting any of it:
+
+   ```bash
+   .venv/bin/python -m control.preflight mithril-studio/legal-ai-app
+   ```
+
+   It reports on the repo (readable, pushable, has CI, has a profile, labels) and on the
+   golden its runs would actually fork (checkout is the right repo, clean, on the base
+   branch, how far behind, toolchain against `.nvmrc`, `claude`, `gh`, skills). Exit status
+   0 means ready. Same answers over HTTP at `/api/preflight?repo=owner/repo`.
+
+   These are the questions a run answers the expensive way — after forking a VM and spending
+   forty minutes finding out that the checkout belongs to another project.
+
+## What a watched repo tells the factory: `.factory.md`
+
+A repo can describe itself to the agent in a `.factory.md` at its root. The control plane
+reads it from the base branch at dispatch and splices it into the build and review prompts,
+so it is the one place that says how *this* project is verified and what is already set up:
+
+```markdown
+- Everything runs from `app/`: `npm run lint`, `npm run typecheck`, `npm test`.
+- Dependencies are installed and `app/.env.local` is present. Do not reinstall or print it.
+- There is no local database — Supabase is remote. Do not try to start one.
+```
+
+It lives in the repo rather than in this one because it describes that repo, and because
+editing it is then a pull request there rather than a control-plane deploy. A repo without
+one gets a deliberately vague default that names no build tool — a wrong fact costs more
+than a missing one, since the agent acts on it before it can find out.
+
+Keep harness invariants out of it. Anything that would hang or corrupt *any* run (do not
+background long commands, commit and push as you go) belongs in the prompt, not here; see
+`discussion.md` §"Where rules live".
 
 ## The UI
 

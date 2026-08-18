@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -21,6 +23,9 @@ from telemetry.recorder import Recorder
 
 from . import db, github
 from .config import settings
+
+# `log` is the per-run RunLog throughout this file, so the module logger takes another name.
+_log = logging.getLogger("factory.runner")
 
 # The coding agent that runs inside the VM. A constant for now — there is exactly one. It
 # becomes meaningful once a review/PR agent joins and runs need to say which one produced them.
@@ -39,11 +44,25 @@ def semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
+# Every VM a run creates is named from its run id with one of these prefixes: `run-` for a
+# build, `rev-` for a review. Reconcile and the fleet view both key off them, so they live
+# here rather than being spelled out at each site — a prefix known to one and not the other
+# is a VM nobody reaps and nobody recognises.
+RUN_PREFIX = "run-"
+REVIEW_PREFIX = "rev-"
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX)
+
+
+def is_run_vm(name: str) -> bool:
+    """True for a machine this factory forked for a run, build or review."""
+    return name.startswith(VM_PREFIXES)
+
+
 def client() -> AsyncBoxd:
     return AsyncBoxd(api_key=settings.boxd_api_key)
 
 
-async def _machine_id(boxd: AsyncBoxd, source: str) -> str:
+async def machine_id(boxd: AsyncBoxd, source: str) -> str:
     """Resolve a machine's id.
 
     The boxd SDK forks by machine **id**, not name — forking by name fails with
@@ -90,7 +109,7 @@ async def _provision(boxd: AsyncBoxd, source: str, vm_name: str):
             auto_destroy_timeout=settings.auto_destroy,
         )
     return await boxd.machines.fork(
-        await _machine_id(boxd, source),
+        await machine_id(boxd, source),
         vm_name,
         auto_suspend_timeout=0,
         auto_destroy_timeout=settings.auto_destroy,
@@ -125,25 +144,19 @@ How to work:
    half-way, whatever you pushed is what the next attempt continues from, so small
    commits that build on each other are worth far more than one perfect commit you
    never got to make.
-4. Verify with the repo's fast checks, and only these:
-   npm run lint · npm run typecheck · npm run test · npm run test:integration · npm run build
-   Do NOT run the end-to-end suite (`npm run test:e2e`) and do NOT install browsers —
-   CI runs end-to-end on your pull request, it is not your job here. Do not add a test
-   framework or test runner that isn't already in the repo.
+4. Verify with the repo's own fast checks — the ones named under "This project" below,
+   and only those. Do not add a test framework or test runner that isn't already in the repo.
 5. Record anything durable you learned into `.mem/`, following the memory skill.
 6. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
    referencing the issue in the body so it links (e.g. "Closes #{number}").
 
-Environment notes — this machine is already set up, so setup work is wasted work:
-- Dependencies are installed and the build cache is warm. Do not run `npm ci`, do not
-  delete `node_modules`, and do not clear the build output. Install a package only if the
-  issue genuinely needs a new one.
-- `.env` is correct and read-only. Do not create, copy or modify it, and do not print its
-  contents.
-- The test database is already running, migrated and seeded. Do not start, reset or
-  re-seed it.
+This project — the machine is already set up for it, so setup work is wasted work:
+
+{project_notes}
+
+True of every run here, whatever the project notes say:
 - Run long commands in the foreground with an explicit timeout, e.g.
-  `timeout 600 npm run build`. Do not put work in the background to wait for it later:
+  `timeout 600 <the build command>`. Do not put work in the background to wait for it later:
   background tasks and scheduled wake-ups do not deliver notifications in this
   environment, so a run that waits for one waits forever and dies having produced nothing.
 
@@ -154,7 +167,8 @@ what blocked you. A run that ends with no PR gives the human nothing to look at.
 
 # --------------------------------------------------------------------------- criteria
 
-# The acceptance-criteria block an issue carries, per the factory-compose issue template: a
+# The acceptance-criteria block an issue carries, per the factory-compose issue template
+# (mithril-studio/agent-skills, factory-skills/factory-compose): a
 # fenced yaml list under an "## Acceptance criteria" heading.
 _CRITERIA_BLOCK = re.compile(
     r"^##\s*Acceptance criteria\s*?\n+```ya?ml\n(.*?)^```", re.S | re.M | re.I
@@ -240,11 +254,45 @@ previous attempt log (tail):
 """
 
 
+# The file a watched repo carries to describe itself: how it is verified, what is already
+# installed, what must not be touched. It lives in the repo rather than here because it
+# describes that repo — one project's `npm run test:integration` is another project's
+# nonsense, and a control plane that asserts one project's setup as universal sends every
+# other project's agent to verify something that does not exist.
+PROFILE_PATH = ".factory.md"
+
+# What a repo without a profile gets. Deliberately says nothing specific: a wrong fact costs
+# more than a missing one, because the agent acts on it before it can find out.
+DEFAULT_PROJECT_NOTES = """- Dependencies are installed and any build cache is warm. Do not reinstall them, do not
+  delete the dependency directory, and do not clear build output. Install a package only if
+  the issue genuinely needs a new one.
+- This repo carries no `.factory.md`, so nothing more specific about it is known here. Read
+  its own rules files (`CLAUDE.md`, `AGENTS.md`, `CONTEXT.md`, the README) and `.mem/` to
+  find out how it is built and verified, and run those checks.
+- Do not run an end-to-end or browser suite, and do not install browsers — CI covers that on
+  your pull request."""
+
+
+async def project_notes(repo: str, ref: str) -> str:
+    """The repo's own `.factory.md` at `ref`, or the generic default when it has none.
+
+    Best-effort by design: a GitHub hiccup here must not fail a run that would otherwise
+    work, and the default is a safe thing to say about any repo.
+    """
+    try:
+        text = await github.file(repo, PROFILE_PATH, ref)
+    except Exception:  # noqa: BLE001 - a profile is an improvement, never a precondition
+        _log.exception("could not read %s from %s", PROFILE_PATH, repo)
+        return DEFAULT_PROJECT_NOTES
+    return text.strip() if text and text.strip() else DEFAULT_PROJECT_NOTES
+
+
 def build_prompt(
     repo: str,
     issue: dict,
     branch: str,
     base: str,
+    notes: str = DEFAULT_PROJECT_NOTES,
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
@@ -256,6 +304,7 @@ def build_prompt(
         body=issue["body"] or "(no description given)",
         branch=branch,
         base=base,
+        project_notes=notes,
     )
     if attempt > 1:
         prompt += RETRY_TEMPLATE.format(
@@ -295,6 +344,16 @@ You are checked out on the branch `{branch}`. The base branch is `{base}`.
 {criteria}
 --- end criteria ---
 
+--- the issue body the change was written against ---
+{body}
+--- end issue body ---
+
+The criteria are the contract; the body is context for reading the change. It tells you what
+the step was for, where its author expected the work to land, and where its lane ended. Use it
+to judge scope — do not mine it for extra gates. A criterion is the only thing that blocks on
+its own; prose in the body is not one. Where the body and the criteria disagree, the criteria
+win: record the disagreement in `notes` rather than acting on it.
+
 Your job is to find out whether each criterion is true. Not whether the code looks correct,
 not whether you would have written it that way — whether the criterion holds.
 
@@ -325,14 +384,24 @@ How to check each criterion, by its `mode`:
 - `inspect` — read what `verify` points at and report what you found. This is the one mode that
   cannot block a merge, so be useful rather than cautious: say what is there and what is missing.
 
-Also run the repo's fast checks once — `npm run lint`, `npm run typecheck`, `npm run test`,
-`npm run test:integration`, `npm run build`. Do not run the end-to-end suite; CI covers it.
+Also run the repo's own fast checks once, as described here:
+
+{project_notes}
+
 If any of them fail, that is a finding regardless of the criteria.
 
 Then look for two specific things and report them as findings if present:
 
 1. **Scope creep.** Map every changed file (`git diff --name-only {base_sha}...HEAD`) to a
-   criterion or to the issue's stated task. Files that map to neither are findings.
+   criterion, to the issue's `## Task`, or to its `## Where this goes` map if it has one.
+   Files that map to none of those are findings. Two things about that map, when present:
+   - It is **advisory**. It was written before the code existed, and the issue itself tells the
+     builder to follow the repo where the two disagree. So a changed file that is not on the
+     map is a reason to look closer, not a finding by itself.
+   - A file that is **on** the map but was never touched belongs in `notes`: either the step is
+     unfinished or the map was wrong. Both are worth knowing; neither blocks on its own.
+   Anything the issue's `## Boundaries` section puts in its `Never:` lane **is** a finding if
+   the change does it. That is the issue's own written rule, not an opinion you formed.
 2. **Rules broken.** Check the change against the repo's own written rules — `CLAUDE.md`,
    `docs/adr/*`, `.mem/`. Only rules that are actually written down. Do not invent a
    convention and then report the code for violating it; if it is not written anywhere, it is
@@ -573,17 +642,42 @@ def format_event(event: dict) -> list[str]:
 # --------------------------------------------------------------------------- run
 
 
-async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> tuple[bool, str | None]:
+@dataclass(frozen=True)
+class MergeAttempt:
+    """What came of trying to merge one pull request.
+
+    A record rather than a tuple because it carries four facts that are easy to confuse, and
+    two of them are only meaningful in one ending each:
+
+    - `merged`     — did it land
+    - `ci_failure` — set *only* when checks ran and came back red, which is the one ending a
+                     fix run can act on. Everything else leaves it None, because "we could
+                     not find out" and "CI says no" call for different responses.
+    - `why`        — always populated, in plain language, for the issue comment and the runs
+                     table. This used to be dropped for every non-CI ending, which is how a
+                     stranded pull request came to be recorded as "cause unknown" when GitHub
+                     had in fact said exactly what was wrong.
+    - `head_sha`   — the commit the checks were verified on, so the caller can fetch that
+                     commit's failing logs rather than whatever is at the head by then.
+    """
+
+    merged: bool
+    ci_failure: str | None
+    why: str
+    head_sha: str | None = None
+
+
+async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt:
     """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
     than one we force, and the PR simply stays open for a human.
 
-    Returns (merged, ci_failure). `ci_failure` is set only when CI ran and came back red,
-    which is a thing an agent can be sent back to fix; every other reason for not merging
-    (checks still pending, GitHub unreachable, the merge itself refused) leaves it None,
-    because those need a human to look rather than another run to guess.
+    The merge itself retries while GitHub is unavailable (see `github.merge_pr`) and is
+    pinned to the sha the checks passed on, so "auto-merge once the tests are done" holds
+    even across an outage, and can still only ever land the commit that was tested.
     """
     try:
         pr_number = int(pr_url.rstrip("/").split("/")[-1])
+        sha: str | None = None
         green, why, failed = True, "checks not required", []
         if settings.merge_require_checks:
             # The merge API waits for nothing, so without this the PR is merged seconds after
@@ -596,13 +690,17 @@ async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> tuple[bool, 
             )
         if not green:
             log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
-            return False, why if failed else None
-        await github.merge_pr(repo, pr_number)
+            return MergeAttempt(False, why if failed else None, why, sha)
+        await github.merge_pr(repo, pr_number, sha=sha)
         log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
-        return True, None
+        return MergeAttempt(True, None, why, sha)
     except Exception as exc:  # noqa: BLE001
+        # Keep the reason. GitHub nearly always says what was wrong, and throwing that away
+        # left a human with an unmerged pull request and nothing to go on.
+        detail = " ".join(str(exc).split())[:200] or type(exc).__name__
+        why = f"the merge call failed — {detail}"
         log.write(f"[factory] merge failed (PR left open): {exc!r}")
-        return False, None
+        return MergeAttempt(False, None, why, None)
 
 
 async def _fix_cycle(
@@ -923,7 +1021,10 @@ async def _execute(
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
-        prompt = build_prompt(repo, issue, branch, base, attempt, prior_error, prior_log)
+        notes = await project_notes(repo, base)
+        prompt = build_prompt(
+            repo, issue, branch, base, notes, attempt, prior_error, prior_log
+        )
 
         # ---- claim: mirror the pickup onto the issue for anyone watching on GitHub
         which = f" (attempt {attempt} of {settings.max_attempts})" if attempt > 1 else ""
@@ -937,7 +1038,7 @@ async def _execute(
 
         # ---- provision
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
-        vm_name = f"run-{run_id[:8]}"
+        vm_name = f"{RUN_PREFIX}{run_id[:8]}"
         log.write(f"[factory] provisioning {vm_name} from {golden}")
         machine = await _provision(boxd, golden, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
@@ -1008,7 +1109,7 @@ async def _execute(
                 # already contains this issue's work.
                 if not criteria:
                     log.write("[factory] issue carries no acceptance criteria; skipping review")
-                merged, _ = await _merge(repo, pr_url, base, log)
+                merged = (await _merge(repo, pr_url, base, log)).merged
             await db.update_run(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
@@ -1065,7 +1166,7 @@ async def _execute_review(
     boxd = client()
     try:
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
-        vm_name = f"rev-{run_id[:8]}"
+        vm_name = f"{REVIEW_PREFIX}{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
         log.write(f"[factory] provisioning {vm_name} from {golden}")
         machine = await _provision(boxd, golden, vm_name)
@@ -1079,6 +1180,7 @@ async def _execute_review(
 
         await db.update_run(run_id, status="running")
         prompt = REVIEW_PROMPT_TEMPLATE.format(
+            project_notes=await project_notes(repo, base),
             repo=repo,
             number=number,
             title=issue["title"],
@@ -1087,6 +1189,7 @@ async def _execute_review(
             base=base,
             base_sha=base_sha,
             criteria=yaml.safe_dump(criteria, sort_keys=False, allow_unicode=True),
+            body=issue.get("body") or "(no description given)",
         )
         env = {
             "FACTORY_REPO_DIR": settings.repo_dir,
@@ -1142,14 +1245,16 @@ async def _execute_review(
         # so it stops for a human. Collapsing all three into `agent:done` is how a broken
         # pull request ends up sitting open under an issue that claims to be finished.
         if approved:
-            merged, ci_failure = False, None
+            merge_attempt = MergeAttempt(False, None, "auto-merge is off")
             if settings.auto_merge:
-                merged, ci_failure = await _merge(repo, pr_url, base, log)
-            outcome = merge_outcome(settings.auto_merge, merged, ci_failure)
+                merge_attempt = await _merge(repo, pr_url, base, log)
+            outcome = merge_outcome(
+                settings.auto_merge, merge_attempt.merged, merge_attempt.ci_failure
+            )
 
             if outcome == "done":
                 comment = f"Review passed — {why}. {pr_url}"
-                if merged:
+                if merge_attempt.merged:
                     comment += " (merged)"
                 await _mirror_issue(
                     repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=comment
@@ -1157,7 +1262,7 @@ async def _execute_review(
                 return
 
             if outcome == "human":
-                await db.update_run(run_id, error="merge blocked, cause unknown")
+                await db.update_run(run_id, error=f"not merged: {merge_attempt.why}")
                 await _mirror_issue(
                     repo,
                     number,
@@ -1165,37 +1270,53 @@ async def _execute_review(
                     [github.LABEL_RUNNING, github.LABEL_QUEUED],
                     log,
                     comment=(
-                        f"Review passed — {why} — but the pull request could not be merged and "
-                        f"CI never reported a failure to work from. Needs a human. {pr_url}"
+                        f"Review passed — {why} — but the pull request could not be merged: "
+                        f"{merge_attempt.why}. Needs a human. {pr_url}"
                     ),
                 )
                 return
 
-            await db.update_run(run_id, error=ci_failure)
+            # Fetch the failing job's log now, while we still know which commit CI judged, and
+            # hand it to the fix run. Without it the next agent is told only that a check named
+            # `gates` failed, which is equally true of a broken test and of a registry timeout.
+            await db.update_run(run_id, error=merge_attempt.ci_failure)
+            ci_log = "(head commit unknown, could not fetch logs)"
+            if merge_attempt.head_sha:
+                ci_log = await github.failing_check_logs(repo, merge_attempt.head_sha)
+            log.write(f"[factory] fetched {len(ci_log)} chars of failing check log")
             await _fix_cycle(
                 repo,
                 number,
                 golden,
                 cycle,
                 log,
-                reason=f"CI failed after an approved review: {ci_failure}",
+                reason=f"CI failed after an approved review: {merge_attempt.ci_failure}",
                 detail=(
                     f"CI failed on the pull request after the review approved it.\n"
-                    f"{ci_failure}\n\n"
+                    f"{merge_attempt.ci_failure}\n\n"
                     "The reviewer confirmed every acceptance criterion against real command "
                     "output, so the change itself is sound. What failed is something CI runs "
-                    "that this VM does not — the end-to-end browser suite in particular.\n\n"
-                    "Read the actual failure before changing anything:\n"
+                    "that this VM does not.\n\n"
+                    "The failing job's log is below — read it before you change anything, and "
+                    "decide first which kind of failure it is.\n\n"
+                    "If it is an infrastructure fault rather than a defect in this change — an "
+                    "image pull or network timeout, a runner that died, a rate limit, a service "
+                    "that was briefly unavailable — then the code is fine and editing it would "
+                    "make things worse. Re-run the job instead and wait for the result:\n"
                     f"  gh run list --branch {branch} --limit 1\n"
-                    "  gh run view <run-id> --log-failed\n\n"
-                    "Then fix its cause. Do not delete, skip or weaken a test to make it pass, "
-                    "and do not edit CI configuration — a gate that fails is doing its job."
+                    "  gh run rerun <run-id> --failed\n\n"
+                    "If it is a real defect, fix its cause. Do not delete, skip or weaken a "
+                    "test to make it pass, and do not edit CI configuration — a gate that "
+                    "fails is doing its job.\n\n"
+                    f"--- failing check log ---\n{ci_log}"
                 ),
                 going_back=(
-                    f"Review passed, but CI is red ({ci_failure}). Fixing. {pr_url}"
+                    f"Review passed, but CI is red ({merge_attempt.ci_failure}). "
+                    f"Fixing. {pr_url}"
                 ),
                 giving_up=(
-                    f"Review passed, but CI is still red after {cycle} cycles ({ci_failure}).\n\n"
+                    f"Review passed, but CI is still red after {cycle} cycles "
+                    f"({merge_attempt.ci_failure}).\n\n"
                     f"Stopping — needs a human. {pr_url}"
                 ),
             )
@@ -1358,7 +1479,7 @@ async def reconcile() -> dict:
         active_vms = {r["vm_name"] for r in active if r.get("vm_name")}
 
         orphans = [
-            m for m in machines if m.name.startswith("run-") and m.name not in active_vms
+            m for m in machines if is_run_vm(m.name) and m.name not in active_vms
         ]
         for machine in orphans:
             await boxd.machines.delete(machine.id)

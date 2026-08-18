@@ -44,10 +44,23 @@ def _github_token() -> str:
         return ""
 
 
-def _repos() -> tuple[str, ...]:
-    """Repos the poller watches, from a comma-separated FACTORY_REPOS."""
+def _watched() -> tuple[tuple[str, str], ...]:
+    """Parse FACTORY_REPOS into (repo, golden) pairs.
+
+    An entry is `owner/repo` or `owner/repo=golden`. A golden holds one repo cloned at
+    FACTORY_REPO_DIR, so a second watched repo needs a second machine to fork; the pair is
+    written here rather than in a second env var so a repo and its fork source can never
+    drift apart. Without `=golden` the entry falls back to FACTORY_GOLDEN.
+    """
     raw = os.environ.get("FACTORY_REPOS", "")
-    return tuple(r.strip() for r in raw.split(",") if r.strip())
+    default = os.environ.get("FACTORY_GOLDEN", "")
+    out = []
+    for entry in raw.split(","):
+        repo, _, golden = entry.partition("=")
+        repo, golden = repo.strip(), golden.strip()
+        if repo:
+            out.append((repo, golden or default))
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -108,13 +121,35 @@ class Settings:
     # human clears it. Turn off if a repo's issues are independent.
     halt_on_failure: bool = os.environ.get("FACTORY_HALT_ON_FAILURE", "1") == "1"
     # Issue polling. The poller only runs if at least one repo is listed in FACTORY_REPOS.
-    repos: tuple[str, ...] = _repos()
+    # Each entry carries the machine its runs fork from — see _watched().
+    watched: tuple[tuple[str, str], ...] = _watched()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
+    # How often to check each golden for drift, in seconds. 0 switches the sweep off. Hourly
+    # because what it watches moves on the timescale of merges, not of runs.
+    golden_sweep_interval: int = int(os.environ.get("FACTORY_GOLDEN_SWEEP", "3600"))
     poll_interval: int = int(os.environ.get("FACTORY_POLL_INTERVAL", "30"))
     # Public URL of this control plane, used only to link runs from issue comments.
     base_url: str = os.environ.get("FACTORY_BASE_URL", "").rstrip("/")
     db_path: Path = ROOT / "var" / "factory.db"
     log_dir: Path = ROOT / "var" / "logs"
+
+    @property
+    def repos(self) -> tuple[str, ...]:
+        """Just the repo names, in the order the poller works them."""
+        return tuple(repo for repo, _ in self.watched)
+
+    @property
+    def goldens(self) -> tuple[str, ...]:
+        """Every machine the factory forks from, deduplicated, order preserved."""
+        names = [self.golden, *(g for _, g in self.watched)]
+        return tuple(dict.fromkeys(n for n in names if n))
+
+    def golden_for(self, repo: str) -> str:
+        """The machine a run for `repo` forks from."""
+        for name, golden in self.watched:
+            if name == repo:
+                return golden
+        return self.golden
 
     def missing(self) -> list[str]:
         """Which required settings are absent. Surfaced in the UI rather than crashing."""
@@ -125,6 +160,11 @@ class Settings:
             gaps.append("GITHUB_TOKEN (or `gh auth login`)")
         if not self.golden:
             gaps.append("FACTORY_GOLDEN")
+        # A watched repo with no machine to fork would fail every dispatch, one run at a
+        # time, with nothing in the UI saying why.
+        for repo, golden in self.watched:
+            if not golden:
+                gaps.append(f"a golden for {repo} (FACTORY_REPOS entry or FACTORY_GOLDEN)")
         return gaps
 
 

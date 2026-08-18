@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import auth, db, github, poller, runner
+from . import auth, db, github, goldens, poller, preflight, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -31,10 +31,12 @@ async def lifespan(app: FastAPI):
     await db.init()
     await telemetry.init()
     poller.start()
+    goldens.start()
     try:
         yield
     finally:
         await poller.stop()
+        await goldens.stop()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
@@ -93,6 +95,7 @@ async def api_config():
     return {
         "repos": list(settings.repos),
         "golden": settings.golden,
+        "watched": [{"repo": r, "golden": g} for r, g in settings.watched],
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
@@ -144,15 +147,51 @@ class StartRun(BaseModel):
     repo: str
     issue_number: int
     golden: str | None = None
+    # A review of a pull request a build already opened, rather than a build. Both are runs
+    # on a fork, which is why one endpoint starts either.
+    kind: str = "build"
+    pr_url: str | None = None
+    branch: str | None = None
+    # For a build: which attempt this is, so `VM_SCRIPT` resumes the branch instead of
+    # resetting it to the base and throwing the previous attempt's commits away. For a
+    # review: which review cycle.
+    attempt: int = 1
 
 
 @app.post("/api/runs")
 async def api_start_run(body: StartRun):
+    """Start a run. This is the only supported way to dispatch one by hand.
+
+    It matters that this lives in the serving process: a run is an `asyncio` task holding a
+    VM, so a run started from a throwaway script dies with that script — leaving a machine
+    nobody reaps, a row that says `running` forever, and an issue mirroring a state that
+    stopped being true. Anything that needs to start a run talks to this.
+    """
     gaps = settings.missing()
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
+    repo = body.repo.strip()
+    # A run started by hand forks the same machine the poller would have used, so a manual
+    # dispatch on a watched repo can't land on the wrong repo's golden.
+    golden = body.golden or settings.golden_for(repo)
     try:
-        run_id = await runner.create(body.repo.strip(), body.issue_number, golden=body.golden)
+        if body.kind == "review":
+            if not body.pr_url or not body.branch:
+                raise ValueError("a review needs pr_url and branch")
+            run_id = await runner.create_review(
+                repo,
+                body.issue_number,
+                body.pr_url,
+                body.branch,
+                golden=golden,
+                cycle=body.attempt,
+            )
+        elif body.kind == "build":
+            run_id = await runner.create(
+                repo, body.issue_number, golden=golden, attempt=body.attempt
+            )
+        else:
+            raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not start run: {exc}") from exc
     return {"run_id": run_id}
@@ -236,16 +275,47 @@ async def api_plan(repo: str | None = None):
     return out
 
 
+@app.post("/api/goldens/sweep")
+async def api_golden_sweep():
+    """Check every golden for drift now, rather than waiting for the next sweep."""
+    return await goldens.sweep()
+
+
+@app.get("/api/preflight")
+async def api_preflight(repo: str):
+    """Whether `repo` is ready to be dispatched to, and its golden ready to build it.
+
+    Read-only: it reports, it never repairs. Answers here cost a second; the same answers
+    found during a run cost a VM and forty minutes.
+    """
+    checks = await preflight.run(repo.strip())
+    return {
+        "repo": repo,
+        "ready": not any(c for c in checks if not c.ok and c.fatal),
+        "checks": [
+            {"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks
+        ],
+    }
+
+
 @app.get("/api/projects")
 async def api_projects():
-    """Watched repos with their run tallies."""
+    """Watched repos with their run tallies, and how fresh the machine they fork is."""
     stats = await db.stats_by_repo()
+    fresh = await db.goldens()
     out = []
-    for repo in settings.repos:
+    for repo, golden in settings.watched:
         s = stats.get(repo, {})
+        g = fresh.get(golden) or {}
         out.append(
             {
                 "repo": repo,
+                "golden": golden,
+                # What the last sweep saw. Absent until the first one has run.
+                "golden_checked_at": g.get("checked_at"),
+                "golden_behind": g.get("behind"),
+                "golden_stale_deps": g.get("stale_deps") or None,
+                "golden_error": g.get("error"),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -268,15 +338,18 @@ async def api_agents():
     finally:
         await boxd.close()
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
+    fresh = await db.goldens()
     out = []
     for m in machines:
-        is_run = m.name.startswith("run-")
+        is_run = runner.is_run_vm(m.name)
         out.append(
             {
                 "name": m.name,
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
-                "is_golden": m.name == settings.golden,
+                "is_golden": m.name in settings.goldens,
+                "behind": (fresh.get(m.name) or {}).get("behind"),
+                "stale_deps": (fresh.get(m.name) or {}).get("stale_deps") or None,
                 "orphan": is_run and m.name not in active,
             }
         )
