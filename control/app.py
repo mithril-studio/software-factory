@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import auth, db, github, poller, runner
+from . import auth, db, github, poller, preflight, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -240,6 +240,23 @@ async def api_plan(repo: str | None = None):
                 }
             )
     return out
+
+
+@app.get("/api/preflight")
+async def api_preflight(repo: str):
+    """Whether `repo` is ready to be dispatched to, and its golden ready to build it.
+
+    Read-only: it reports, it never repairs. Answers here cost a second; the same answers
+    found during a run cost a VM and forty minutes.
+    """
+    checks = await preflight.run(repo.strip())
+    return {
+        "repo": repo,
+        "ready": not any(c for c in checks if not c.ok and c.fatal),
+        "checks": [
+            {"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks
+        ],
+    }
 
 
 @app.get("/api/projects")

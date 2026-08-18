@@ -111,6 +111,35 @@ async def file(repo: str, path: str, ref: str) -> str | None:
     return resp.text
 
 
+async def repo_info(repo: str) -> dict | None:
+    """The repository object, or None when the token cannot even read it."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{API}/repos/{repo}", headers=_headers())
+    return resp.json() if resp.status_code == 200 else None
+
+
+async def workflow_count(repo: str, ref: str) -> int:
+    """How many Actions workflow files exist on `ref`.
+
+    Zero is the interesting answer: `checks_green` reports success only once at least one
+    check run has finished, so a repo with no workflows can never satisfy the merge gate.
+
+    Counted from the tree rather than from `/actions/workflows`, which also lists workflows
+    it has only ever seen on a branch — a pull request adding CI would otherwise make the
+    repo look like it already had some.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/contents/.github/workflows",
+            headers=_headers(),
+            params={"ref": ref},
+        )
+    if resp.status_code != 200:
+        return 0
+    body = resp.json()
+    return sum(1 for f in body if f.get("name", "").endswith((".yml", ".yaml")))
+
+
 async def default_branch(repo: str) -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(f"{API}/repos/{repo}", headers=_headers())
