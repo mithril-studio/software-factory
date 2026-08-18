@@ -43,17 +43,58 @@ def client() -> AsyncBoxd:
     return AsyncBoxd(api_key=settings.boxd_api_key)
 
 
-async def golden_id(boxd: AsyncBoxd, golden: str) -> str:
-    """Resolve the golden's machine id.
+async def _machine_id(boxd: AsyncBoxd, source: str) -> str:
+    """Resolve a machine's id.
 
     The boxd SDK forks by machine **id**, not name — forking by name fails with
     `source VM not found` even though the machine lists fine. `FACTORY_GOLDEN` is a
     human-readable name, so resolve it here. Accepts an id too, so either works in config.
     """
     for m in await boxd.machines.list():
-        if m.id == golden or m.name == golden:
+        if m.id == source or m.name == source:
             return m.id
-    raise RuntimeError(f"golden VM {golden!r} not found in the boxd fleet")
+    raise RuntimeError(f"golden VM {source!r} not found in the boxd fleet")
+
+
+async def _is_snapshot(boxd: AsyncBoxd, source: str) -> bool:
+    """Does `source` name a snapshot in this account?
+
+    Asked of the fleet rather than of the name, because both kinds of source are named the
+    same way: the golden `golden-claude` is a snapshot on the new path and was a machine on
+    the old one. A name alone cannot tell them apart, and guessing wrong picks the wrong API.
+    """
+    return any(s.id == source or s.name == source for s in await boxd.snapshots.list())
+
+
+async def _provision(boxd: AsyncBoxd, source: str, vm_name: str):
+    """Give a run its VM, from a snapshot when `source` is one and by forking when it is not.
+
+    Goldens are moving from long-lived machines to snapshots: a running golden holds one of
+    the account's 20 concurrent VM slots forever, a snapshot holds none. The fork path stays
+    for as long as any deployment still points at a machine — it is the rollback.
+
+    Both paths set the same two timers, and both are load-bearing. Without
+    `auto_suspend_timeout=0` the default idle suspend freezes a VM in the middle of a long,
+    silent build. Without `auto_destroy_timeout` a control plane that dies leaks the slot for
+    good. The snapshot path passes nothing else: `create(from_snapshot=...)` rejects `env`,
+    `image`, `cmd`, `restart_policy`, `shared` and `networks` with a ValueError, since
+    restoring a capture replays a machine rather than configuring a new one. The per-run
+    environment arrives later, through `stream_exec(env=...)`, exactly as it does on the fork
+    path.
+    """
+    if await _is_snapshot(boxd, source):
+        return await boxd.machines.create(
+            name=vm_name,
+            from_snapshot=source,
+            auto_suspend_timeout=0,
+            auto_destroy_timeout=settings.auto_destroy,
+        )
+    return await boxd.machines.fork(
+        await _machine_id(boxd, source),
+        vm_name,
+        auto_suspend_timeout=0,
+        auto_destroy_timeout=settings.auto_destroy,
+    )
 
 
 # --------------------------------------------------------------------------- prompt
@@ -894,20 +935,11 @@ async def _execute(
             repo, number, github.LABEL_RUNNING, [github.LABEL_QUEUED], log, comment=started
         )
 
-        # ---- fork
+        # ---- provision
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"run-{run_id[:8]}"
-        log.write(f"[factory] forking {golden} -> {vm_name}")
-        source_id = await golden_id(boxd, golden)
-        machine = await boxd.machines.fork(
-            source_id,
-            vm_name,
-            # Agent work is CPU-bound and often silent; the default idle suspend would
-            # freeze the VM mid-build. Zero disables it.
-            auto_suspend_timeout=0,
-            # Safety net: if this process dies, the VM still reaps itself.
-            auto_destroy_timeout=settings.auto_destroy,
-        )
+        log.write(f"[factory] provisioning {vm_name} from {golden}")
+        machine = await _provision(boxd, golden, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
         log.write(f"[factory] {machine.name} ready ({machine.id})")
@@ -1035,13 +1067,8 @@ async def _execute_review(
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"rev-{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
-        log.write(f"[factory] forking {golden} -> {vm_name}")
-        machine = await boxd.machines.fork(
-            await golden_id(boxd, golden),
-            vm_name,
-            auto_suspend_timeout=0,
-            auto_destroy_timeout=settings.auto_destroy,
-        )
+        log.write(f"[factory] provisioning {vm_name} from {golden}")
+        machine = await _provision(boxd, golden, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
         log.write(f"[factory] {machine.name} ready ({machine.id})")
