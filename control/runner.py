@@ -11,6 +11,7 @@ import inspect
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -527,17 +528,42 @@ def format_event(event: dict) -> list[str]:
 # --------------------------------------------------------------------------- run
 
 
-async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> tuple[bool, str | None]:
+@dataclass(frozen=True)
+class MergeAttempt:
+    """What came of trying to merge one pull request.
+
+    A record rather than a tuple because it carries four facts that are easy to confuse, and
+    two of them are only meaningful in one ending each:
+
+    - `merged`     — did it land
+    - `ci_failure` — set *only* when checks ran and came back red, which is the one ending a
+                     fix run can act on. Everything else leaves it None, because "we could
+                     not find out" and "CI says no" call for different responses.
+    - `why`        — always populated, in plain language, for the issue comment and the runs
+                     table. This used to be dropped for every non-CI ending, which is how a
+                     stranded pull request came to be recorded as "cause unknown" when GitHub
+                     had in fact said exactly what was wrong.
+    - `head_sha`   — the commit the checks were verified on, so the caller can fetch that
+                     commit's failing logs rather than whatever is at the head by then.
+    """
+
+    merged: bool
+    ci_failure: str | None
+    why: str
+    head_sha: str | None = None
+
+
+async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt:
     """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
     than one we force, and the PR simply stays open for a human.
 
-    Returns (merged, ci_failure). `ci_failure` is set only when CI ran and came back red,
-    which is a thing an agent can be sent back to fix; every other reason for not merging
-    (checks still pending, GitHub unreachable, the merge itself refused) leaves it None,
-    because those need a human to look rather than another run to guess.
+    The merge itself retries while GitHub is unavailable (see `github.merge_pr`) and is
+    pinned to the sha the checks passed on, so "auto-merge once the tests are done" holds
+    even across an outage, and can still only ever land the commit that was tested.
     """
     try:
         pr_number = int(pr_url.rstrip("/").split("/")[-1])
+        sha: str | None = None
         green, why, failed = True, "checks not required", []
         if settings.merge_require_checks:
             # The merge API waits for nothing, so without this the PR is merged seconds after
@@ -550,13 +576,17 @@ async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> tuple[bool, 
             )
         if not green:
             log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
-            return False, why if failed else None
-        await github.merge_pr(repo, pr_number)
+            return MergeAttempt(False, why if failed else None, why, sha)
+        await github.merge_pr(repo, pr_number, sha=sha)
         log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
-        return True, None
+        return MergeAttempt(True, None, why, sha)
     except Exception as exc:  # noqa: BLE001
+        # Keep the reason. GitHub nearly always says what was wrong, and throwing that away
+        # left a human with an unmerged pull request and nothing to go on.
+        detail = " ".join(str(exc).split())[:200] or type(exc).__name__
+        why = f"the merge call failed — {detail}"
         log.write(f"[factory] merge failed (PR left open): {exc!r}")
-        return False, None
+        return MergeAttempt(False, None, why, None)
 
 
 async def _fix_cycle(
@@ -971,7 +1001,7 @@ async def _execute(
                 # already contains this issue's work.
                 if not criteria:
                     log.write("[factory] issue carries no acceptance criteria; skipping review")
-                merged, _ = await _merge(repo, pr_url, base, log)
+                merged = (await _merge(repo, pr_url, base, log)).merged
             await db.update_run(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
@@ -1110,14 +1140,16 @@ async def _execute_review(
         # so it stops for a human. Collapsing all three into `agent:done` is how a broken
         # pull request ends up sitting open under an issue that claims to be finished.
         if approved:
-            merged, ci_failure = False, None
+            merge_attempt = MergeAttempt(False, None, "auto-merge is off")
             if settings.auto_merge:
-                merged, ci_failure = await _merge(repo, pr_url, base, log)
-            outcome = merge_outcome(settings.auto_merge, merged, ci_failure)
+                merge_attempt = await _merge(repo, pr_url, base, log)
+            outcome = merge_outcome(
+                settings.auto_merge, merge_attempt.merged, merge_attempt.ci_failure
+            )
 
             if outcome == "done":
                 comment = f"Review passed — {why}. {pr_url}"
-                if merged:
+                if merge_attempt.merged:
                     comment += " (merged)"
                 await _mirror_issue(
                     repo, number, github.LABEL_DONE, [github.LABEL_RUNNING], log, comment=comment
@@ -1125,7 +1157,7 @@ async def _execute_review(
                 return
 
             if outcome == "human":
-                await db.update_run(run_id, error="merge blocked, cause unknown")
+                await db.update_run(run_id, error=f"not merged: {merge_attempt.why}")
                 await _mirror_issue(
                     repo,
                     number,
@@ -1133,31 +1165,45 @@ async def _execute_review(
                     [github.LABEL_RUNNING, github.LABEL_QUEUED],
                     log,
                     comment=(
-                        f"Review passed — {why} — but the pull request could not be merged and "
-                        f"CI never reported a failure to work from. Needs a human. {pr_url}"
+                        f"Review passed — {why} — but the pull request could not be merged: "
+                        f"{merge_attempt.why}. Needs a human. {pr_url}"
                     ),
                 )
                 return
 
-            await db.update_run(run_id, error=ci_failure)
+            # Fetch the failing job's log now, while we still know which commit CI judged, and
+            # hand it to the fix run. Without it the next agent is told only that a check named
+            # `gates` failed, which is equally true of a broken test and of a registry timeout.
+            await db.update_run(run_id, error=merge_attempt.ci_failure)
+            ci_log = "(head commit unknown, could not fetch logs)"
+            if merge_attempt.head_sha:
+                ci_log = await github.failing_check_logs(repo, merge_attempt.head_sha)
+            log.write(f"[factory] fetched {len(ci_log)} chars of failing check log")
             await _fix_cycle(
                 repo,
                 number,
                 golden,
                 cycle,
                 log,
-                reason=f"CI failed after an approved review: {ci_failure}",
+                reason=f"CI failed after an approved review: {merge_attempt.ci_failure}",
                 detail=(
                     f"CI failed on the pull request after the review approved it.\n"
-                    f"{ci_failure}\n\n"
+                    f"{merge_attempt.ci_failure}\n\n"
                     "The reviewer confirmed every acceptance criterion against real command "
                     "output, so the change itself is sound. What failed is something CI runs "
-                    "that this VM does not — the end-to-end browser suite in particular.\n\n"
-                    "Read the actual failure before changing anything:\n"
+                    "that this VM does not.\n\n"
+                    "The failing job's log is below — read it before you change anything, and "
+                    "decide first which kind of failure it is.\n\n"
+                    "If it is an infrastructure fault rather than a defect in this change — an "
+                    "image pull or network timeout, a runner that died, a rate limit, a service "
+                    "that was briefly unavailable — then the code is fine and editing it would "
+                    "make things worse. Re-run the job instead and wait for the result:\n"
                     f"  gh run list --branch {branch} --limit 1\n"
-                    "  gh run view <run-id> --log-failed\n\n"
-                    "Then fix its cause. Do not delete, skip or weaken a test to make it pass, "
-                    "and do not edit CI configuration — a gate that fails is doing its job."
+                    "  gh run rerun <run-id> --failed\n\n"
+                    "If it is a real defect, fix its cause. Do not delete, skip or weaken a "
+                    "test to make it pass, and do not edit CI configuration — a gate that "
+                    "fails is doing its job.\n\n"
+                    f"--- failing check log ---\n{ci_log}"
                 ),
                 going_back=(
                     f"Review passed, but CI is red ({ci_failure}). Fixing. {pr_url}"
