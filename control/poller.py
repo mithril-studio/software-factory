@@ -41,8 +41,9 @@ async def _poll_repo(repo: str) -> None:
     if not issues:
         return
     issue = issues[0]  # lowest number
-    log.info("dispatching %s#%s", repo, issue["number"])
-    await runner.create(repo, issue["number"])
+    agent = settings.agent_for(repo)
+    log.info("dispatching %s#%s to %s", repo, issue["number"], agent)
+    await runner.create(repo, issue["number"], agent=agent)
 
 
 async def _tick() -> None:

@@ -37,7 +37,7 @@ installed when a golden is built rather than deployed with the control plane.
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python -e .
-cp .env.example .env               # fill in BOXD_API_KEY and FACTORY_GOLDEN
+cp .env.example .env               # fill in BOXD_API_KEY and FACTORY_REPOS
 npm --prefix web install && npm --prefix web run build   # build the UI once
 .venv/bin/uvicorn control.app:app --port 8765 --reload
 ```

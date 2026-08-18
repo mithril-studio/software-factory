@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import auth, db, github, poller, runner
+from . import agents, auth, config, db, github, poller, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -87,17 +87,44 @@ async def api_me(request: Request):
 # --------------------------------------------------------------------------- config
 
 
+async def _available() -> tuple[str, ...]:
+    """Golden snapshot names in the fleet, or nothing if the fleet cannot be reached.
+
+    Best-effort on purpose: this backs advice, and a boxd outage should degrade the advice
+    rather than take the API down with it.
+    """
+    boxd = runner.client()
+    try:
+        return await agents.available(boxd)
+    except Exception:  # noqa: BLE001 - no credentials, no network: report nothing found
+        return ()
+    finally:
+        await boxd.close()
+
+
 @app.get("/api/config")
 async def api_config():
-    """What the shell needs: watched repos, the golden, limits, and any missing settings."""
+    """What the shell needs: watched repos and their agents, limits, and what is wrong.
+
+    Two kinds of wrong, kept apart. `missing` is a setting nobody filled in; `problems` is a
+    configuration that is complete but has nothing to run on — an agent with no snapshot yet.
+    The second question needs the fleet, which is why it lives here (async) and not in
+    `settings.missing()`, which is synchronous and gates starting a run.
+    """
+    available = await _available()
     return {
         "repos": list(settings.repos),
-        "golden": settings.golden,
+        "watched": [
+            {"repo": repo, "agent": settings.agent_for(repo)} for repo, _ in settings.watched
+        ],
+        "agents": list(agents.discover(available)),
+        "agent_default": settings.agent_default,
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
         "poll_interval": settings.poll_interval,
         "missing": settings.missing(),
+        "problems": settings.problems(available),
     }
 
 
@@ -143,7 +170,7 @@ async def api_telemetry():
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    golden: str | None = None
+    agent: str | None = None
 
 
 @app.post("/api/runs")
@@ -151,8 +178,15 @@ async def api_start_run(body: StartRun):
     gaps = settings.missing()
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
+    if body.agent:
+        # Validated against the snapshots that exist, because this is the one place a typo
+        # should be loud: quietly running somebody's issue on a different agent than they
+        # asked for is worse than refusing to start.
+        wrong = config.unknown_agent(body.agent, await _available())
+        if wrong:
+            raise HTTPException(400, wrong)
     try:
-        run_id = await runner.create(body.repo.strip(), body.issue_number, golden=body.golden)
+        run_id = await runner.create(body.repo.strip(), body.issue_number, agent=body.agent)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not start run: {exc}") from exc
     return {"run_id": run_id}
@@ -261,7 +295,7 @@ async def api_projects():
 
 @app.get("/api/agents")
 async def api_agents():
-    """Boxd machines: the golden(s) runs fork from, and any live run VMs."""
+    """Boxd machines: any golden still held as one, plus the live run VMs."""
     boxd = runner.client()
     try:
         machines = await boxd.machines.list()
@@ -276,7 +310,7 @@ async def api_agents():
                 "name": m.name,
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
-                "is_golden": m.name == settings.golden,
+                "is_golden": agents.parse_golden(m.name) is not None,
                 "orphan": is_run and m.name not in active,
             }
         )

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import agents
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,17 +47,50 @@ def _github_token() -> str:
         return ""
 
 
-def _repos() -> tuple[str, ...]:
-    """Repos the poller watches, from a comma-separated FACTORY_REPOS."""
+def _watched() -> tuple[tuple[str, str], ...]:
+    """Parse FACTORY_REPOS into (repo, agent) pairs.
+
+    An entry is `owner/repo` or `owner/repo=agent`. The right-hand side names an *agent*,
+    never a machine: which snapshot that agent boots from is derived from its name at
+    dispatch time, so a repo warmed into `golden-<agent>--<repo-slug>` gets it automatically
+    and a repo without one falls back to the bare agent image. The pairing is written next
+    to the repo rather than in a second env var so the two cannot drift apart, and this is
+    what keeps configuration free of per-agent variables: a fourth agent needs none.
+
+    An entry with no `=agent` is left empty here and resolves through `agent_for`, so the
+    default can change without rewriting every entry.
+    """
     raw = os.environ.get("FACTORY_REPOS", "")
-    return tuple(r.strip() for r in raw.split(",") if r.strip())
+    out = []
+    for entry in raw.split(","):
+        repo, _, agent = entry.partition("=")
+        repo, agent = repo.strip(), agent.strip()
+        if repo:
+            out.append((repo, agent))
+    return tuple(out)
+
+
+def unknown_agent(name: str, available: Iterable[str] = ()) -> str | None:
+    """Why `name` cannot be dispatched, or None when it can.
+
+    The API is the one place a typo should be loud, so this backs a 400 rather than a
+    fallback: a hand-started run that silently ran on a different agent than the one asked
+    for would be a lie told at the only moment somebody was watching. A bad *config* value
+    is treated the other way round — it falls back and logs, because a poller that stops
+    dispatching over one stale name is worse than one that keeps working.
+    """
+    found = agents.discover(available)
+    if name.strip() in found:
+        return None
+    if not found:
+        return f"unknown agent {name!r}: no golden snapshots exist to run it"
+    return f"unknown agent {name!r}: known agents are {', '.join(found)}"
 
 
 @dataclass(frozen=True)
 class Settings:
     boxd_api_key: str = os.environ.get("BOXD_API_KEY", "")
     github_token: str = _github_token()
-    golden: str = os.environ.get("FACTORY_GOLDEN", "")
     repo_dir: str = os.environ.get("FACTORY_REPO_DIR", "/home/boxd/repo")
     max_concurrent: int = int(os.environ.get("FACTORY_MAX_CONCURRENT", "3"))
     # Hard ceiling on one agent run. Observed successful runs took 27-53 minutes, so 60
@@ -108,7 +144,10 @@ class Settings:
     # human clears it. Turn off if a repo's issues are independent.
     halt_on_failure: bool = os.environ.get("FACTORY_HALT_ON_FAILURE", "1") == "1"
     # Issue polling. The poller only runs if at least one repo is listed in FACTORY_REPOS.
-    repos: tuple[str, ...] = _repos()
+    # Each entry carries the agent its runs use — see _watched().
+    watched: tuple[tuple[str, str], ...] = _watched()
+    # The agent for a repo that names none. `claude` unless a deployment says otherwise.
+    agent_default: str = os.environ.get("FACTORY_AGENT_DEFAULT", "").strip() or agents.DEFAULT_AGENT
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
     poll_interval: int = int(os.environ.get("FACTORY_POLL_INTERVAL", "30"))
     # Public URL of this control plane, used only to link runs from issue comments.
@@ -116,16 +155,53 @@ class Settings:
     db_path: Path = ROOT / "var" / "factory.db"
     log_dir: Path = ROOT / "var" / "logs"
 
+    @property
+    def repos(self) -> tuple[str, ...]:
+        """Just the repo names, in the order the poller works them."""
+        return tuple(repo for repo, _ in self.watched)
+
+    def agent_for(self, repo: str) -> str:
+        """The agent that takes `repo`'s issues: its own if it named one, else the default."""
+        for name, agent in self.watched:
+            if name == repo and agent:
+                return agent
+        return self.agent_default
+
     def missing(self) -> list[str]:
-        """Which required settings are absent. Surfaced in the UI rather than crashing."""
+        """Which required settings are absent. Surfaced in the UI rather than crashing.
+
+        Static gaps only. Whether anything is *runnable* — whether the agents named here have
+        snapshots — is a question for the fleet, and this is synchronous and gates
+        `POST /api/runs`, so it must never grow an `await`. `problems()` answers that one.
+        """
         gaps = []
         if not self.boxd_api_key:
             gaps.append("BOXD_API_KEY")
         if not self.github_token:
             gaps.append("GITHUB_TOKEN (or `gh auth login`)")
-        if not self.golden:
-            gaps.append("FACTORY_GOLDEN")
         return gaps
+
+    def problems(self, available: Iterable[str] = ()) -> list[str]:
+        """What this configuration cannot run, given the golden snapshots that exist.
+
+        Reported rather than raised: a missing snapshot is a thing to go build, not a broken
+        setting, and the answer changes the moment somebody builds one.
+        """
+        names = tuple(available or ())
+        found = agents.discover(names)
+        if not found:
+            return ["no golden snapshots found — build one named golden-<agent>"]
+        out = []
+        for agent in dict.fromkeys(a for _, a in self.watched if a):
+            if agent not in found:
+                out.append(f"agent {agent!r} is configured but has no golden-{agent} snapshot")
+        unconfigured = [repo for repo, agent in self.watched if not agent]
+        if self.agent_default not in found and (unconfigured or not self.watched):
+            out.append(
+                f"no golden-{self.agent_default} snapshot, so a repo that names no agent "
+                "has nothing to run on"
+            )
+        return out
 
 
 settings = Settings()
