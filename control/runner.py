@@ -387,13 +387,42 @@ anything on GitHub — writing that file is the entirety of your output.
 """
 
 
-VM_SCRIPT = r"""
+# The setup both dispatch scripts open with: enter the checkout, make git willing to work in a
+# directory it did not create, say who is committing, and get the remote refs. It lives in one
+# constant because both scripts need it identical — a review VM that resolves the branch
+# differently from the build VM that wrote it reviews something nobody built.
+PRELUDE = r"""
 cd "$FACTORY_REPO_DIR" || { echo "FACTORY: repo dir $FACTORY_REPO_DIR not found" >&2; exit 90; }
 git config --global --add safe.directory "$FACTORY_REPO_DIR" 2>/dev/null || true
 git config user.name  "software-factory" 2>/dev/null || true
 git config user.email "factory@users.noreply.github.com" 2>/dev/null || true
 echo "FACTORY: fetching origin"
 git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
+"""
+
+# Fail fast when the machine's toolchain does not match what the repo pins. This is not
+# cosmetic: two npm majors disagree about what belongs in a lock file, so a mismatched golden
+# has its agents silently write lock files CI cannot install — which surfaces two steps later
+# as an unrelated-looking CI failure rather than as the version problem it is. That exact
+# mismatch killed CI on fourteen consecutive commits before anyone noticed. Skipped when the
+# repo pins nothing or the runtime is absent, so this stays harmless for non-Node projects.
+#
+# Shared by both scripts but deliberately not part of PRELUDE: it reads the pin out of the
+# working tree, so it has to run after each script has checked its own branch out. Read the pin
+# before the checkout and you assert against whatever commit the machine happened to be sitting
+# on, which is exactly the stale answer this guard exists to catch.
+NODE_GUARD = r"""
+if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
+  want=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
+  have=$(node -v | tr -d 'v' | cut -d. -f1)
+  if [ -n "$want" ] && [ "$want" != "$have" ]; then
+    echo "FACTORY: this machine runs node $have but .nvmrc pins $want — the golden needs rebuilding" >&2
+    exit 93
+  fi
+fi
+"""
+
+VM_SCRIPT = PRELUDE + r"""
 # On a retry, resume the branch a previous attempt pushed to rather than resetting to the base
 # and throwing that work away. The VM is always fresh; the branch is what carries work forward.
 # Only on a retry: a first attempt always starts from the base, so re-queueing an issue whose
@@ -405,20 +434,7 @@ else
   echo "FACTORY: checking out $FACTORY_BRANCH from origin/$FACTORY_BASE"
   git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BASE" || { echo "FACTORY: checkout failed" >&2; exit 92; }
 fi
-# Fail fast when the machine's toolchain does not match what the repo pins. This is not
-# cosmetic: two npm majors disagree about what belongs in a lock file, so a mismatched golden
-# has its agents silently write lock files CI cannot install — which surfaces two steps later
-# as an unrelated-looking CI failure rather than as the version problem it is. That exact
-# mismatch killed CI on fourteen consecutive commits before anyone noticed. Skipped when the
-# repo pins nothing or the runtime is absent, so this stays harmless for non-Node projects.
-if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
-  want=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
-  have=$(node -v | tr -d 'v' | cut -d. -f1)
-  if [ -n "$want" ] && [ "$want" != "$have" ]; then
-    echo "FACTORY: this machine runs node $have but .nvmrc pins $want — the golden needs rebuilding" >&2
-    exit 93
-  fi
-fi
+""" + NODE_GUARD + r"""
 echo "FACTORY: starting agent"
 claude -p "$FACTORY_PROMPT" \
   --effort "$FACTORY_AGENT_EFFORT" \
@@ -435,22 +451,11 @@ VERDICT_PATH = "/tmp/factory-verdict.json"
 
 # Review runs check out the PR branch and change nothing. No `-B` from the base, no push: a
 # reviewer that can write to the branch is a reviewer that can make its own findings go away.
-REVIEW_SCRIPT = r"""
-cd "$FACTORY_REPO_DIR" || { echo "FACTORY: repo dir $FACTORY_REPO_DIR not found" >&2; exit 90; }
-git config --global --add safe.directory "$FACTORY_REPO_DIR" 2>/dev/null || true
+REVIEW_SCRIPT = PRELUDE + r"""
 rm -f /tmp/factory-verdict.json
-echo "FACTORY: fetching origin"
-git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
 echo "FACTORY: checking out $FACTORY_BRANCH for review"
 git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BRANCH" || { echo "FACTORY: checkout failed" >&2; exit 92; }
-if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
-  want=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
-  have=$(node -v | tr -d 'v' | cut -d. -f1)
-  if [ -n "$want" ] && [ "$want" != "$have" ]; then
-    echo "FACTORY: this machine runs node $have but .nvmrc pins $want — the golden needs rebuilding" >&2
-    exit 93
-  fi
-fi
+""" + NODE_GUARD + r"""
 echo "FACTORY: starting reviewer"
 claude -p "$FACTORY_PROMPT" \
   --effort "$FACTORY_AGENT_EFFORT" \
@@ -1020,9 +1025,9 @@ async def _execute(
             # How long a single shell command may run before the agent's own tooling moves
             # it to the background. The default (120s) is shorter than an ordinary build or
             # test run here, and a backgrounded command is what the agent then waits on
-            # forever — under `claude -p` there is no loop to deliver the notification it
-            # expects. Generous values keep everything legitimate in the foreground; a
-            # genuinely stuck command is bounded by FACTORY_RUN_TIMEOUT, not by this.
+            # forever — in headless mode (`claude --print`) there is no loop to deliver the
+            # notification it expects. Generous values keep everything legitimate in the
+            # foreground; a genuinely stuck command is bounded by FACTORY_RUN_TIMEOUT.
             "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
             "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
             # Correlation key. Telemetry is not wired yet, but every run carries its id
