@@ -16,7 +16,6 @@ from pathlib import Path
 import yaml
 from boxd import AsyncBoxd
 
-from telemetry.normalize import summary as telemetry_summary
 from telemetry.recorder import Recorder
 
 from . import agents, db, github
@@ -579,62 +578,102 @@ class RunLog:
             pass
 
 
-def format_event(event: dict) -> list[str]:
-    """Turn one Claude Code stream-json event into readable log lines.
+def _format_system(event: dict) -> list[str]:
+    if event.get("subtype") != "init":
+        return []
+    return [f"[agent] session {event.get('session_id', '?')} started"]
 
-    Written defensively: the event schema is not a stable contract, so anything
-    unrecognised degrades to a compact fallback rather than raising.
-    """
+
+def _format_assistant(event: dict) -> list[str]:
     lines: list[str] = []
-    kind = event.get("type")
-
-    if kind == "system":
-        if event.get("subtype") == "init":
-            lines.append(f"[agent] session {event.get('session_id', '?')} started")
-        return lines
-
-    if kind == "assistant":
-        for block in event.get("message", {}).get("content", []) or []:
-            btype = block.get("type")
-            if btype == "text":
-                text = (block.get("text") or "").strip()
-                if text:
-                    lines.extend(text.splitlines())
-            elif btype == "tool_use":
-                name = block.get("name", "tool")
-                supplied = block.get("input", {}) or {}
-                hint = (
-                    supplied.get("command")
-                    or supplied.get("file_path")
-                    or supplied.get("pattern")
-                    or supplied.get("skill")
-                    or ""
-                )
-                hint = str(hint).replace("\n", " ")
-                lines.append(f"[tool] {name}{': ' + hint[:160] if hint else ''}")
-        return lines
-
-    if kind == "user":
-        for block in event.get("message", {}).get("content", []) or []:
-            if block.get("type") == "tool_result" and block.get("is_error"):
-                lines.append("[tool] -> error")
-        return lines
-
-    if kind == "result":
-        usage = event.get("usage", {}) or {}
-        tokens = ""
-        if usage:
-            tokens = (
-                f" | tokens in={usage.get('input_tokens', '?')} "
-                f"out={usage.get('output_tokens', '?')}"
+    for block in event.get("message", {}).get("content", []) or []:
+        btype = block.get("type")
+        if btype == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                lines.extend(text.splitlines())
+        elif btype == "tool_use":
+            name = block.get("name", "tool")
+            supplied = block.get("input", {}) or {}
+            hint = (
+                supplied.get("command")
+                or supplied.get("file_path")
+                or supplied.get("pattern")
+                or supplied.get("skill")
+                or ""
             )
-        lines.append(
-            f"[agent] finished: {event.get('subtype', 'done')}"
-            f" | {event.get('num_turns', '?')} turns{tokens}"
-        )
-        return lines
-
+            hint = str(hint).replace("\n", " ")
+            lines.append(f"[tool] {name}{': ' + hint[:160] if hint else ''}")
     return lines
+
+
+def _format_user(event: dict) -> list[str]:
+    return [
+        "[tool] -> error"
+        for block in event.get("message", {}).get("content", []) or []
+        if block.get("type") == "tool_result" and block.get("is_error")
+    ]
+
+
+def _format_finished(event: dict) -> list[str]:
+    usage = event.get("usage", {}) or {}
+    tokens = ""
+    if usage:
+        tokens = (
+            f" | tokens in={usage.get('input_tokens', '?')} "
+            f"out={usage.get('output_tokens', '?')}"
+        )
+    return [
+        f"[agent] finished: {event.get('subtype', 'done')}"
+        f" | {event.get('num_turns', '?')} turns{tokens}"
+    ]
+
+
+# Which event types this log knows how to read, and how. A table rather than a chain of
+# comparisons for one reason: whether an event is *recognised* is now a question the
+# stream has to ask, so that an event from a runtime whose shape nobody has written a
+# formatter for is logged raw instead of vanishing (see `stream_lines`). Every key here
+# is Claude Code's vocabulary — a second runtime adds its own names, and nothing outside
+# this table has to change.
+FORMATTERS = {
+    "system": _format_system,
+    "assistant": _format_assistant,
+    "user": _format_user,
+    "result": _format_finished,
+}
+
+# How much of an unrecognised event goes into the log. Enough to see what it was; not so
+# much that one chatty runtime buries the run in its own protocol.
+RAW_EVENT_MAX = 300
+
+
+def format_event(event: dict) -> list[str]:
+    """Turn one agent event into readable log lines, or none if it says nothing.
+
+    Written defensively: the event schema is not a stable contract, so an event this
+    does not recognise produces nothing rather than raising. `stream_lines` is what
+    decides such an event is worth a raw line anyway.
+    """
+    formatter = FORMATTERS.get(event.get("type"))
+    return formatter(event) if formatter else []
+
+
+def stream_lines(event: dict, raw: str) -> list[str]:
+    """What one JSON line from the agent contributes to the run log.
+
+    The fallback is the whole point. An agent whose events no formatter recognises used
+    to stream a *completely empty* log to the UI while working perfectly — the failure
+    that hides itself at exactly the moment somebody is watching a new agent to see
+    whether it works. A truncated raw line is unlovely and always better than silence.
+
+    A recognised event that produces no lines stays silent, because that is a formatter
+    saying "nothing here worth reading", not an unread event: half of a normal run is
+    tool results nobody needs to see.
+    """
+    if event.get("type") in FORMATTERS:
+        return format_event(event)
+    raw = raw.strip()
+    return [f"[agent] {raw[:RAW_EVENT_MAX]}{'…' if len(raw) > RAW_EVENT_MAX else ''}"]
 
 
 # --------------------------------------------------------------------------- run
@@ -1368,10 +1407,13 @@ async def _stream(
                     # the middle of a log a human reads.
                     manifest = parse_manifest(line)
                     named = str(manifest.get("agent") or "").strip()
+                    # Before a single event is read, which is the only moment an
+                    # adapter can still be chosen.
+                    events = recorder.use(manifest.get("events"))
                     if manifest:
                         log.write(
                             f"[factory] manifest: agent {named or 'unnamed'}, "
-                            f"transcript {transcript_glob(manifest)}"
+                            f"events {events}, transcript {transcript_glob(manifest)}"
                         )
                     else:
                         log.write("[factory] agent manifest unreadable; using defaults")
@@ -1389,10 +1431,14 @@ async def _stream(
                     except json.JSONDecodeError:
                         log.write(line)
                         continue
-                    if event.get("type") == "result":
-                        usage = telemetry_summary(event)
+                    # Asked of every event, because which one carries the run's
+                    # figures is the adapter's business. A null adapter answers `{}`
+                    # to all of them, and the run records no cost rather than a wrong
+                    # one — `_salvage_usage` fills the ledger from rows where there
+                    # are any.
+                    usage = recorder.summary(event) or usage
                     await recorder.feed(event)
-                    for formatted in format_event(event):
+                    for formatted in stream_lines(event, line):
                         log.write(formatted)
                     continue
                 log.write(line)

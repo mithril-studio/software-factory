@@ -84,11 +84,13 @@ editing this layer.
   `FACTORY-MANIFEST {…}` with its newlines stripped. Known keys:
 
       {"agent": "claude", "transcript": "\"$HOME\"/.claude/projects/*/*.jsonl",
-       "telemetry": "claude-code"}
+       "events": "claude-code"}
 
   `agent` is written onto the run row, so a run records what actually ran and not only what
   was asked for. `transcript` is the glob the salvage step reaches for before the VM is
-  reaped. Every key has a default and the whole file may be missing or broken: an
+  reaped. `events` names the telemetry adapter that reads this agent's stream
+  (`telemetry/normalize.py`); a name no adapter answers to records no rows rather than
+  refusing the run. Every key has a default and the whole file may be missing or broken: an
   unparseable manifest is `{}`, and a run whose real work succeeded never fails over one.
 
 The prompt is multi-kilobyte and quotes arbitrarily, so nothing re-quotes it through another

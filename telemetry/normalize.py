@@ -191,6 +191,28 @@ class ClaudeCodeAdapter:
         self._pending.clear()
         return rows
 
+    def summary(self, event: dict) -> dict:
+        """The run-level figures this runtime reports in its final `result` event.
+
+        `{}` for every other event, which is what lets the caller hand the whole stream
+        through here without knowing that Claude Code calls its last event `result` —
+        that knowledge was the last piece of one runtime's vocabulary left in `control`.
+
+        Returned as `runs` column names, so the caller can hand it straight to an update.
+        Kept exactly as the runtime reports them: they are not the same quantity the rows
+        sum to — the runtime bills side calls (title generation and the like) that never
+        surface as assistant events — so the two disagreeing is signal, not a bug. The rows
+        are what the agent did; this is what the runtime charged for.
+        """
+        if not isinstance(event, dict) or event.get("type") != "result":
+            return {}
+        usage = event.get("usage") or {}
+        return {
+            "tokens_in": usage.get("input_tokens"),
+            "tokens_out": usage.get("output_tokens"),
+            "cost_usd": event.get("total_cost_usd"),
+        }
+
     # ------------------------------------------------------------------ internals
 
     def _assistant(self, event: dict) -> list[LlmCall | ToolCall]:
@@ -287,18 +309,47 @@ class ClaudeCodeAdapter:
         return rows
 
 
-def summary(event: dict) -> dict:
-    """The run-level figures the runtime reports in its final `result` event.
+class NullAdapter:
+    """The adapter for a runtime this layer does not understand yet.
 
-    Returned as `runs` column names, so the caller can hand it straight to an update.
-    Kept exactly as the runtime reports them: they are not the same quantity the rows
-    sum to — the runtime bills side calls (title generation and the like) that never
-    surface as assistant events — so the two disagreeing is signal, not a bug. The rows
-    are what the agent did; this is what the runtime charged for.
+    Every method is the empty answer, so a golden carrying an agent nobody has written an
+    adapter for still runs, still streams its log, and still opens its pull request — it
+    simply records no per-call rows and no cost. That is the point: telemetry is a
+    consumer of a run, never a precondition for one, and a missing adapter must degrade to
+    a missing number rather than to a refused dispatch.
+
+    Recording nothing is also the honest answer rather than a lossy one. A run with no
+    adapter reports no cost instead of a wrong cost, and `runner._salvage_usage` fills the
+    ledger from the rows wherever any exist — which, here, is nowhere.
     """
-    usage = event.get("usage") or {}
-    return {
-        "tokens_in": usage.get("input_tokens"),
-        "tokens_out": usage.get("output_tokens"),
-        "cost_usd": event.get("total_cost_usd"),
-    }
+
+    name = "null"
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.turn = 0
+
+    def feed(self, event: dict) -> list[LlmCall | ToolCall]:
+        return []
+
+    def flush(self) -> list[ToolCall]:
+        return []
+
+    def summary(self, event: dict) -> dict:
+        return {}
+
+
+# Every runtime this layer can read, keyed by the `events` string a golden announces in
+# its manifest. One entry per adapter, and adding a runtime is adding a class and a line
+# here — never a change in `control`, which is what §2 of this layer's README promises.
+ADAPTERS = {ClaudeCodeAdapter.name: ClaudeCodeAdapter}
+
+
+def adapter_for(events: str | None, run_id: str):
+    """The adapter for an `events` format, or the null adapter for anything unknown.
+
+    Deliberately total. `events` arrives from a file on a machine we did not build, so
+    every failure to recognise it — a typo, an agent added before its adapter, a manifest
+    that names none at all — resolves to an adapter rather than to an exception.
+    """
+    return ADAPTERS.get((events or "").strip(), NullAdapter)(run_id)

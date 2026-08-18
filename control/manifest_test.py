@@ -25,6 +25,8 @@ import asyncio
 import json
 import sys
 
+from telemetry.normalize import ClaudeCodeAdapter
+
 from control import runner
 from control.runner import (
     CLAUDE_TRANSCRIPT_GLOB,
@@ -48,7 +50,7 @@ def check(name, got, want=True):
 MANIFEST = {
     "agent": "codex",
     "transcript": '"$HOME"/.codex/sessions/*.jsonl',
-    "telemetry": "codex",
+    "events": "codex",
 }
 LINE = f"{MANIFEST_PREFIX} {json.dumps(MANIFEST)}"
 
@@ -147,13 +149,26 @@ class StubBoxd:
 
 
 class StubRecorder:
-    """Stands in for the telemetry recorder, and keeps everything it was fed."""
+    """Stands in for the telemetry recorder, and keeps everything it was fed.
+
+    Its `summary` is the real Claude adapter's, so the usage a run reports is still
+    checked here rather than stubbed into being right.
+    """
 
     fed = []
 
     def __init__(self, run_id):
         StubRecorder.fed = []
         self.dropped = 0
+        self.adapter = ClaudeCodeAdapter(run_id)
+        self.used = []
+
+    def use(self, events):
+        self.used.append(events)
+        return self.adapter.name
+
+    def summary(self, event):
+        return self.adapter.summary(event)
 
     async def feed(self, event):
         StubRecorder.fed.append(event)
