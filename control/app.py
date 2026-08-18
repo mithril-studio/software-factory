@@ -147,20 +147,51 @@ class StartRun(BaseModel):
     repo: str
     issue_number: int
     golden: str | None = None
+    # A review of a pull request a build already opened, rather than a build. Both are runs
+    # on a fork, which is why one endpoint starts either.
+    kind: str = "build"
+    pr_url: str | None = None
+    branch: str | None = None
+    # For a build: which attempt this is, so `VM_SCRIPT` resumes the branch instead of
+    # resetting it to the base and throwing the previous attempt's commits away. For a
+    # review: which review cycle.
+    attempt: int = 1
 
 
 @app.post("/api/runs")
 async def api_start_run(body: StartRun):
+    """Start a run. This is the only supported way to dispatch one by hand.
+
+    It matters that this lives in the serving process: a run is an `asyncio` task holding a
+    VM, so a run started from a throwaway script dies with that script — leaving a machine
+    nobody reaps, a row that says `running` forever, and an issue mirroring a state that
+    stopped being true. Anything that needs to start a run talks to this.
+    """
     gaps = settings.missing()
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
+    repo = body.repo.strip()
+    # A run started by hand forks the same machine the poller would have used, so a manual
+    # dispatch on a watched repo can't land on the wrong repo's golden.
+    golden = body.golden or settings.golden_for(repo)
     try:
-        repo = body.repo.strip()
-        # A run started by hand forks the same machine the poller would have used, so a
-        # manual dispatch on a watched repo can't land on the wrong repo's golden.
-        run_id = await runner.create(
-            repo, body.issue_number, golden=body.golden or settings.golden_for(repo)
-        )
+        if body.kind == "review":
+            if not body.pr_url or not body.branch:
+                raise ValueError("a review needs pr_url and branch")
+            run_id = await runner.create_review(
+                repo,
+                body.issue_number,
+                body.pr_url,
+                body.branch,
+                golden=golden,
+                cycle=body.attempt,
+            )
+        elif body.kind == "build":
+            run_id = await runner.create(
+                repo, body.issue_number, golden=golden, attempt=body.attempt
+            )
+        else:
+            raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not start run: {exc}") from exc
     return {"run_id": run_id}
