@@ -126,7 +126,8 @@ what blocked you. A run that ends with no PR gives the human nothing to look at.
 
 # --------------------------------------------------------------------------- criteria
 
-# The acceptance-criteria block an issue carries, per the factory-compose issue template: a
+# The acceptance-criteria block an issue carries, per the factory-compose issue template
+# (mithril-studio/agent-skills, factory-skills/factory-compose): a
 # fenced yaml list under an "## Acceptance criteria" heading.
 _CRITERIA_BLOCK = re.compile(
     r"^##\s*Acceptance criteria\s*?\n+```ya?ml\n(.*?)^```", re.S | re.M | re.I

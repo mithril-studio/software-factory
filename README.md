@@ -33,6 +33,12 @@ Skills the agent uses live in a separate repo,
 **into the VM**, not onto the server — the agent's code, not the factory's — so they are
 installed when a golden is built rather than deployed with the control plane.
 
+The skill that *fills* this repo's queue lives there too: **`factory-compose`** turns a brief
+into the ordered backlog the factory builds. It is the one skill that runs outside a VM —
+on a laptop, or on the `planner` box over SSH — so it is installed like any other skill
+rather than shipped with a golden. It is not vendored here; there is one copy, in
+agent-skills, because two would drift.
+
 ## Quickstart
 
 ```bash
