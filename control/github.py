@@ -93,6 +93,24 @@ async def find_pr(repo: str, branch: str) -> str | None:
     return data[0]["html_url"] if data else None
 
 
+async def file(repo: str, path: str, ref: str) -> str | None:
+    """Fetch one file's raw contents from `repo` at `ref`. None when it is not there.
+
+    Used for a repo's `.factory.md` profile, which is why a missing file is an ordinary
+    answer rather than an error: most repos will not have one, and the caller has a default.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/contents/{path}",
+            headers={**_headers(), "Accept": "application/vnd.github.raw"},
+            params={"ref": ref},
+            follow_redirects=True,
+        )
+    if resp.status_code != 200:
+        return None
+    return resp.text
+
+
 async def default_branch(repo: str) -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(f"{API}/repos/{repo}", headers=_headers())

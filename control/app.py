@@ -277,7 +277,7 @@ async def api_agents():
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
     out = []
     for m in machines:
-        is_run = m.name.startswith("run-")
+        is_run = runner.is_run_vm(m.name)
         out.append(
             {
                 "name": m.name,

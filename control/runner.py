@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,9 @@ from telemetry.recorder import Recorder
 
 from . import db, github
 from .config import settings
+
+# `log` is the per-run RunLog throughout this file, so the module logger takes another name.
+_log = logging.getLogger("factory.runner")
 
 # The coding agent that runs inside the VM. A constant for now — there is exactly one. It
 # becomes meaningful once a review/PR agent joins and runs need to say which one produced them.
@@ -38,6 +42,20 @@ def semaphore() -> asyncio.Semaphore:
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(settings.max_concurrent)
     return _semaphore
+
+
+# Every VM a run creates is named from its run id with one of these prefixes: `run-` for a
+# build, `rev-` for a review. Reconcile and the fleet view both key off them, so they live
+# here rather than being spelled out at each site — a prefix known to one and not the other
+# is a VM nobody reaps and nobody recognises.
+RUN_PREFIX = "run-"
+REVIEW_PREFIX = "rev-"
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX)
+
+
+def is_run_vm(name: str) -> bool:
+    """True for a machine this factory forked for a run, build or review."""
+    return name.startswith(VM_PREFIXES)
 
 
 def client() -> AsyncBoxd:
@@ -85,25 +103,19 @@ How to work:
    half-way, whatever you pushed is what the next attempt continues from, so small
    commits that build on each other are worth far more than one perfect commit you
    never got to make.
-4. Verify with the repo's fast checks, and only these:
-   npm run lint · npm run typecheck · npm run test · npm run test:integration · npm run build
-   Do NOT run the end-to-end suite (`npm run test:e2e`) and do NOT install browsers —
-   CI runs end-to-end on your pull request, it is not your job here. Do not add a test
-   framework or test runner that isn't already in the repo.
+4. Verify with the repo's own fast checks — the ones named under "This project" below,
+   and only those. Do not add a test framework or test runner that isn't already in the repo.
 5. Record anything durable you learned into `.mem/`, following the memory skill.
 6. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
    referencing the issue in the body so it links (e.g. "Closes #{number}").
 
-Environment notes — this machine is already set up, so setup work is wasted work:
-- Dependencies are installed and the build cache is warm. Do not run `npm ci`, do not
-  delete `node_modules`, and do not clear the build output. Install a package only if the
-  issue genuinely needs a new one.
-- `.env` is correct and read-only. Do not create, copy or modify it, and do not print its
-  contents.
-- The test database is already running, migrated and seeded. Do not start, reset or
-  re-seed it.
+This project — the machine is already set up for it, so setup work is wasted work:
+
+{project_notes}
+
+True of every run here, whatever the project notes say:
 - Run long commands in the foreground with an explicit timeout, e.g.
-  `timeout 600 npm run build`. Do not put work in the background to wait for it later:
+  `timeout 600 <the build command>`. Do not put work in the background to wait for it later:
   background tasks and scheduled wake-ups do not deliver notifications in this
   environment, so a run that waits for one waits forever and dies having produced nothing.
 
@@ -200,11 +212,45 @@ previous attempt log (tail):
 """
 
 
+# The file a watched repo carries to describe itself: how it is verified, what is already
+# installed, what must not be touched. It lives in the repo rather than here because it
+# describes that repo — one project's `npm run test:integration` is another project's
+# nonsense, and a control plane that asserts one project's setup as universal sends every
+# other project's agent to verify something that does not exist.
+PROFILE_PATH = ".factory.md"
+
+# What a repo without a profile gets. Deliberately says nothing specific: a wrong fact costs
+# more than a missing one, because the agent acts on it before it can find out.
+DEFAULT_PROJECT_NOTES = """- Dependencies are installed and any build cache is warm. Do not reinstall them, do not
+  delete the dependency directory, and do not clear build output. Install a package only if
+  the issue genuinely needs a new one.
+- This repo carries no `.factory.md`, so nothing more specific about it is known here. Read
+  its own rules files (`CLAUDE.md`, `AGENTS.md`, `CONTEXT.md`, the README) and `.mem/` to
+  find out how it is built and verified, and run those checks.
+- Do not run an end-to-end or browser suite, and do not install browsers — CI covers that on
+  your pull request."""
+
+
+async def project_notes(repo: str, ref: str) -> str:
+    """The repo's own `.factory.md` at `ref`, or the generic default when it has none.
+
+    Best-effort by design: a GitHub hiccup here must not fail a run that would otherwise
+    work, and the default is a safe thing to say about any repo.
+    """
+    try:
+        text = await github.file(repo, PROFILE_PATH, ref)
+    except Exception:  # noqa: BLE001 - a profile is an improvement, never a precondition
+        _log.exception("could not read %s from %s", PROFILE_PATH, repo)
+        return DEFAULT_PROJECT_NOTES
+    return text.strip() if text and text.strip() else DEFAULT_PROJECT_NOTES
+
+
 def build_prompt(
     repo: str,
     issue: dict,
     branch: str,
     base: str,
+    notes: str = DEFAULT_PROJECT_NOTES,
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
@@ -216,6 +262,7 @@ def build_prompt(
         body=issue["body"] or "(no description given)",
         branch=branch,
         base=base,
+        project_notes=notes,
     )
     if attempt > 1:
         prompt += RETRY_TEMPLATE.format(
@@ -285,8 +332,10 @@ How to check each criterion, by its `mode`:
 - `inspect` — read what `verify` points at and report what you found. This is the one mode that
   cannot block a merge, so be useful rather than cautious: say what is there and what is missing.
 
-Also run the repo's fast checks once — `npm run lint`, `npm run typecheck`, `npm run test`,
-`npm run test:integration`, `npm run build`. Do not run the end-to-end suite; CI covers it.
+Also run the repo's own fast checks once, as described here:
+
+{project_notes}
+
 If any of them fail, that is a finding regardless of the criteria.
 
 Then look for two specific things and report them as findings if present:
@@ -907,7 +956,10 @@ async def _execute(
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
-        prompt = build_prompt(repo, issue, branch, base, attempt, prior_error, prior_log)
+        notes = await project_notes(repo, base)
+        prompt = build_prompt(
+            repo, issue, branch, base, notes, attempt, prior_error, prior_log
+        )
 
         # ---- claim: mirror the pickup onto the issue for anyone watching on GitHub
         which = f" (attempt {attempt} of {settings.max_attempts})" if attempt > 1 else ""
@@ -921,7 +973,7 @@ async def _execute(
 
         # ---- fork
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
-        vm_name = f"run-{run_id[:8]}"
+        vm_name = f"{RUN_PREFIX}{run_id[:8]}"
         log.write(f"[factory] forking {golden} -> {vm_name}")
         source_id = await golden_id(boxd, golden)
         machine = await boxd.machines.fork(
@@ -1058,7 +1110,7 @@ async def _execute_review(
     boxd = client()
     try:
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
-        vm_name = f"rev-{run_id[:8]}"
+        vm_name = f"{REVIEW_PREFIX}{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
         log.write(f"[factory] forking {golden} -> {vm_name}")
         machine = await boxd.machines.fork(
@@ -1077,6 +1129,7 @@ async def _execute_review(
 
         await db.update_run(run_id, status="running")
         prompt = REVIEW_PROMPT_TEMPLATE.format(
+            project_notes=await project_notes(repo, base),
             repo=repo,
             number=number,
             title=issue["title"],
@@ -1372,7 +1425,7 @@ async def reconcile() -> dict:
         active_vms = {r["vm_name"] for r in active if r.get("vm_name")}
 
         orphans = [
-            m for m in machines if m.name.startswith("run-") and m.name not in active_vms
+            m for m in machines if is_run_vm(m.name) and m.name not in active_vms
         ]
         for machine in orphans:
             await boxd.machines.delete(machine.id)
