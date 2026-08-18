@@ -38,7 +38,24 @@ git log --oneline -1
 
 if [ -n "$install" ]; then
   echo "==> $machine: $install"
-  boxd machine exec "$machine" "set -e; cd '$repo_dir'; $install"
+  # Detached, then polled. A foreground `boxd machine exec` that runs for minutes gets its
+  # session torn down ("the shell did not respond within 60s"), which leaves a half-deleted
+  # `node_modules` behind — a golden worse off than the stale one you started with. The
+  # sentinel line is how we learn the exit status of something we are no longer attached to.
+  boxd machine exec "$machine" "
+    cd '$repo_dir'
+    nohup sh -c '{ $install ; } ; echo \"FACTORY-SYNC-EXIT=\$?\"' > /tmp/factory-sync.log 2>&1 < /dev/null &
+    sleep 1
+  " > /dev/null
+
+  while :; do
+    out=$(boxd machine exec "$machine" 'grep -h FACTORY-SYNC-EXIT= /tmp/factory-sync.log || true' 2>/dev/null | tr -dc '0-9A-Z=-')
+    case "$out" in
+      *FACTORY-SYNC-EXIT=0*) echo "==> $machine: install ok"; break ;;
+      *FACTORY-SYNC-EXIT=*)  echo "==> $machine: install FAILED — boxd machine exec $machine 'tail -40 /tmp/factory-sync.log'" >&2; exit 1 ;;
+    esac
+    sleep 15
+  done
 fi
 
 echo "==> $machine: synced"
