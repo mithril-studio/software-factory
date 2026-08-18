@@ -457,13 +457,46 @@ anything on GitHub — writing that file is the entirety of your output.
 """
 
 
-# The setup both dispatch scripts open with: enter the checkout, make git willing to work in a
-# directory it did not create, say who is committing, and get the remote refs. It lives in one
-# constant because both scripts need it identical — a review VM that resolves the branch
-# differently from the build VM that wrote it reviews something nobody built.
+# The setup both dispatch scripts open with: get a checkout of the assigned repo, make git
+# willing to work in a directory it did not create, say who is committing, and get the remote
+# refs. It lives in one constant because both scripts need it identical — a review VM that
+# resolves the branch differently from the build VM that wrote it reviews something nobody
+# built.
+#
+# The run brings its own repo now. A golden used to carry exactly one checkout, which is why a
+# second watched repo needed a second golden; a golden is an *agent* image, and which repo it
+# works on is a property of the run. So this clones — and the warm tier is the same script
+# taking the other branch: a snapshot with the repo already in place skips the clone, which is
+# all "warm" has ever meant.
+#
+# `--filter=blob:none` rather than `--depth 1`: reviews need real ancestry (they diff against
+# a merge base) and agents run `git log`, but the file contents of history nobody reads can be
+# fetched on demand.
 PRELUDE = r"""
-cd "$FACTORY_REPO_DIR" || { echo "FACTORY: repo dir $FACTORY_REPO_DIR not found" >&2; exit 90; }
-git config --global --add safe.directory "$FACTORY_REPO_DIR" 2>/dev/null || true
+[ -n "$FACTORY_REPO" ] || { echo "FACTORY: no repo assigned" >&2; exit 90; }
+workdir="${FACTORY_WORKDIR:-$HOME/work}"
+dir="$workdir/${FACTORY_REPO##*/}"
+
+# The pre-clone override, kept for one release: a golden built the old way holds its single
+# checkout at FACTORY_REPO_DIR. Taken only when it really is a checkout of the assigned repo,
+# because the alternative — working in whatever repo that directory happens to hold — is a run
+# that pushes one repo's branch into another.
+if [ -n "$FACTORY_REPO_DIR" ] && [ -d "$FACTORY_REPO_DIR/.git" ] && \
+   git -C "$FACTORY_REPO_DIR" remote get-url origin 2>/dev/null | grep -qi "$FACTORY_REPO"; then
+  dir="$FACTORY_REPO_DIR"
+fi
+
+if [ -d "$dir/.git" ]; then
+  echo "FACTORY: reusing the checkout at $dir"
+else
+  echo "FACTORY: cloning $FACTORY_REPO into $dir"
+  mkdir -p "$workdir" || { echo "FACTORY: cannot create $workdir" >&2; exit 90; }
+  gh repo clone "$FACTORY_REPO" "$dir" -- --filter=blob:none \
+    || { echo "FACTORY: clone of $FACTORY_REPO failed" >&2; exit 90; }
+fi
+
+cd "$dir" || { echo "FACTORY: workspace unusable: $dir" >&2; exit 90; }
+git config --global --add safe.directory "$dir" 2>/dev/null || true
 git config user.name  "software-factory" 2>/dev/null || true
 git config user.email "factory@users.noreply.github.com" 2>/dev/null || true
 echo "FACTORY: fetching origin"
@@ -481,12 +514,24 @@ git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
 # working tree, so it has to run after each script has checked its own branch out. Read the pin
 # before the checkout and you assert against whatever commit the machine happened to be sitting
 # on, which is exactly the stale answer this guard exists to catch.
+#
+# It repairs before it refuses. A golden pre-matched to one repo's pin was possible while a
+# golden carried one repo; an agent image serves every repo the deployment watches, and they do
+# not agree on a Node version. So the mismatch is now ordinary and the fix is to install what
+# the repo asks for. Only a mismatch that survives the install is fatal — and the old advice,
+# "the golden needs rebuilding", is no longer the right sentence for it.
 NODE_GUARD = r"""
 if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
   want=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
   have=$(node -v | tr -d 'v' | cut -d. -f1)
+  if [ -n "$want" ] && [ "$want" != "$have" ] && command -v fnm > /dev/null 2>&1; then
+    echo "FACTORY: node $have is not the pinned $want; installing it"
+    eval "$(fnm env 2>/dev/null)" 2>/dev/null || true
+    fnm use --install-if-missing > /dev/null 2>&1 || true
+    have=$(node -v | tr -d 'v' | cut -d. -f1)
+  fi
   if [ -n "$want" ] && [ "$want" != "$have" ]; then
-    echo "FACTORY: this machine runs node $have but .nvmrc pins $want — the golden needs rebuilding" >&2
+    echo "FACTORY: node $have does not match the pinned $want and could not be repaired" >&2
     exit 93
   fi
 fi
@@ -517,6 +562,67 @@ command -v factory-agent >/dev/null 2>&1 || { claude -p "$FACTORY_PROMPT" \
 echo "FACTORY-MANIFEST $(tr -d '\n' < /etc/factory/agent.json 2>/dev/null)"
 exec factory-agent
 """
+
+
+def dispatch_env(
+    repo: str,
+    branch: str,
+    base: str,
+    prompt: str,
+    run_id: str,
+    number: int,
+    vm_name: str,
+    attempt: int | None = None,
+    kind: str = "build",
+) -> dict:
+    """Everything a run VM is told, for either kind of run.
+
+    One builder because the two paths must agree: a review VM that clones a different repo,
+    or authenticates as somebody else, than the build VM whose work it is checking is not
+    reviewing that work. The differences between them are the two arguments — a build run
+    counts attempts, a review run labels itself in the trace — and everything else is shared
+    by construction rather than by two people remembering to edit both.
+
+    `GH_TOKEN` is the control plane's own durable credential and covers the clone, the push
+    and `gh pr create` from one source. The golden's `gh` login stays as the fallback for a
+    deployment that has not set one, which is why an empty token is left out entirely rather
+    than exported as an empty string that would shadow it.
+    """
+    env = {
+        # Which repo this run is for. The golden no longer knows.
+        "FACTORY_REPO": repo,
+        "FACTORY_WORKDIR": settings.workdir,
+        # The pre-clone override, honoured only when it holds this repo. See PRELUDE.
+        "FACTORY_REPO_DIR": settings.repo_dir,
+        "FACTORY_BRANCH": branch,
+        "FACTORY_BASE": base,
+        "FACTORY_PROMPT": prompt,
+        "FACTORY_AGENT_EFFORT": settings.agent_effort,
+        # How long a single shell command may run before the agent's own tooling moves it to
+        # the background. The default (120s) is shorter than an ordinary build or test run
+        # here, and a backgrounded command is what the agent then waits on forever — in
+        # headless mode (`claude --print`) there is no loop to deliver the notification it
+        # expects. Generous values keep everything legitimate in the foreground; a genuinely
+        # stuck command is bounded by FACTORY_RUN_TIMEOUT.
+        "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
+        "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
+        # Correlation key: every run carries its id so traces can attach without changing
+        # the dispatch contract later.
+        "OTEL_RESOURCE_ATTRIBUTES": (
+            f"run.id={run_id},issue={repo}#{number},repo={repo},vm={vm_name}"
+            + (",kind=review" if kind == "review" else "")
+        ),
+    }
+    if attempt is not None:
+        env["FACTORY_ATTEMPT"] = str(attempt)
+    if settings.github_token:
+        env["GH_TOKEN"] = settings.github_token
+    # Durable auth for the agent itself, overriding the golden's expiring OAuth.
+    if settings.anthropic_api_key:
+        env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+    if settings.claude_code_oauth_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
+    return env
 
 
 # --------------------------------------------------------------------------- manifest
@@ -1168,32 +1274,16 @@ async def _execute(
 
         # ---- run the agent
         await db.update_run(run_id, status="running")
-        env = {
-            "FACTORY_REPO_DIR": settings.repo_dir,
-            "FACTORY_BRANCH": branch,
-            "FACTORY_BASE": base,
-            "FACTORY_ATTEMPT": str(attempt),
-            "FACTORY_PROMPT": prompt,
-            "FACTORY_AGENT_EFFORT": settings.agent_effort,
-            # How long a single shell command may run before the agent's own tooling moves
-            # it to the background. The default (120s) is shorter than an ordinary build or
-            # test run here, and a backgrounded command is what the agent then waits on
-            # forever — in headless mode (`claude --print`) there is no loop to deliver the
-            # notification it expects. Generous values keep everything legitimate in the
-            # foreground; a genuinely stuck command is bounded by FACTORY_RUN_TIMEOUT.
-            "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
-            "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
-            # Correlation key. Telemetry is not wired yet, but every run carries its id
-            # so traces can attach without changing the dispatch contract later.
-            "OTEL_RESOURCE_ATTRIBUTES": (
-                f"run.id={run_id},issue={repo}#{issue['number']},repo={repo},vm={machine.name}"
-            ),
-        }
-        # Durable auth for the agent's `claude`, overriding the golden's expiring OAuth.
-        if settings.anthropic_api_key:
-            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-        if settings.claude_code_oauth_token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
+        env = dispatch_env(
+            repo=repo,
+            branch=branch,
+            base=base,
+            prompt=prompt,
+            run_id=run_id,
+            number=number,
+            vm_name=machine.name,
+            attempt=attempt,
+        )
         exit_code, usage, manifest = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log, run_id), timeout=settings.run_timeout
         )
@@ -1314,22 +1404,16 @@ async def _execute_review(
             criteria=yaml.safe_dump(criteria, sort_keys=False, allow_unicode=True),
             body=issue.get("body") or "(no description given)",
         )
-        env = {
-            "FACTORY_REPO_DIR": settings.repo_dir,
-            "FACTORY_BRANCH": branch,
-            "FACTORY_BASE": base,
-            "FACTORY_PROMPT": prompt,
-            "FACTORY_AGENT_EFFORT": settings.agent_effort,
-            "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
-            "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
-            "OTEL_RESOURCE_ATTRIBUTES": (
-                f"run.id={run_id},issue={repo}#{number},repo={repo},vm={machine.name},kind=review"
-            ),
-        }
-        if settings.anthropic_api_key:
-            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-        if settings.claude_code_oauth_token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
+        env = dispatch_env(
+            repo=repo,
+            branch=branch,
+            base=base,
+            prompt=prompt,
+            run_id=run_id,
+            number=number,
+            vm_name=machine.name,
+            kind="review",
+        )
 
         exit_code, usage, manifest = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log, run_id, script=REVIEW_SCRIPT),

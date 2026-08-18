@@ -85,7 +85,8 @@ that layer existed:
 
 1. Fetch the issue from GitHub
 2. Fork the golden VM (~0.2s), with idle-suspend disabled and a self-destruct timer set
-3. `git fetch` and check out `factory/issue-<n>` from the default branch
+3. Clone the assigned repo (or reuse a checkout the golden already has), then `git fetch` and
+   check out `factory/issue-<n>` from the default branch
 4. Run `claude -p` with the issue as the prompt, streaming its event log back live
 5. Look for the PR the agent opened; salvage the session transcript
 6. Destroy the VM
@@ -97,8 +98,11 @@ possible: fleet state lives in a table, not in an agent's context window.
 
 Every run forks one long-lived machine. It must have:
 
-- the repo cloned at `FACTORY_REPO_DIR` with a working `origin` remote
-- dependencies installed
+- `git`, `gh` and the language toolchains the watched repos need — but *not* a repo: a golden
+  is an agent image, and each run clones the repo it was assigned into `$HOME/work/<name>`
+  (`FACTORY_WORKDIR` moves that). A per-repo golden may still carry a warm checkout there,
+  which the run reuses instead of cloning
+- dependencies installed, for the repo a warm golden was built for
 - `claude` authenticated (inherited by every fork — this credential expires, so re-auth and
   re-snapshot on a schedule)
 - `gh` authenticated with push access to the repo

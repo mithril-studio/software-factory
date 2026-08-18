@@ -91,6 +91,12 @@ def unknown_agent(name: str, available: Iterable[str] = ()) -> str | None:
 class Settings:
     boxd_api_key: str = os.environ.get("BOXD_API_KEY", "")
     github_token: str = _github_token()
+    # Where a run puts the checkout it clones. Empty means "let the VM decide", which is
+    # `$HOME/work` — the golden knows its own home directory and the control plane does not.
+    workdir: str = os.environ.get("FACTORY_WORKDIR", "")
+    # A pre-clone checkout to reuse instead of cloning, honoured only when it holds the repo
+    # the run was assigned. Goldens built before they became repo-agnostic carry exactly one
+    # checkout at this path; it is the rollback for that migration and goes away with it.
     repo_dir: str = os.environ.get("FACTORY_REPO_DIR", "/home/boxd/repo")
     max_concurrent: int = int(os.environ.get("FACTORY_MAX_CONCURRENT", "3"))
     # Hard ceiling on one agent run. Observed successful runs took 27-53 minutes, so 60

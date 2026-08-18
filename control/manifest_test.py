@@ -249,9 +249,14 @@ for name, script in (("build", VM_SCRIPT), ("review", REVIEW_SCRIPT)):
     check(f"{name}: keeps one pre-wrapper fallback", script.count("command -v factory-agent"), 1)
     check(f"{name}: the fallback exits with the agent's own status", "; exit $?; }" in script)
     # The prompt is multi-kilobyte and contains arbitrary quoting, so nothing may re-quote
-    # it through another shell — an executable on PATH is what makes that impossible.
-    check(f"{name}: the manifest is never parsed or re-quoted in shell",
-          [bad for bad in ("eval", "jq ", "sh -c") if bad in script], [])
+    # it through another shell — an executable on PATH is what makes that impossible. The
+    # manifest itself is only ever echoed: never read into a variable, never parsed, never
+    # turned into a command.
+    check(f"{name}: the manifest is only echoed, never parsed",
+          [ln.strip() for ln in script.splitlines() if "agent.json" in ln],
+          ['echo "FACTORY-MANIFEST $(tr -d \'\\n\' < /etc/factory/agent.json 2>/dev/null)"'])
+    check(f"{name}: the prompt is never handed to another shell",
+          [ln for ln in script.splitlines() if "$FACTORY_PROMPT" in ln and "claude -p" not in ln], [])
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
