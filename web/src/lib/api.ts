@@ -10,6 +10,8 @@ export type Run = {
   branch: string | null
   status: string
   attempt: number | null
+  kind: string
+  verdict: string | null
   agent: string | null
   tokens_in: number | null
   tokens_out: number | null
@@ -21,6 +23,16 @@ export type Run = {
   created_at: string
   started_at: string | null
   finished_at: string | null
+}
+
+// A run's `status` is the *process* outcome — did the agent complete — which is not the same
+// question as whether the result was good. A reviewer that runs cleanly and rejects the pull
+// request records `succeeded` with the reason in `error`, so in the runs list a rejected
+// review was indistinguishable from an approved one: both green. Fold the verdict back in
+// here rather than at each call site, so the list and the detail page cannot disagree.
+export function runOutcome(r: Run): string {
+  if (r.kind === "review" && r.status === "succeeded" && r.error) return "changes requested"
+  return r.status
 }
 
 export type PlanIssue = {
