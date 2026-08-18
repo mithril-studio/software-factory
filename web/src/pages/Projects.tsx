@@ -10,8 +10,9 @@ function gitUrl(repo: string): string {
 
 /** What the last sweep found on the machine this repo's runs fork.
  *
- * The warm golden is what the prompt promises the agent ("dependencies are installed, do not
- * reinstall"), so drift here is a promise going quietly false — worth a badge, not a footnote.
+ * The prompt promises the agent nothing about this any more — it installs once, every run. So
+ * drift here is not a broken promise, it is minutes added to every run on this repo, which is
+ * the kind of cost that hides unless something shows it.
  */
 function Freshness({ p }: { p: Project }) {
   if (p.golden_error) return <Badge variant="bad">{p.golden_error}</Badge>

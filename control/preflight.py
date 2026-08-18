@@ -16,6 +16,7 @@ its own first sight of a repo anyway.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from dataclasses import dataclass
 
@@ -136,6 +137,41 @@ async def _vm_checks(repo: str, golden: str, repo_dir: str, base: str) -> list[C
     return checks
 
 
+# A `## Setup` heading in the profile, at any level. What follows it is the command the
+# prompt now tells the agent to run before it touches any code; nothing here reads that
+# command, only whether the repo bothered to name one.
+SETUP_SECTION = re.compile(r"^#{1,6}\s*set[ -]?up\b", re.I | re.M)
+
+
+def profile_checks(profile: str | None) -> list[Check]:
+    """What the repo's `.factory.md` says, and the one thing it most needs to say.
+
+    Both findings are warnings, deliberately. A repo with no profile still builds and a
+    profile with no setup section still helps; what they cost is turns, not the run — the
+    agent works the install out from the lock file instead of being told. Blocking on it
+    would stop onboarding over something no run needs.
+    """
+    text = (profile or "").strip()
+    if not text:
+        return [
+            Check(
+                f"has {runner.PROFILE_PATH}",
+                False,
+                "the agent gets a generic default without it",
+                fatal=False,
+            )
+        ]
+    return [
+        Check(f"has {runner.PROFILE_PATH}", True, f"{len(text)} characters"),
+        Check(
+            f"{runner.PROFILE_PATH} names a setup command",
+            bool(SETUP_SECTION.search(text)),
+            "no `## Setup` section, so every run guesses how to install this repo",
+            fatal=False,
+        ),
+    ]
+
+
 async def _repo_checks(repo: str, base: str) -> list[Check]:
     """What only GitHub can answer."""
     info = await github.repo_info(repo)
@@ -159,15 +195,7 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
             fatal=settings.merge_require_checks and settings.auto_merge,
         )
     )
-    profile = await github.file(repo, runner.PROFILE_PATH, base)
-    checks.append(
-        Check(
-            f"has {runner.PROFILE_PATH}",
-            bool(profile and profile.strip()),
-            "the agent gets a generic default without it",
-            fatal=False,
-        )
-    )
+    checks.extend(profile_checks(await github.file(repo, runner.PROFILE_PATH, base)))
     try:
         await github.ensure_labels(repo)
         checks.append(Check("lifecycle labels", True, "present or created"))

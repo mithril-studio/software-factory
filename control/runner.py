@@ -161,25 +161,31 @@ Issue #{number}: {title}
 How to work:
 1. Load the `memory` skill first and prime yourself from `.mem/` if it exists. What past
    runs learned about this repo is the most valuable context you have.
-2. Make the change. Stay in scope: resolve this issue, nothing more.
+2. Install this project's dependencies, before you touch any code. Run the setup command
+   named under "This project" below, in the foreground, with an explicit timeout — e.g.
+   `timeout 900 <the setup command>`. Run it **once**: if it worked, a second install spends
+   minutes of wall clock arriving where you already are, and if it failed, read the error and
+   fix that rather than run the same command again.
+3. Make the change. Stay in scope: resolve this issue, nothing more.
    If the issue carries an `## Acceptance criteria` block, that is the contract. Every
    criterion must be true when you are done, and a reviewing agent will afterwards run each
    one rather than take your word for it. For `mode: test` criteria, write the test at the
    path given in `verify`, and make sure it **fails before your change and passes after** —
    a test that passes either way proves nothing and will be rejected.
-3. Commit and push as you go — after each meaningful step, not once at the end:
+4. Commit and push as you go — after each meaningful step, not once at the end:
    git add -A && git commit -m "<message>" && git push -u origin {branch}
    The branch is what survives; this VM is destroyed when you exit. If this run dies
    half-way, whatever you pushed is what the next attempt continues from, so small
    commits that build on each other are worth far more than one perfect commit you
    never got to make.
-4. Verify with the repo's own fast checks — the ones named under "This project" below,
+5. Verify with the repo's own fast checks — the ones named under "This project" below,
    and only those. Do not add a test framework or test runner that isn't already in the repo.
-5. Record anything durable you learned into `.mem/`, following the memory skill.
-6. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
+6. Record anything durable you learned into `.mem/`, following the memory skill.
+7. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
    referencing the issue in the body so it links (e.g. "Closes #{number}").
 
-This project — the machine is already set up for it, so setup work is wasted work:
+This project — the package manager's download caches on this machine are warm, so installing
+is fast, but nothing is installed for this repo yet:
 
 {project_notes}
 
@@ -283,8 +289,8 @@ previous attempt log (tail):
 """
 
 
-# The file a watched repo carries to describe itself: how it is verified, what is already
-# installed, what must not be touched. It lives in the repo rather than here because it
+# The file a watched repo carries to describe itself: how it is set up, how it is verified,
+# what must not be touched. It lives in the repo rather than here because it
 # describes that repo — one project's `npm run test:integration` is another project's
 # nonsense, and a control plane that asserts one project's setup as universal sends every
 # other project's agent to verify something that does not exist.
@@ -292,9 +298,13 @@ PROFILE_PATH = ".factory.md"
 
 # What a repo without a profile gets. Deliberately says nothing specific: a wrong fact costs
 # more than a missing one, because the agent acts on it before it can find out.
-DEFAULT_PROJECT_NOTES = """- Dependencies are installed and any build cache is warm. Do not reinstall them, do not
-  delete the dependency directory, and do not clear build output. Install a package only if
-  the issue genuinely needs a new one.
+DEFAULT_PROJECT_NOTES = """- Nothing is installed for this repo yet. Work out the package manager from the lock file
+  at the root and run its frozen-lockfile install once — `package-lock.json` -> `npm ci`,
+  `pnpm-lock.yaml` -> `pnpm install --frozen-lockfile`, `yarn.lock` -> `yarn install
+  --immutable`, `uv.lock` -> `uv sync --frozen`, `poetry.lock` -> `poetry install --sync`,
+  `Cargo.lock` -> `cargo fetch`, `go.sum` -> `go mod download`. Frozen, so the install is the
+  one the lock file describes and your run does not silently upgrade the project. Do not
+  delete or regenerate a lock file, and do not add a package the issue does not need.
 - This repo carries no `.factory.md`, so nothing more specific about it is known here. Read
   its own rules files (`CLAUDE.md`, `AGENTS.md`, `CONTEXT.md`, the README) and `.mem/` to
   find out how it is built and verified, and run those checks.

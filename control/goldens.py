@@ -1,10 +1,11 @@
 """Watch the machines runs fork from, so staleness is visible instead of discovered.
 
-A golden is warm on purpose: its dependencies are installed and its build cache is hot, and
-the prompt tells the agent so — "do not reinstall, do not clear the build output". That
-instruction is only true while the install still matches the repo. Nothing keeps it true, and
-nothing said when it stopped being true. With one golden that is a chore somebody remembers;
-with one per repo it is the thing that caps how many repos the factory can carry.
+A per-repo golden is warm on purpose: it carries that repo's checkout with its dependencies
+already installed. That warmth is only warmth while the install still matches the repo, and
+nothing keeps it true or says when it stopped. The prompt no longer promises the agent any of
+it — it says the download caches are warm and sends the run to install once — so a stale
+golden costs a run minutes rather than sending it to build against the wrong tree. Minutes
+per run, across every repo, is still what caps how many repos the factory can carry.
 
 This sweep **observes**. It does not reset the checkout and does not install anything: a run
 already checks its own branch out from `origin/<base>`, so the *code* on a golden is never
@@ -12,7 +13,7 @@ what goes stale — the *install* is, and how to redo that is project-specific (
 sync`, something else). Guessing it here is how a control plane that contains no intelligence
 starts containing some. What the sweep does instead is name the drift, including whether a
 dependency manifest moved, so a human knows a golden needs rebuilding rather than finding out
-from a run that installs 900 packages it was promised it already had.
+from a run that quietly reinstalls 900 packages on every attempt.
 """
 
 from __future__ import annotations
