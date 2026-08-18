@@ -1206,10 +1206,12 @@ async def _execute_review(
                     f"--- failing check log ---\n{ci_log}"
                 ),
                 going_back=(
-                    f"Review passed, but CI is red ({ci_failure}). Fixing. {pr_url}"
+                    f"Review passed, but CI is red ({merge_attempt.ci_failure}). "
+                    f"Fixing. {pr_url}"
                 ),
                 giving_up=(
-                    f"Review passed, but CI is still red after {cycle} cycles ({ci_failure}).\n\n"
+                    f"Review passed, but CI is still red after {cycle} cycles "
+                    f"({merge_attempt.ci_failure}).\n\n"
                     f"Stopping — needs a human. {pr_url}"
                 ),
             )
