@@ -122,6 +122,45 @@ def resolve_agent(
     return found[0] if len(found) == 1 else None
 
 
+def api_rows(known: dict[str, dict], default: str = DEFAULT_AGENT) -> list[dict]:
+    """One row per discovered golden snapshot, for the fleet page.
+
+    `known` is `db.agents()` — what the refresh loop last saw, which is the only registry
+    there is. Shaped here rather than in the endpoint because it is a pure function over
+    rows and a name, and everything about the golden naming contract is testable without a
+    database, a fleet or a clock.
+
+    The default is marked rather than filtered: a deployment wants to see the agent a repo
+    that names none will get, sitting in the same list as the ones that were asked for.
+    Rows whose name is not a golden are dropped — the table is keyed on snapshot names and a
+    row that cannot be parsed as one is a row the refresh should never have written.
+    """
+    out = []
+    for name, row in (known or {}).items():
+        parsed = parse_golden(name)
+        if not parsed:
+            continue
+        agent = row.get("agent") or parsed[0]
+        out.append(
+            {
+                "agent": agent,
+                "snapshot": name,
+                "version": row.get("version") or None,
+                "events": row.get("events") or None,
+                "agent_version": row.get("agent_version") or None,
+                # From the runs, not from a probe: `ok` is what the last run on this snapshot
+                # did, and `verified_at` is when one last finished on it having produced
+                # usage. Null `verified_at` is unproven, not broken.
+                "ok": bool(row.get("ok")),
+                "error": row.get("error") or None,
+                "verified_at": row.get("verified_at") or None,
+                "default": agent == (default or "").strip(),
+            }
+        )
+    out.sort(key=lambda r: (not r["default"], r["agent"], r["snapshot"]))
+    return out
+
+
 _cache: tuple[float, tuple[str, ...]] | None = None
 _versions: dict[str, str] = {}
 

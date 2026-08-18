@@ -6,7 +6,7 @@ import { Runs } from "@/pages/Runs"
 import { RunDetail } from "@/pages/RunDetail"
 import { Plan } from "@/pages/Plan"
 import { Projects } from "@/pages/Projects"
-import { Agents } from "@/pages/Agents"
+import { Machines } from "@/pages/Machines"
 import { Telemetry } from "@/pages/Telemetry"
 import { checkAuth } from "@/lib/api"
 
@@ -36,7 +36,7 @@ const router = createBrowserRouter([
       { path: "/runs/:runId", element: <RunDetail /> },
       { path: "/plan", element: <Plan /> },
       { path: "/projects", element: <Projects /> },
-      { path: "/agents", element: <Agents /> },
+      { path: "/agents", element: <Machines /> },
       { path: "/telemetry", element: <Telemetry /> },
     ],
   },

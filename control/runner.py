@@ -53,6 +53,22 @@ def is_run_vm(name: str) -> bool:
     return name.startswith(VM_PREFIXES)
 
 
+def vm_role(name: str) -> str:
+    """What a machine in the fleet is: `run`, `review`, or `other`.
+
+    Read off the same prefixes `is_run_vm` sweeps on, so the fleet view and the reaper can
+    never disagree about what belongs to the factory. `other` covers everything the factory
+    did not create — a control plane, somebody's scratch machine — and, now that goldens are
+    snapshots, it is where a golden still held as a machine shows up: a rollback artefact
+    rather than a category.
+    """
+    if name.startswith(REVIEW_PREFIX):
+        return "review"
+    if name.startswith(RUN_PREFIX):
+        return "run"
+    return "other"
+
+
 def client() -> AsyncBoxd:
     return AsyncBoxd(api_key=settings.boxd_api_key)
 

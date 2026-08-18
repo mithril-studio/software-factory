@@ -50,6 +50,9 @@ export type Project = {
   agent: string
   /** The snapshot that agent actually boots for this repo. */
   golden: string
+  /** True when that snapshot is this repo's own warm tier rather than the bare agent image.
+   *  A speed-up only — every run installs the repo for itself either way. */
+  warm: boolean
   runs: number
   succeeded: number
   failed: number
@@ -57,15 +60,37 @@ export type Project = {
   last_run: string | null
 }
 
+/** A golden snapshot the factory can dispatch onto, as the refresh loop last saw it.
+ *
+ *  Not a machine. Goldens stopped being machines when they became snapshots, which is why
+ *  this and `Machine` are two types served from two endpoints instead of one list that could
+ *  answer neither question fully. */
 export type Agent = {
+  agent: string
+  snapshot: string
+  version: string | null
+  /** The telemetry adapter this golden's stream is read with, from its manifest. */
+  events: string | null
+  agent_version: string | null
+  /** What the last run on this snapshot did. False with no error means no run has used it. */
+  ok: boolean
+  error: string | null
+  /** When a run last finished on it having produced usage — the only proof its credentials
+   *  still work. Null means unproven, not broken. */
+  verified_at: string | null
+  /** True when this is the agent a repo that names none of its own gets. */
+  default: boolean
+}
+
+/** A boxd machine in the fleet. */
+export type Machine = {
   name: string
   status: string | null
-  role: "golden" | "run"
-  is_golden: boolean
+  /** From the VM name prefixes the reaper sweeps on. `other` is anything the factory did not
+   *  create — including a golden still held as a machine, which is now a rollback artefact. */
+  role: "run" | "review" | "other"
+  /** A run VM with no run behind it any more. What Reconcile reaps. */
   orphan: boolean
-  /** When a run last finished on this golden having produced usage — the only proof its
-   *  credentials still work. Null means no run has proved it yet, not that it is broken. */
-  verified_at: string | null
 }
 
 export type Config = {

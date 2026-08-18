@@ -283,9 +283,12 @@ FastAPI — one deployable, at the cost of a `vite build` step. It reads the JSO
   one that has hung.
 - **Plan** — open issues across watched repos with their factory state, in the order the
   poller works them.
-- **Projects** — watched repos with run tallies.
-- **Agents** — the boxd fleet: the golden runs fork from, live run VMs, orphans flagged, with
-  a reconcile button.
+- **Projects** — watched repos with run tallies, the agent each one dispatches to, and
+  whether that agent has a warm snapshot for it.
+- **Agents** — two tables, because they stopped being one question when goldens became
+  snapshots. What the factory *can run*: every golden snapshot (`/api/agents`), its version,
+  its telemetry adapter, and whether a run has ever proved its credentials. What *is* running:
+  the boxd machines (`/api/machines`), by role, orphans flagged, with a reconcile button.
 - **Telemetry** — where the money and the time go: cost by token class (cache reads are most
   of the bill), spend by day, tools by wall time, and cost per shipped issue against spend on
   runs that shipped nothing.
