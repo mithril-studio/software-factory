@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import auth, db, github, goldens, poller, preflight, runner
+from . import agents, auth, config, db, github, goldens, poller, preflight, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -89,18 +89,44 @@ async def api_me(request: Request):
 # --------------------------------------------------------------------------- config
 
 
+async def _available() -> tuple[str, ...]:
+    """Golden snapshot names in the fleet, or nothing if the fleet cannot be reached.
+
+    Best-effort on purpose: this backs advice, and a boxd outage should degrade the advice
+    rather than take the API down with it.
+    """
+    boxd = runner.client()
+    try:
+        return await agents.available(boxd)
+    except Exception:  # noqa: BLE001 - no credentials, no network: report nothing found
+        return ()
+    finally:
+        await boxd.close()
+
+
 @app.get("/api/config")
 async def api_config():
-    """What the shell needs: watched repos, the golden, limits, and any missing settings."""
+    """What the shell needs: watched repos and their agents, limits, and what is wrong.
+
+    Two kinds of wrong, kept apart. `missing` is a setting nobody filled in; `problems` is a
+    configuration that is complete but has nothing to run on — an agent with no snapshot yet.
+    The second question needs the fleet, which is why it lives here (async) and not in
+    `settings.missing()`, which is synchronous and gates starting a run.
+    """
+    available = await _available()
     return {
         "repos": list(settings.repos),
-        "golden": settings.golden,
-        "watched": [{"repo": r, "golden": g} for r, g in settings.watched],
+        "watched": [
+            {"repo": repo, "agent": settings.agent_for(repo)} for repo, _ in settings.watched
+        ],
+        "agents": list(agents.discover(available)),
+        "agent_default": settings.agent_default,
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
         "poll_interval": settings.poll_interval,
         "missing": settings.missing(),
+        "problems": settings.problems(available),
     }
 
 
@@ -146,7 +172,7 @@ async def api_telemetry():
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    golden: str | None = None
+    agent: str | None = None
     # A review of a pull request a build already opened, rather than a build. Both are runs
     # on a fork, which is why one endpoint starts either.
     kind: str = "build"
@@ -171,9 +197,13 @@ async def api_start_run(body: StartRun):
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
     repo = body.repo.strip()
-    # A run started by hand forks the same machine the poller would have used, so a manual
-    # dispatch on a watched repo can't land on the wrong repo's golden.
-    golden = body.golden or settings.golden_for(repo)
+    if body.agent:
+        # Validated against the snapshots that exist, because this is the one place a typo
+        # should be loud: quietly running somebody's issue on a different agent than they
+        # asked for is worse than refusing to start.
+        wrong = config.unknown_agent(body.agent, await _available())
+        if wrong:
+            raise HTTPException(400, wrong)
     try:
         if body.kind == "review":
             if not body.pr_url or not body.branch:
@@ -183,12 +213,12 @@ async def api_start_run(body: StartRun):
                 body.issue_number,
                 body.pr_url,
                 body.branch,
-                golden=golden,
+                agent=body.agent,
                 cycle=body.attempt,
             )
         elif body.kind == "build":
             run_id = await runner.create(
-                repo, body.issue_number, golden=golden, attempt=body.attempt
+                repo, body.issue_number, agent=body.agent, attempt=body.attempt
             )
         else:
             raise ValueError(f"unknown run kind {body.kind!r}")
@@ -303,13 +333,25 @@ async def api_projects():
     """Watched repos with their run tallies, and how fresh the machine they fork is."""
     stats = await db.stats_by_repo()
     fresh = await db.goldens()
+    # `watched` names an agent, not a machine, so the golden is derived the same way a
+    # dispatch derives it — otherwise this column reports an agent and the sweep's rows,
+    # which are keyed by snapshot, never match it.
+    boxd = runner.client()
+    try:
+        sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
+    except Exception:  # noqa: BLE001 - a boxd outage costs a column, not the page
+        sources = {}
+    finally:
+        await boxd.close()
     out = []
-    for repo, golden in settings.watched:
+    for repo, _ in settings.watched:
+        golden = sources.get(repo, "")
         s = stats.get(repo, {})
         g = fresh.get(golden) or {}
         out.append(
             {
                 "repo": repo,
+                "agent": settings.agent_for(repo),
                 "golden": golden,
                 # What the last sweep saw. Absent until the first one has run.
                 "golden_checked_at": g.get("checked_at"),
@@ -331,7 +373,7 @@ async def api_projects():
 
 @app.get("/api/agents")
 async def api_agents():
-    """Boxd machines: the golden(s) runs fork from, and any live run VMs."""
+    """Boxd machines: any golden still held as one, plus the live run VMs."""
     boxd = runner.client()
     try:
         machines = await boxd.machines.list()
@@ -347,7 +389,7 @@ async def api_agents():
                 "name": m.name,
                 "status": getattr(m, "status", None),
                 "role": "run" if is_run else "golden",
-                "is_golden": m.name in settings.goldens,
+                "is_golden": agents.parse_golden(m.name) is not None,
                 "behind": (fresh.get(m.name) or {}).get("behind"),
                 "stale_deps": (fresh.get(m.name) or {}).get("stale_deps") or None,
                 "orphan": is_run and m.name not in active,

@@ -46,6 +46,9 @@ export type PlanIssue = {
 
 export type Project = {
   repo: string
+  /** The agent that takes this repo's issues. */
+  agent: string
+  /** The snapshot that agent actually boots for this repo. */
   golden: string
   golden_checked_at: string | null
   golden_behind: number | null
@@ -70,12 +73,19 @@ export type Agent = {
 
 export type Config = {
   repos: string[]
-  golden: string
+  /** Each watched repo with the agent that takes its issues. */
+  watched: { repo: string; agent: string }[]
+  /** Every agent the snapshot fleet can name. */
+  agents: string[]
+  agent_default: string
   max_concurrent: number
   max_attempts: number
   poll_enabled: boolean
   poll_interval: number
+  /** A setting nobody filled in. Blocks starting a run. */
   missing: string[]
+  /** A complete configuration with nothing to run on — an agent with no snapshot yet. */
+  problems: string[]
 }
 
 /** Cost split by token class. Cache reads dominate real runs — that is the finding

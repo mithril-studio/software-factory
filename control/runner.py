@@ -21,15 +21,11 @@ from boxd import AsyncBoxd
 from telemetry.normalize import summary as telemetry_summary
 from telemetry.recorder import Recorder
 
-from . import db, github
+from . import agents, db, github
 from .config import settings
 
 # `log` is the per-run RunLog throughout this file, so the module logger takes another name.
 _log = logging.getLogger("factory.runner")
-
-# The coding agent that runs inside the VM. A constant for now — there is exactly one. It
-# becomes meaningful once a review/PR agent joins and runs need to say which one produced them.
-AGENT = "claude-code"
 
 # Run ids of in-flight runs -> their asyncio task, so the UI can cancel them.
 _tasks: dict[str, asyncio.Task] = {}
@@ -66,8 +62,8 @@ async def machine_id(boxd: AsyncBoxd, source: str) -> str:
     """Resolve a machine's id.
 
     The boxd SDK forks by machine **id**, not name — forking by name fails with
-    `source VM not found` even though the machine lists fine. `FACTORY_GOLDEN` is a
-    human-readable name, so resolve it here. Accepts an id too, so either works in config.
+    `source VM not found` even though the machine lists fine. A golden is named, not
+    numbered, so resolve it here. Accepts an id too, so either form works.
     """
     for m in await boxd.machines.list():
         if m.id == source or m.name == source:
@@ -114,6 +110,40 @@ async def _provision(boxd: AsyncBoxd, source: str, vm_name: str):
         auto_suspend_timeout=0,
         auto_destroy_timeout=settings.auto_destroy,
     )
+
+
+async def source_for(
+    boxd: AsyncBoxd, repo: str, agent: str = "", log: RunLog | None = None
+) -> str:
+    """Which golden this run boots from: the agent's snapshot, warmed for this repo if there is one.
+
+    Public because a run is not the only thing that needs the answer — the golden sweep and
+    preflight both report on the machine a repo's runs would actually boot, and a second
+    derivation of that would be a second thing to keep in step. Without a `log` the two
+    fallbacks are noted on the module logger instead of in a run's own log.
+
+    `runs.agent` records what was asked for and this records what answered, so a run says both
+    which agent took the issue and which tier of its image served it.
+
+    Two fallbacks, both deliberate. An agent no snapshot provides falls back to the default
+    agent and says so, because a poller that halts a repo over one stale config value is worse
+    than one that keeps building — a typo is rejected at the API instead, where somebody is
+    watching (`config.unknown_agent`). And when the snapshot fleet answers to nothing at all,
+    the conventional name is handed to `_provision` anyway: on the rollback path `golden-<agent>`
+    is still a *machine*, and forking it is exactly what should happen.
+    """
+    agent = agent or settings.agent_for(repo)
+    note = log.write if log is not None else _log.info
+    names = await agents.available(boxd)
+    source = agents.resolve_snapshot(agent, repo, names)
+    if not source:
+        source = agents.resolve_snapshot(settings.agent_default, repo, names)
+        if source:
+            note(f"[factory] no snapshot for agent {agent!r}; falling back to {source}")
+    if not source:
+        source = agents.golden_name(agent)
+        note(f"[factory] no golden snapshot for agent {agent!r}; trying machine {source}")
+    return source
 
 
 # --------------------------------------------------------------------------- prompt
@@ -706,7 +736,7 @@ async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt
 async def _fix_cycle(
     repo: str,
     number: int,
-    golden: str,
+    agent: str,
     cycle: int,
     log: RunLog,
     *,
@@ -729,7 +759,7 @@ async def _fix_cycle(
         await create(
             repo,
             number,
-            golden=golden,
+            agent=agent,
             attempt=cycle + 1,
             prior_error=reason,
             prior_log=detail,
@@ -751,7 +781,7 @@ async def _fail_run(
     run_id: str,
     repo: str,
     issue: dict,
-    golden: str,
+    agent: str,
     attempt: int,
     reason: str,
     log: RunLog,
@@ -770,7 +800,7 @@ async def _fail_run(
             await create(
                 repo,
                 number,
-                golden=golden,
+                agent=agent,
                 attempt=attempt + 1,
                 prior_error=reason,
                 prior_log=_log_tail(run_id),
@@ -809,7 +839,7 @@ async def _fail_run(
 async def create(
     repo: str,
     issue_number: int,
-    golden: str | None = None,
+    agent: str | None = None,
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
@@ -817,10 +847,15 @@ async def create(
 ) -> str:
     """Register a run and schedule it. Returns the run id immediately.
 
+    `agent` names which agent takes the issue; without one the repo's configured agent does.
+    Which snapshot that agent boots is resolved when the run actually starts, so a golden
+    built while the run sat in the queue is still picked up.
+
     `attempt` > 1 marks a retry: the previous attempt's error and log tail are woven into
     the prompt so the agent diagnoses the failure instead of repeating it. Retries reuse the
     same branch, so the whole chain resolves into one pull request.
     """
+    agent = (agent or "").strip() or settings.agent_for(repo)
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     branch = f"factory/issue-{issue_number}"
@@ -833,17 +868,16 @@ async def create(
         issue_number=issue_number,
         issue_title=issue["title"],
         branch=branch,
-        golden=golden or settings.golden,
         status="queued",
         attempt=attempt,
-        agent=AGENT,
+        agent=agent,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
     task = asyncio.create_task(
         _guarded(
-            run_id, repo, issue, branch, golden or settings.golden,
+            run_id, repo, issue, branch, agent,
             attempt, prior_error, prior_log, review_cycle,
         )
     )
@@ -857,10 +891,11 @@ async def create_review(
     issue_number: int,
     pr_url: str,
     branch: str,
-    golden: str | None = None,
+    agent: str | None = None,
     cycle: int = 1,
 ) -> str:
     """Register and schedule a review of the pull request a build run opened."""
+    agent = (agent or "").strip() or settings.agent_for(repo)
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"
@@ -872,18 +907,17 @@ async def create_review(
         issue_number=issue_number,
         issue_title=issue["title"],
         branch=branch,
-        golden=golden or settings.golden,
         status="queued",
         kind="review",
         attempt=cycle,
-        agent=AGENT,
+        agent=agent,
         pr_url=pr_url,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
     task = asyncio.create_task(
-        _guarded_review(run_id, repo, issue, branch, pr_url, golden or settings.golden, cycle)
+        _guarded_review(run_id, repo, issue, branch, pr_url, agent, cycle)
     )
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
@@ -930,13 +964,13 @@ async def _guarded_review(
     issue: dict,
     branch: str,
     pr_url: str,
-    golden: str,
+    agent: str,
     cycle: int,
 ) -> None:
     log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
     try:
         async with semaphore():
-            await _execute_review(run_id, repo, issue, branch, pr_url, golden, log, cycle)
+            await _execute_review(run_id, repo, issue, branch, pr_url, agent, log, cycle)
     except asyncio.CancelledError:
         log.write("[factory] review cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
@@ -971,7 +1005,7 @@ async def _guarded(
     repo: str,
     issue: dict,
     branch: str,
-    golden: str,
+    agent: str,
     attempt: int,
     prior_error: str | None,
     prior_log: str | None,
@@ -981,7 +1015,7 @@ async def _guarded(
     try:
         async with semaphore():
             await _execute(
-                run_id, repo, issue, branch, golden, log,
+                run_id, repo, issue, branch, agent, log,
                 attempt, prior_error, prior_log, review_cycle,
             )
     except asyncio.CancelledError:
@@ -998,7 +1032,7 @@ async def _guarded(
             reason = f"timed out after {settings.run_timeout}s"
         else:
             reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        await _fail_run(run_id, repo, issue, golden, attempt, reason, log)
+        await _fail_run(run_id, repo, issue, agent, attempt, reason, log)
     finally:
         await _salvage_usage(run_id, log)
         log.close()
@@ -1009,7 +1043,7 @@ async def _execute(
     repo: str,
     issue: dict,
     branch: str,
-    golden: str,
+    agent: str,
     log: RunLog,
     attempt: int = 1,
     prior_error: str | None = None,
@@ -1039,8 +1073,10 @@ async def _execute(
         # ---- provision
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{RUN_PREFIX}{run_id[:8]}"
-        log.write(f"[factory] provisioning {vm_name} from {golden}")
-        machine = await _provision(boxd, golden, vm_name)
+        source = await source_for(boxd, repo, agent, log)
+        await db.update_run(run_id, golden=source)
+        log.write(f"[factory] provisioning {vm_name} from {source} (agent {agent})")
+        machine = await _provision(boxd, source, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
         log.write(f"[factory] {machine.name} ready ({machine.id})")
@@ -1128,7 +1164,7 @@ async def _execute(
             )
         else:
             reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
-            await _fail_run(run_id, repo, issue, golden, attempt, reason, log, pr_url=pr_url)
+            await _fail_run(run_id, repo, issue, agent, attempt, reason, log, pr_url=pr_url)
 
         # ---- reap
         if ok or not settings.keep_failed:
@@ -1142,7 +1178,7 @@ async def _execute(
         # ---- hand off to review, once this run's VM is gone and its slot is free
         if ok and review_next:
             try:
-                await create_review(repo, number, pr_url, branch, golden, cycle=review_cycle)
+                await create_review(repo, number, pr_url, branch, agent, cycle=review_cycle)
             except Exception as exc:  # noqa: BLE001 - an unreviewed PR beats a lost one
                 log.write(f"[factory] could not queue review: {exc!r}")
     finally:
@@ -1155,7 +1191,7 @@ async def _execute_review(
     issue: dict,
     branch: str,
     pr_url: str,
-    golden: str,
+    agent: str,
     log: RunLog,
     cycle: int,
 ) -> None:
@@ -1168,8 +1204,10 @@ async def _execute_review(
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{REVIEW_PREFIX}{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
-        log.write(f"[factory] provisioning {vm_name} from {golden}")
-        machine = await _provision(boxd, golden, vm_name)
+        source = await source_for(boxd, repo, agent, log)
+        await db.update_run(run_id, golden=source)
+        log.write(f"[factory] provisioning {vm_name} from {source} (agent {agent})")
+        machine = await _provision(boxd, source, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
         log.write(f"[factory] {machine.name} ready ({machine.id})")
@@ -1287,7 +1325,7 @@ async def _execute_review(
             await _fix_cycle(
                 repo,
                 number,
-                golden,
+                agent,
                 cycle,
                 log,
                 reason=f"CI failed after an approved review: {merge_attempt.ci_failure}",
@@ -1326,7 +1364,7 @@ async def _execute_review(
         await _fix_cycle(
             repo,
             number,
-            golden,
+            agent,
             cycle,
             log,
             reason=f"review requested changes: {why}",

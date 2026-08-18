@@ -178,9 +178,13 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
 
 async def run(repo: str) -> list[Check]:
     """Every check for `repo`, against the golden its runs would actually fork."""
-    golden = settings.golden_for(repo)
-    if not golden:
-        return [Check("golden configured", False, f"no golden for {repo} in FACTORY_REPOS")]
+    boxd = runner.client()
+    try:
+        golden = await runner.source_for(boxd, repo)
+    except Exception as exc:  # noqa: BLE001 - the message is the finding
+        return [Check("golden configured", False, f"no golden resolved for {repo}: {exc}")]
+    finally:
+        await boxd.close()
     base = await github.default_branch(repo)
     repo_checks, vm_checks = await asyncio.gather(
         _repo_checks(repo, base), _vm_checks(repo, golden, settings.repo_dir, base)

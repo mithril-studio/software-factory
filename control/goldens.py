@@ -94,8 +94,15 @@ async def check(name: str, repo: str, repo_dir: str, base: str) -> dict:
 async def sweep() -> dict[str, dict]:
     """Check every configured golden once. Never raises — one bad machine is one bad row."""
     results = {}
-    for repo in settings.repos:
-        golden = settings.golden_for(repo)
+    boxd = runner.client()
+    try:
+        sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
+    except Exception:  # noqa: BLE001 - a fleet the sweep cannot read is nothing to sweep
+        log.exception("could not resolve the goldens to sweep")
+        return results
+    finally:
+        await boxd.close()
+    for repo, golden in sources.items():
         if not golden:
             continue
         # A golden being forked right now is busy, and a `git fetch` on it is one more thing
