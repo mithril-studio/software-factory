@@ -6,8 +6,9 @@ same question asked from a different side: can a name be misread? A machine some
 and take the agent's name with it. A repo with no warm snapshot must fall back to the agent
 image rather than to some other repo's golden.
 
-Nothing here touches boxd. `available()` is exercised against a stub precisely because a
-test that needs credentials is a test that stops being run.
+Nothing here needs credentials, a VM or a database. `available()` and the refresh loop are
+exercised against stubs precisely because a test that needs any of those is a test that stops
+being run.
 
 Run it directly, no framework needed:
 
@@ -16,6 +17,7 @@ Run it directly, no framework needed:
 import asyncio
 import sys
 
+from control import db, goldens, runner
 from control.agents import (
     DEFAULT_AGENT,
     GOLDEN_PREFIX,
@@ -28,6 +30,7 @@ from control.agents import (
     resolve_agent,
     resolve_snapshot,
     slug,
+    version,
 )
 
 fails = []
@@ -142,8 +145,9 @@ check("resolve_agent: two discovered agents and no claude asks a human",
 # ---------- available
 
 class FakeSnapshot:
-    def __init__(self, name):
+    def __init__(self, name, snapshot_version="1"):
         self.name = name
+        self.version = snapshot_version
 
 
 class FakeBoxd:
@@ -152,11 +156,14 @@ class FakeBoxd:
     def __init__(self, names):
         self.calls = 0
         self.snapshots = self
-        self._names = names
+        self.names = list(names)
 
     async def list(self):
         self.calls += 1
-        return [FakeSnapshot(n) for n in self._names]
+        return [FakeSnapshot(n) for n in self.names]
+
+    async def close(self):
+        pass
 
 
 forget()
@@ -169,7 +176,124 @@ check("available: a second lookup inside the TTL does not re-read the fleet", bo
 forget()
 asyncio.run(available(boxd))
 check("available: forgetting the cache re-reads the fleet", boxd.calls, 2)
+
+check("available: the version arrives with the listing, no second round trip",
+      version("golden-claude"), "1")
+check("available: a name the listing never held has no version", version("golden-codex"), "")
+
+# AC2: a snapshot somebody deleted must leave the answer, not linger in a cache. This is what
+# stops a dispatch resolving onto a golden that is no longer forkable.
+boxd.names.remove(WARM)
 forget()
+check("vanished: a deleted snapshot stops being available",
+      WARM in asyncio.run(available(boxd)), False)
+check("vanished: and stops being resolvable for the repo it was warmed for",
+      resolve_snapshot("claude", REPO, asyncio.run(available(boxd))), IMAGE)
+check("vanished: its version leaves with it", version(WARM), "")
+check("vanished: the snapshots that remain are untouched",
+      asyncio.run(available(boxd)), ("golden-claude",))
+forget()
+
+
+# ---------- refresh  (AC1)
+# The loop that replaced the freshness sweep. It reads the fleet and writes what it saw; the
+# grading is done from rows the runs already wrote, so nothing here boots a VM. Both the
+# database and boxd are stubbed — a golden's health is a question about evidence, and
+# evidence is exactly what a test can hand it.
+
+recorded: dict[str, dict] = {}
+evidence: dict[str, dict] = {}
+
+
+async def fake_record_agent(name, **fields):
+    recorded[name] = fields
+
+
+async def fake_evidence():
+    return evidence
+
+
+def run_refresh(names, seen=None):
+    """Run one refresh against a stubbed fleet and a stubbed database."""
+    recorded.clear()
+    evidence.clear()
+    evidence.update(seen or {})
+    real = (runner.client, db.record_agent, db.agent_evidence)
+    runner.client = lambda: FakeBoxd(names)
+    db.record_agent, db.agent_evidence = fake_record_agent, fake_evidence
+    try:
+        return asyncio.run(goldens.refresh())
+    finally:
+        runner.client, db.record_agent, db.agent_evidence = real
+        forget()
+
+
+FLEET_ROWS = ["golden-claude", WARM, "golden-codex", "goldenrod", "software-factory"]
+
+rows = run_refresh(FLEET_ROWS)
+check("refresh: one row per discovered golden, and none for anything else",
+      sorted(recorded), sorted(["golden-claude", WARM, "golden-codex"]))
+check("refresh: what it returns is what it wrote", sorted(rows), sorted(recorded))
+check("refresh: each row names the agent its snapshot name carries",
+      recorded[WARM]["agent"], "claude")
+check("refresh: and carries the version the listing saw", recorded[WARM]["version"], "1")
+check("refresh: a golden nothing has run on is unproven, not broken",
+      (recorded[WARM]["ok"], recorded[WARM]["error"], recorded[WARM]["verified_at"]),
+      (0, None, None))
+check("refresh: every row is stamped with when the fleet was listed",
+      all(r["checked_at"] for r in recorded.values()), True)
+
+# Upsert, not append: listing the same fleet twice is one row per name, still.
+before = sorted(recorded)
+rows = run_refresh(FLEET_ROWS)
+check("refresh: listing the same fleet again writes the same one row per name",
+      sorted(recorded), before)
+
+# The grade comes from the runs, including the manifest the golden announced on the way in.
+rows = run_refresh(FLEET_ROWS, {
+    "golden-claude": {
+        "last_run": "r1", "ok": 1, "error": None, "verified_at": "2026-08-18T10:00:00+00:00",
+        "manifest": '{"agent": "codex", "events": "codex", "transcript": "/t/*.jsonl", '
+                    '"version": "0.4.1"}',
+    },
+    "golden-codex": {"last_run": "r2", "ok": 0, "error": "boom", "manifest": None},
+})
+check("refresh: a golden a run finished on carries that run's verdict",
+      (recorded["golden-claude"]["ok"], recorded["golden-claude"]["last_run"]), (1, "r1"))
+check("refresh: verified_at is evidence from a run, not a probe",
+      recorded["golden-claude"]["verified_at"], "2026-08-18T10:00:00+00:00")
+check("refresh: the manifest the golden announced is unpacked into columns",
+      (recorded["golden-claude"]["events"], recorded["golden-claude"]["transcript"],
+       recorded["golden-claude"]["agent_version"]),
+      ("codex", "/t/*.jsonl", "0.4.1"))
+check("refresh: a failed last run is reported as the error it was",
+      (recorded["golden-codex"]["ok"], recorded["golden-codex"]["error"]), (0, "boom"))
+check("refresh: an unreadable manifest costs the columns, not the row",
+      (recorded["golden-codex"]["events"], recorded["golden-codex"]["agent_version"]),
+      (None, None))
+check("refresh: evidence for a snapshot the fleet no longer holds is not written",
+      "golden-gone" in recorded, False)
+
+# A fleet nobody can list is a refresh that recorded nothing, never a control plane that fell
+# over: this loop runs unattended every five minutes.
+class BrokenBoxd(FakeBoxd):
+    async def list(self):
+        raise RuntimeError("boxd unreachable")
+
+
+recorded.clear()
+real_client = runner.client
+real_record, real_evidence = db.record_agent, db.agent_evidence
+runner.client = lambda: BrokenBoxd([])
+db.record_agent, db.agent_evidence = fake_record_agent, fake_evidence
+try:
+    check("refresh: an unlistable fleet returns nothing and raises nothing",
+          asyncio.run(goldens.refresh()), {})
+finally:
+    runner.client = real_client
+    db.record_agent, db.agent_evidence = real_record, real_evidence
+    forget()
+check("refresh: and writes no rows", recorded, {})
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

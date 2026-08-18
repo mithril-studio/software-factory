@@ -124,10 +124,11 @@ class Settings:
     # single call. `medium` buys most of `high`'s quality for materially fewer tokens; raise it
     # if issues start coming back underdone.
     agent_effort: str = os.environ.get("FACTORY_AGENT_EFFORT", "medium")
-    # How often to check each golden for drift, in seconds. 0 switches the sweep off. Hourly
-    # is plenty: a golden goes stale over days, and the probe is a `git fetch` on a machine
-    # that may be forking runs at the time.
-    golden_sweep_interval: int = int(os.environ.get("FACTORY_GOLDEN_SWEEP", "3600"))
+    # How often to re-list the golden snapshots, in seconds. 0 switches the refresh off.
+    # Five minutes rather than the sweep's hour, because this is a list call and not a probe
+    # on a machine that may be forking runs: what it costs is one request, and what it buys
+    # is an agent built by hand being dispatchable within a poll or two of existing.
+    agent_refresh_interval: int = int(os.environ.get("FACTORY_AGENT_REFRESH", "300"))
     # Auto-merge a run's PR on success, so the next issue in a sequential backlog branches
     # from a main that already contains the previous issue's work.
     auto_merge: bool = os.environ.get("FACTORY_AUTO_MERGE", "0") == "1"

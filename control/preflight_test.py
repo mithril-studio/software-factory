@@ -1,8 +1,14 @@
-"""Reading a golden's probe output, and deciding whether a repo may be dispatched to.
+"""Reading a probe's output, and deciding whether a repo may be dispatched to.
 
 Both halves fail quietly if they are wrong: a probe key that stops being parsed reads as
 "absent" rather than as an error, and a verdict that counts the wrong checks says READY about
-a machine that cannot build anything.
+a repo nothing can build.
+
+The probe half outlived the probe. `preflight` stopped `exec`ing into goldens when they
+became repo-agnostic snapshots with no checkout to inspect, but `probe.parse` is still how
+any `key=value` round trip is read back, and the parsing bug it guards against — a key the
+script never printed coming back as empty rather than absent — is silent in whichever caller
+comes next.
 
 Run it directly, no framework needed:
 
@@ -10,7 +16,7 @@ Run it directly, no framework needed:
 """
 import sys
 
-from control.preflight import Check, profile_checks, report
+from control.preflight import Check, agent_check, profile_checks, report
 from control.probe import parse
 
 fails: list[str] = []
@@ -94,6 +100,36 @@ check("setup warning: a whitespace-only profile is no profile",
       [(c.ok, c.fatal) for c in profile_checks("   \n")], [(False, False)])
 check("setup warning: a missing profile is not also blamed for the setup line",
       any("setup" in c.name for c in profile_checks(None)), False)
+
+# ---------- no agent  (AC3)
+# The one machine-side question left, and the cheapest of the six the VM probe used to ask.
+# Blocking, unlike the profile warnings: a repo whose agent resolves to no snapshot does not
+# build worse, it cannot be dispatched at all — the fork has nothing to fork from.
+REPO = "acme/api"
+WARM = "golden-claude--acme-api"
+
+check("no agent: a fleet with the agent's image is ready",
+      agent_check(REPO, "claude", ["golden-claude"]).ok, True)
+check("no agent: a warm snapshot answers for it too",
+      agent_check(REPO, "claude", [WARM]).ok, True)
+check("no agent: the detail names the snapshot that would boot",
+      agent_check(REPO, "claude", [WARM]).detail, f"claude boots {WARM}")
+
+missing = agent_check(REPO, "pi", ["golden-claude", WARM])
+check("no agent: an agent no snapshot provides is not ready", missing.ok, False)
+check("no agent: and it blocks, rather than warning", missing.fatal, True)
+check("no agent: so the repo is reported not ready", report(REPO, [missing]), False)
+check("no agent: the detail names the snapshot somebody has to build",
+      "golden-pi" in missing.detail, True)
+check("no agent: and what the fleet does hold, so the fix is obvious",
+      WARM in missing.detail, True)
+
+empty = agent_check(REPO, "claude", [])
+check("no agent: an empty fleet is not ready either", empty.ok, False)
+check("no agent: and says so rather than listing nothing",
+      "no golden snapshots at all" in empty.detail, True)
+check("no agent: another repo's warm golden is never borrowed",
+      agent_check("acme/other", "claude", [WARM]).ok, False)
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

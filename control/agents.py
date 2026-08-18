@@ -123,6 +123,19 @@ def resolve_agent(
 
 
 _cache: tuple[float, tuple[str, ...]] | None = None
+_versions: dict[str, str] = {}
+
+
+def version(name: str) -> str:
+    """The snapshot version the last listing saw for `name`, or `""` if it saw none.
+
+    Kept beside the listing rather than fetched on demand, because it arrives with it: the
+    fleet call already carries the version, and asking again would be a second round trip
+    for something already in hand. `""` means "the last listing did not include this name",
+    which is the same answer as for a snapshot that never existed — the caller has no use
+    for the difference.
+    """
+    return _versions.get(name, "")
 
 
 async def available(boxd) -> tuple[str, ...]:
@@ -135,16 +148,22 @@ async def available(boxd) -> tuple[str, ...]:
     previous one stays forkable, so dropping a name because a newer capture is in flight
     would make a working agent vanish from discovery mid-poll.
     """
-    global _cache
+    global _cache, _versions
     now = time.monotonic()
     if _cache and now - _cache[0] < CACHE_TTL:
         return _cache[1]
-    names = tuple(sorted(s.name for s in await boxd.snapshots.list() if parse_golden(s.name)))
+    found = [s for s in await boxd.snapshots.list() if parse_golden(s.name)]
+    # Replaced wholesale, never merged: a listing is the whole truth about the fleet at that
+    # moment, so a snapshot that has been deleted must leave with it rather than linger as a
+    # version nobody can fork any more.
+    _versions = {s.name: str(getattr(s, "version", "") or "") for s in found}
+    names = tuple(sorted(s.name for s in found))
     _cache = (now, names)
     return names
 
 
 def forget() -> None:
     """Drop the memoised listing, so the next `available()` re-reads the fleet."""
-    global _cache
+    global _cache, _versions
     _cache = None
+    _versions = {}

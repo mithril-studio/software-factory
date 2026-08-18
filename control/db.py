@@ -46,21 +46,29 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_created_idx ON runs (created_at DESC);
 CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 
--- What the last freshness sweep saw on each golden. One row per machine: the sweep is an
--- observation of a thing that exists, not an event log. Fleet state belongs in a table for
--- the same reason run state does — otherwise "is the golden current?" is answered by
--- somebody sshing in and remembering.
-CREATE TABLE IF NOT EXISTS goldens (
-    name        TEXT PRIMARY KEY,
-    repo        TEXT,
-    head_sha    TEXT,
-    behind      INTEGER,
-    dirty       INTEGER,
-    stale_deps  TEXT,
-    toolchain   TEXT,
-    ok          INTEGER NOT NULL DEFAULT 0,
-    error       TEXT,
-    checked_at  TEXT NOT NULL
+-- Every golden snapshot the fleet holds, one row per name. An observation of a thing that
+-- exists, not an event log — fleet state belongs in a table for the same reason run state
+-- does, otherwise "which agents can this deployment run?" is answered by somebody listing
+-- snapshots and remembering.
+--
+-- Two clocks, deliberately far apart. `checked_at` is when the refresh loop last saw the
+-- name in the fleet, which costs a list call and says only that the snapshot is there.
+-- `verified_at` is when a run last finished on it having produced usage — the only evidence
+-- that its credentials still work, and unlike a probe it is free, because the runs were
+-- happening anyway.
+CREATE TABLE IF NOT EXISTS agents (
+    name          TEXT PRIMARY KEY,
+    agent         TEXT,
+    version       TEXT,
+    events        TEXT,
+    transcript    TEXT,
+    manifest      TEXT,
+    agent_version TEXT,
+    ok            INTEGER NOT NULL DEFAULT 0,
+    error         TEXT,
+    last_run      TEXT,
+    verified_at   TEXT,
+    checked_at    TEXT NOT NULL
 );
 """
 
@@ -83,6 +91,11 @@ MIGRATIONS = (
     # rather than spread across columns, because the control plane is not the authority on
     # what a manifest may contain — the golden is, and it gains keys without a migration.
     "ALTER TABLE runs ADD COLUMN manifest TEXT",
+    # The freshness sweep's table. It held one row per golden *machine*: how far behind its
+    # checkout was, whether a dependency manifest had moved. A repo-agnostic snapshot has no
+    # checkout, so every column of it became unanswerable at once — dropped rather than left
+    # to be read by something that has forgotten it stopped being filled in.
+    "DROP TABLE IF EXISTS goldens",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -157,24 +170,60 @@ async def list_runs(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def record_golden(name: str, **fields: Any) -> None:
-    """Store what the sweep saw. One row per golden, replaced each time."""
+async def record_agent(name: str, **fields: Any) -> None:
+    """Store what the refresh saw. One row per golden snapshot, replaced each time."""
     fields = {"name": name, **fields}
     cols = ", ".join(fields)
     marks = ", ".join("?" for _ in fields)
     async with connect() as conn:
         await conn.execute(
-            f"INSERT OR REPLACE INTO goldens ({cols}) VALUES ({marks})", tuple(fields.values())
+            f"INSERT OR REPLACE INTO agents ({cols}) VALUES ({marks})", tuple(fields.values())
         )
         await conn.commit()
 
 
-async def goldens() -> dict[str, dict]:
-    """The last sweep's findings, keyed by machine name."""
+async def agents() -> dict[str, dict]:
+    """The last refresh's findings, keyed by snapshot name."""
     async with connect() as conn:
-        async with conn.execute("SELECT * FROM goldens") as cur:
+        async with conn.execute("SELECT * FROM agents") as cur:
             rows = await cur.fetchall()
     return {r["name"]: dict(r) for r in rows}
+
+
+async def agent_evidence() -> dict[str, dict]:
+    """What the runs already prove about each golden, keyed by snapshot name.
+
+    This is the whole grading strategy: a golden is not asked how it is, it is judged by
+    what happened on it. The expensive failure on these snapshots is credential expiry, and
+    the only real test of a credential is using one — which every run does anyway, for free,
+    on the machine the question is about.
+
+    Two different facts, and the difference matters. `ok`/`error`/`last_run` come from the
+    most recent run that reached an end on it, so a golden whose last run failed says so.
+    `verified_at` is the most recent run that also *produced usage* — an agent that emitted
+    tokens authenticated, whatever the run then did with the code.
+    """
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT golden, id, status, error, finished_at, manifest, tokens_out, cost_usd "
+            "FROM runs "
+            "WHERE golden IS NOT NULL AND golden != '' AND finished_at IS NOT NULL "
+            "ORDER BY finished_at DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        seen = out.setdefault(r["golden"], {})
+        if "last_run" not in seen:
+            seen.update(
+                last_run=r["id"],
+                ok=1 if r["status"] == "succeeded" else 0,
+                error=r["error"] if r["status"] != "succeeded" else None,
+                manifest=r["manifest"],
+            )
+        if "verified_at" not in seen and ((r["tokens_out"] or 0) > 0 or r["cost_usd"] is not None):
+            seen["verified_at"] = r["finished_at"]
+    return out
 
 
 async def has_active_run(repo: str) -> bool:

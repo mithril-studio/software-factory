@@ -114,29 +114,34 @@ Every run forks one long-lived machine. It must have:
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
-### Keeping a golden warm
+### Knowing which goldens work
 
-A per-repo golden carries a warm checkout and a warm install, and that stays true only while
-the install still matches the repo — nothing kept it true. (The prompt no longer promises the
-agent any of it: it says the download caches are warm and sends it to install once. A stale
-golden is now a slower run rather than a wrong one.) The control plane sweeps every golden
-hourly (`FACTORY_GOLDEN_SWEEP`) and records what it finds: how far behind the checkout is,
-whether the tree is dirty, and whether a dependency manifest moved in the commits it is
-missing. The Projects page shows it, and `POST /api/goldens/sweep` runs one on demand.
+There used to be an hourly sweep that `exec`d into every golden and asked how far behind its
+checkout was and whether a dependency manifest had moved. A golden is a repo-agnostic
+snapshot now: it has no checkout, so all of that stopped having an answer at once — and the
+thing that actually kills a golden was never on the list. What kills one is credential
+expiry, and the only real test of a credential is using it.
 
-The sweep **observes only**. A run checks its own branch out from `origin/<base>` anyway, so
-the code on a golden is never what goes stale — the install is, and how to redo that is
-project-specific. Repairing is one command:
+So the control plane grades by evidence instead. Every `FACTORY_AGENT_REFRESH` seconds (300
+by default) it re-lists the golden snapshots — one API call, no VM — and records a row per
+name in the `agents` table: which agent it is, its snapshot version, what its last run did on
+it, and what that run's manifest announced. `POST /api/agents/refresh` runs one on demand.
 
-```bash
-scripts/sync-golden.sh factory-golden /home/boxd/repo main 'npm ci && npm run build'
-```
+The column that matters is `verified_at`: **when a run last finished on that snapshot having
+produced usage.** A golden that emitted tokens authenticated, so its `claude` login and its
+`gh` token both still worked as of that moment. It costs nothing to know, because the runs
+were happening anyway. A golden with no `verified_at` is unproven, not broken — nothing has
+used it yet.
+
+Repairing one is still manual and still project-specific: re-authenticate on a fork and
+re-snapshot it under the same name.
 
 ## Adding a repo
 
-1. Build or fork a golden for it: the repo cloned at `FACTORY_REPO_DIR`, dependencies
-   installed, `claude` and `gh` authenticated, skills installed (see below).
-2. Add it to `FACTORY_REPOS` as `owner/repo=golden-name`.
+1. Make sure an agent exists for it — a `golden-<agent>` snapshot with `claude` and `gh`
+   authenticated and skills installed (see below). A repo does not need one of its own; a
+   `golden-claude` serves every repo that names no other agent.
+2. Add it to `FACTORY_REPOS`, as `owner/repo` or as `owner/repo=agent`.
 3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
    without checks, auto-merge can never pass its gate and every pull request waits for a
    human.
@@ -146,13 +151,14 @@ scripts/sync-golden.sh factory-golden /home/boxd/repo main 'npm ci && npm run bu
    .venv/bin/python -m control.preflight mithril-studio/legal-ai-app
    ```
 
-   It reports on the repo (readable, pushable, has CI, has a profile, labels) and on the
-   golden its runs would actually fork (checkout is the right repo, clean, on the base
-   branch, how far behind, toolchain against `.nvmrc`, `claude`, `gh`, skills). Exit status
-   0 means ready. Same answers over HTTP at `/api/preflight?repo=owner/repo`.
+   It reports on the repo — readable, pushable, has CI, has a `.factory.md`, has a `##
+   Setup` section, labels — and on one thing outside it: whether a golden snapshot exists
+   for the agent this repo would resolve to. Exit status 0 means ready. Same answers over
+   HTTP at `/api/preflight?repo=owner/repo`.
 
-   These are the questions a run answers the expensive way — after forking a VM and spending
-   forty minutes finding out that the checkout belongs to another project.
+   It boots nothing. Every check is a GitHub call or a snapshot listing, which is the whole
+   point: these are the questions a run otherwise answers the expensive way, after forking a
+   VM and spending forty minutes to find out the token cannot push.
 
 ## What a watched repo tells the factory: `.factory.md`
 

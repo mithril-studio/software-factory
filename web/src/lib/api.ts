@@ -50,10 +50,6 @@ export type Project = {
   agent: string
   /** The snapshot that agent actually boots for this repo. */
   golden: string
-  golden_checked_at: string | null
-  golden_behind: number | null
-  golden_stale_deps: string | null
-  golden_error: string | null
   runs: number
   succeeded: number
   failed: number
@@ -67,8 +63,9 @@ export type Agent = {
   role: "golden" | "run"
   is_golden: boolean
   orphan: boolean
-  behind: number | null
-  stale_deps: string | null
+  /** When a run last finished on this golden having produced usage — the only proof its
+   *  credentials still work. Null means no run has proved it yet, not that it is broken. */
+  verified_at: string | null
 }
 
 export type Config = {

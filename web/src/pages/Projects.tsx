@@ -1,26 +1,10 @@
 import { usePoll, type Project } from "@/lib/api"
-import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { PageHeader, Empty, ErrorNote } from "@/components/Page"
 
 function gitUrl(repo: string): string {
   return `https://github.com/${repo}`
-}
-
-/** What the last sweep found on the machine this repo's runs fork.
- *
- * The prompt promises the agent nothing about this any more — it installs once, every run. So
- * drift here is not a broken promise, it is minutes added to every run on this repo, which is
- * the kind of cost that hides unless something shows it.
- */
-function Freshness({ p }: { p: Project }) {
-  if (p.golden_error) return <Badge variant="bad">{p.golden_error}</Badge>
-  if (!p.golden_checked_at) return <span className="text-muted-foreground">not checked yet</span>
-  if (p.golden_stale_deps)
-    return <Badge variant="bad">deps moved: {p.golden_stale_deps.trim().split(/\s+/).join(", ")}</Badge>
-  if (p.golden_behind) return <Badge variant="warn">{p.golden_behind} behind</Badge>
-  return <Badge variant="ok">current</Badge>
 }
 
 export function Projects() {
@@ -40,8 +24,8 @@ export function Projects() {
               <TableRow>
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
+                <TableHead>Agent</TableHead>
                 <TableHead>Golden</TableHead>
-                <TableHead>Freshness</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
               </TableRow>
@@ -60,10 +44,8 @@ export function Projects() {
                       {gitUrl(p.repo)}
                     </a>
                   </TableCell>
+                  <TableCell className="font-mono">{p.agent}</TableCell>
                   <TableCell className="font-mono text-muted-foreground">{p.golden}</TableCell>
-                  <TableCell>
-                    <Freshness p={p} />
-                  </TableCell>
                   <TableCell className="text-right font-mono">{p.runs}</TableCell>
                   <TableCell className="text-right font-mono text-ok">{p.succeeded}</TableCell>
                 </TableRow>
