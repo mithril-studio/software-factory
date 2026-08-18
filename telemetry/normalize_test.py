@@ -14,7 +14,15 @@ Run it directly, no framework needed:
 """
 import sys
 
-from telemetry.normalize import ClaudeCodeAdapter, LlmCall, ToolCall, elapsed_ms
+from telemetry.normalize import (
+    ADAPTERS,
+    ClaudeCodeAdapter,
+    LlmCall,
+    NullAdapter,
+    ToolCall,
+    adapter_for,
+    elapsed_ms,
+)
 from telemetry.store import canonical_model
 
 # A real assistant event: usage on the message, a tool_use block, `parent_tool_use_id`
@@ -218,6 +226,85 @@ check("date snapshot stripped", canonical_model("claude-haiku-4-5-20251001"),
       "claude-haiku-4-5")
 check("plain id untouched", canonical_model("claude-opus-4-8"), "claude-opus-4-8")
 check("no model is not a model", canonical_model(None), None)
+
+# --- the null adapter ------------------------------------------------------------
+# A golden may carry an agent before anyone has written an adapter for it — that is the
+# ordinary case for the first run of a new agent, not an edge case. Telemetry is a
+# consumer of a run and never a precondition for one, so an unknown `events` string must
+# cost the run its rows and nothing else: no exception, no refused dispatch, no wrong
+# number. Recording nothing is the honest answer; recording Claude's shapes for an agent
+# that is not Claude would be a lying one.
+
+null = adapter_for("codex", "run-9")
+check("null adapter for an unknown events format", type(null), NullAdapter)
+check("null adapter for a manifest that names none", type(adapter_for(None, "run-9")), NullAdapter)
+check("null adapter for an empty events format", type(adapter_for("", "run-9")), NullAdapter)
+check("null adapter for whitespace", type(adapter_for("   ", "run-9")), NullAdapter)
+check("claude is still selected by name", type(adapter_for("claude-code", "run-9")),
+      ClaudeCodeAdapter)
+check("surrounding whitespace does not lose an adapter",
+      type(adapter_for("  claude-code  ", "run-9")), ClaudeCodeAdapter)
+check("the registry names every adapter it can select", sorted(ADAPTERS), ["claude-code"])
+check("an adapter answers to the name it is registered under",
+      [name == cls.name for name, cls in ADAPTERS.items()], [True])
+
+# Anything at all can be fed to it, including the events of the runtime it does not
+# understand and the junk a half-written wrapper prints.
+for event in (ASSISTANT, TOOL_OK, TOOL_ERR, {"type": "turn.completed"}, {}, None, [], "x", 7):
+    check(f"null adapter: no rows for {str(event)[:24]!r}", null.feed(event), [])
+    check(f"null adapter: no summary for {str(event)[:24]!r}", null.summary(event), {})
+check("null adapter: nothing left to flush", null.flush(), [])
+check("null adapter: it still counts no turns", null.turn, 0)
+check("null adapter: it knows the run it recorded nothing for", null.run_id, "run-9")
+
+# The Claude adapter's own summary is the same shape from the other side: figures on the
+# final event, `{}` on every other, so a caller can hand it the whole stream blind.
+claude = adapter_for("claude-code", "run-9")
+RESULT = {"type": "result", "subtype": "success", "num_turns": 12,
+          "usage": {"input_tokens": 31, "output_tokens": 4200}, "total_cost_usd": 1.37}
+check("claude summary: the final event carries the run's figures", claude.summary(RESULT),
+      {"tokens_in": 31, "tokens_out": 4200, "cost_usd": 1.37})
+for event in (ASSISTANT, TOOL_OK, {"type": "system"}, {}, None, "x"):
+    check(f"claude summary: nothing from {str(event)[:20]!r}", claude.summary(event), {})
+
+
+# --- claude regression -----------------------------------------------------------
+# Selecting the adapter from a manifest may not change what the adapter produces. This
+# replays a whole small run — model call, tool call, its result, the final event — and
+# pins every field of every row and every figure of the summary, so a refactor of the
+# selection cannot quietly become a refactor of the numbers. The values are the ones the
+# adapter produced before the registry existed.
+
+def replay(events):
+    """One run's worth of events through the adapter selected for `events`."""
+    adapter = adapter_for(events, "run-regression")
+    rows = []
+    for event in (ASSISTANT, TOOL_OK):
+        rows.extend(adapter.feed(event))
+    rows.extend(adapter.flush())
+    return adapter, rows
+
+
+adapter, rows = replay("claude-code")
+check("claude regression: two rows, one of each kind", [type(r).__name__ for r in rows],
+      ["LlmCall", "ToolCall"])
+check("claude regression: the model call is unchanged", rows[0], LlmCall(
+    run_id="run-regression", turn=1, ts="2026-08-17T10:00:00.000Z", model="claude-opus-5",
+    input_tokens=2, output_tokens=17, cache_read_tokens=16016,
+    cache_write_5m_tokens=0, cache_write_1h_tokens=19177, parent_call_id=None))
+check("claude regression: the tool call is unchanged", rows[1], ToolCall(
+    id="toolu_01", run_id="run-regression", turn=1, ts="2026-08-17T10:00:00.000Z",
+    tool="Bash", ok=True, duration_ms=2500, error=None, detail="echo hi",
+    parent_call_id=None))
+check("claude regression: the turn counter is unchanged", adapter.turn, 1)
+check("claude regression: nothing is left pending", adapter.flush(), [])
+check("claude regression: the run's totals are unchanged", adapter.summary(RESULT),
+      {"tokens_in": 31, "tokens_out": 4200, "cost_usd": 1.37})
+
+# The same events through the class directly: selection is a lookup, not a variant.
+direct = ClaudeCodeAdapter("run-regression")
+check("claude regression: selection by name is the class itself",
+      [r for e in (ASSISTANT, TOOL_OK) for r in direct.feed(e)], rows)
 
 if failures:
     print("\n".join(f"FAIL {f}" for f in failures))

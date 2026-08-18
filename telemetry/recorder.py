@@ -15,19 +15,64 @@ write is guarded and a failure degrades to a missing row.
 
 from __future__ import annotations
 
+import logging
+
 from . import store
-from .normalize import ClaudeCodeAdapter, LlmCall, ToolCall
+from .normalize import LlmCall, ToolCall, adapter_for
+
+log = logging.getLogger("factory.telemetry")
+
+# What to assume until a run's golden says otherwise. Every golden in the fleet today runs
+# Claude Code and none of them announces anything, so the default keeps recording exactly
+# what it recorded before manifests existed.
+DEFAULT_EVENTS = "claude-code"
 
 
 class Recorder:
-    def __init__(self, run_id: str) -> None:
-        self.adapter = ClaudeCodeAdapter(run_id)
+    def __init__(self, run_id: str, events: str = DEFAULT_EVENTS) -> None:
         self.run_id = run_id
+        self.events = events
+        self.adapter = adapter_for(events, run_id)
         self._buffer: list[LlmCall | ToolCall] = []
+        self._fed = False
         self.dropped = 0
+
+    def use(self, events: str | None) -> str:
+        """Switch to the adapter for `events`, before the stream starts. Returns its name.
+
+        A run learns which runtime it is watching from the manifest, and the manifest
+        arrives on the first line the golden prints — ahead of every event. Switching
+        after that would mean an adapter reading half a stream it never saw the start of,
+        so this refuses once anything has been fed and keeps the adapter already in use.
+        The refusal is a bug in the caller rather than in the golden, which is why it is
+        logged rather than swallowed.
+        """
+        if self._fed:
+            if (events or DEFAULT_EVENTS) != self.events:
+                log.warning(
+                    "run %s: ignoring a switch to %r after %r had already read events",
+                    self.run_id, events, self.events,
+                )
+            return self.adapter.name
+        self.events = events or DEFAULT_EVENTS
+        self.adapter = adapter_for(self.events, self.run_id)
+        return self.adapter.name
+
+    def summary(self, event: dict) -> dict:
+        """The run-level figures this event carries, as `runs` columns. `{}` for most.
+
+        Which event those figures ride on is the adapter's business, not the caller's:
+        every runtime ends its stream its own way, and one of them calling that event
+        `result` is exactly the kind of thing `control` must not know.
+        """
+        try:
+            return self.adapter.summary(event) or {}
+        except Exception:  # noqa: BLE001 - a wrong number must not end a run
+            return {}
 
     async def feed(self, event: dict) -> None:
         """Normalize one runtime event and buffer whatever it produced."""
+        self._fed = True
         try:
             rows = self.adapter.feed(event)
         except Exception:  # noqa: BLE001 - a malformed event must not end a run

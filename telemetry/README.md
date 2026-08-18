@@ -59,11 +59,32 @@ class ClaudeCodeAdapter:            # telemetry/normalize.py
     name = "claude-code"
     def feed(self, event: dict) -> list[LlmCall | ToolCall]: ...
     def flush(self) -> list[ToolCall]: ...   # tools the run died inside
+    def summary(self, event: dict) -> dict:  # the run's own figures, {} for most events
+
+ADAPTERS = {"claude-code": ClaudeCodeAdapter}
+adapter_for(events, run_id)         # anything unknown -> NullAdapter
 ```
 
 Pure functions, no I/O, no clock — which is what lets one implementation serve the live
 stream and a replayed transcript, and what makes `normalize_test.py` possible.
 **No table in this repo mentions Claude.**
+
+Which adapter a run uses comes from the `events` string in the golden's manifest
+(`control/README.md` §2.3), handed to `Recorder(run_id, events)` or to `recorder.use()`
+when the manifest arrives — before the first event, since an adapter is stateful over the
+stream it reads.
+
+`summary()` lives on the adapter for the same reason `feed()` does: Claude Code reports a
+run's own token and cost figures on a final event it calls `result`, and that sentence is
+one runtime's vocabulary. The control plane asks every event and keeps whatever comes
+back, so it never has to know the word.
+
+**An agent with no adapter still runs.** An `events` string this layer does not recognise
+selects `NullAdapter`, whose every answer is empty: no rows, no figures, no exception.
+Telemetry is a consumer of a run and never a precondition for one, so the first run of a
+new agent records nothing and works — and reports no cost rather than a wrong one, with
+`runner._salvage_usage` filling the ledger from rows wherever there are any. Writing the
+adapter comes after, against events recorded from that real run rather than invented.
 
 **Storage** is SQLite alongside `control`'s, same reasoning as `control/db.py`: plain SQL,
 so Postgres is a driver swap rather than a rewrite. Revisit when event volume reaches
