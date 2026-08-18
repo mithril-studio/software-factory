@@ -44,6 +44,23 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_created_idx ON runs (created_at DESC);
 CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
+
+-- What the last freshness sweep saw on each golden. One row per machine: the sweep is an
+-- observation of a thing that exists, not an event log. Fleet state belongs in a table for
+-- the same reason run state does — otherwise "is the golden current?" is answered by
+-- somebody sshing in and remembering.
+CREATE TABLE IF NOT EXISTS goldens (
+    name        TEXT PRIMARY KEY,
+    repo        TEXT,
+    head_sha    TEXT,
+    behind      INTEGER,
+    dirty       INTEGER,
+    stale_deps  TEXT,
+    toolchain   TEXT,
+    ok          INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    checked_at  TEXT NOT NULL
+);
 """
 
 # Additive migrations for databases created before a column existed. Each is tried once at
@@ -132,6 +149,26 @@ async def list_runs(limit: int = 100) -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def record_golden(name: str, **fields: Any) -> None:
+    """Store what the sweep saw. One row per golden, replaced each time."""
+    fields = {"name": name, **fields}
+    cols = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    async with connect() as conn:
+        await conn.execute(
+            f"INSERT OR REPLACE INTO goldens ({cols}) VALUES ({marks})", tuple(fields.values())
+        )
+        await conn.commit()
+
+
+async def goldens() -> dict[str, dict]:
+    """The last sweep's findings, keyed by machine name."""
+    async with connect() as conn:
+        async with conn.execute("SELECT * FROM goldens") as cur:
+            rows = await cur.fetchall()
+    return {r["name"]: dict(r) for r in rows}
 
 
 async def has_active_run(repo: str) -> bool:

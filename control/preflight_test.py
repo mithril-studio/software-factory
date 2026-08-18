@@ -10,7 +10,8 @@ Run it directly, no framework needed:
 """
 import sys
 
-from control.preflight import Check, _parse, report
+from control.preflight import Check, report
+from control.probe import parse
 
 fails: list[str] = []
 
@@ -32,12 +33,12 @@ fetch=ok
 behind=0
 skills=boxd memory
 """
-p = _parse(PROBE)
+p = parse(PROBE)
 check("keys and values are split on the first =", p["origin"], "mithril-studio/legal-ai-app")
 check("a value with spaces survives", p["skills"], "boxd memory")
 check("a key the probe never printed is absent, not empty", p.get("gh"), None)
-check("a line with no = is ignored", _parse("noise\nk=v\n"), {"k": "v"})
-check("an empty value stays empty rather than becoming a key", _parse("behind=\n")["behind"], "")
+check("a line with no = is ignored", parse("noise\nk=v\n"), {"k": "v"})
+check("an empty value stays empty rather than becoming a key", parse("behind=\n")["behind"], "")
 
 # ---------- the verdict
 ok_ = Check("a", True, "")
