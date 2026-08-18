@@ -104,6 +104,27 @@ Every run forks one long-lived machine. It must have:
 
 Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials.
 
+## What a watched repo tells the factory: `.factory.md`
+
+A repo can describe itself to the agent in a `.factory.md` at its root. The control plane
+reads it from the base branch at dispatch and splices it into the build and review prompts,
+so it is the one place that says how *this* project is verified and what is already set up:
+
+```markdown
+- Everything runs from `app/`: `npm run lint`, `npm run typecheck`, `npm test`.
+- Dependencies are installed and `app/.env.local` is present. Do not reinstall or print it.
+- There is no local database — Supabase is remote. Do not try to start one.
+```
+
+It lives in the repo rather than in this one because it describes that repo, and because
+editing it is then a pull request there rather than a control-plane deploy. A repo without
+one gets a deliberately vague default that names no build tool — a wrong fact costs more
+than a missing one, since the agent acts on it before it can find out.
+
+Keep harness invariants out of it. Anything that would hang or corrupt *any* run (do not
+background long commands, commit and push as you go) belongs in the prompt, not here; see
+`discussion.md` §"Where rules live".
+
 ## The UI
 
 A React + Tailwind + shadcn single-page app in `web/`, built to `web/dist` and served by
