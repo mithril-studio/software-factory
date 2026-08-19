@@ -13,11 +13,20 @@ import hmac
 import os
 import time
 
+# Importing config for its side effect: it loads `.env` into the environment, and the
+# credentials below are read at import time. Without this the module's import order decides
+# whether a deployment's password is honoured — and when it lost, the baked-in defaults won
+# silently, which is a login anyone who has read this public repo already knows.
+from . import config  # noqa: F401
+
 COOKIE_NAME = "factory_session"
 SESSION_TTL = 7 * 24 * 3600  # a week
 
-AUTH_EMAIL = os.environ.get("FACTORY_AUTH_EMAIL", "info@mithril-studio.com").strip().lower()
-AUTH_PASSWORD = os.environ.get("FACTORY_AUTH_PASSWORD", "theageofmenisover")
+# No defaults. This repo is public, so a baked-in password is a published one, and a
+# deployment that forgot to set these would have been open to anyone who read the source.
+# Unset means "nobody can log in", which is the failure a missing credential should have.
+AUTH_EMAIL = os.environ.get("FACTORY_AUTH_EMAIL", "").strip().lower()
+AUTH_PASSWORD = os.environ.get("FACTORY_AUTH_PASSWORD", "")
 
 # Signing key for the session cookie. A stable value keeps sessions alive across restarts;
 # when unset we derive one from the password so it is stable yet rotates if the password changes.
@@ -31,7 +40,13 @@ PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/me", "/healthz"}
 
 
 def check_credentials(email: str, password: str) -> bool:
-    """Constant-time comparison of both fields so neither leaks via timing."""
+    """Constant-time comparison of both fields so neither leaks via timing.
+
+    An unconfigured deployment rejects everything rather than accepting the empty password
+    that would otherwise compare equal to an unset one.
+    """
+    if not AUTH_EMAIL or not AUTH_PASSWORD:
+        return False
     email_ok = hmac.compare_digest(email.strip().lower(), AUTH_EMAIL)
     password_ok = hmac.compare_digest(password, AUTH_PASSWORD)
     return email_ok and password_ok
