@@ -686,6 +686,37 @@ def dispatch_env(
     return env
 
 
+# A shell name, so a key that could not be one is never pasted into a command.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def export_prelude(env: dict) -> str:
+    """Shell that turns the assignments `stream_exec(env=...)` makes into a real environment.
+
+    boxd's wire protocol has no env field. Its SDK says so and works around it by prefixing
+    the command with `K=v` assignments (`boxd.resources.machines._exec_init`), which is
+    correct for the one-line command that comment has in mind and quietly wrong for a script.
+    In front of a *multi-line* command the prefix lands on a line of its own, and a line of
+    bare assignments sets shell variables rather than exporting them. The script itself then
+    reads `$FACTORY_REPO` perfectly well while every process it starts inherits none of them.
+
+    That is not a theoretical gap. It is what stopped the factory on 2026-08-19: `gh repo
+    clone` could not see `GH_TOKEN`, failed with "please run gh auth login", and the prelude
+    exited 90 before the agent ever started — while the same log line printed the repo name
+    it had just read from the very variable `gh` could not see, which is what made it look
+    like the environment had arrived.
+
+    Names come from the dict, so a variable added to `dispatch_env` cannot be forgotten here.
+    """
+    names = [k for k in env if _ENV_NAME.fullmatch(k)]
+    if not names:
+        return ""
+    # Leading newline so the SDK's prefix stays a line of pure assignments; without it the
+    # assignments would attach to this `export` as a command prefix and the fix would depend
+    # on how the shell scopes assignments to a special builtin.
+    return "\nexport " + " ".join(names) + "\n"
+
+
 # --------------------------------------------------------------------------- manifest
 
 # What a golden says about itself, on one line, immediately before it becomes the agent.
@@ -1659,7 +1690,7 @@ async def _stream(
     manifest: dict = {}
     recorder = Recorder(run_id)
     async with boxd.machines.stream_exec(
-        machine_id, command=script, env=env, close_stdin=True
+        machine_id, command=export_prelude(env) + script, env=env, close_stdin=True
     ) as stream:
         async for chunk in stream.iter_chunks():
             text = chunk.data.decode("utf-8", errors="replace")
