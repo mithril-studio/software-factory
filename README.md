@@ -60,18 +60,32 @@ npm --prefix web run dev        # then open the URL Vite prints (:5173)
 
 ## Deploying
 
-The control plane lives on the long-lived boxd VM **`software-factory`** — a plain checkout
-under `~/software-factory` running uvicorn, not a container. Deploy by pulling:
+The control plane lives on a **Hetzner** VM — a plain checkout under `~/software-factory`
+running uvicorn under systemd, not a container, behind Caddy for TLS. It moved off boxd on
+2026-08-19, after that VM's root filesystem corrupted and took the run history with it: the
+thing the factory forks VMs *from* should not also be the thing that remembers what it did.
+
+boxd is still where every run VM comes from. The Hetzner box reaches it purely over the API,
+so it needs `BOXD_API_KEY` and nothing else — but it does not inherit the two things boxd
+gave for free, so they are explicit here: TLS is Caddy's, and `.env` is a real file on the
+box rather than injected environment.
 
 ```bash
-ssh software-factory.boxd.sh
-cd ~/software-factory
-git pull
-.venv/bin/pip install -e .                 # only when dependencies or packages change
-npm --prefix web install && npm --prefix web run build
-pkill -f 'uvicorn control.app' ; sleep 1
-nohup .venv/bin/uvicorn control.app:app --host 0.0.0.0 --port 8765 >> uvicorn.log 2>&1 &
+scripts/deploy.sh                 # pull the tracked branch, rebuild what moved, restart
+scripts/deploy.sh --ref main      # deploy a specific branch or tag
 ```
+
+| | |
+|---|---|
+| Host | `factory@46.224.40.20` (Hetzner `cx23`, fsn1), ssh key `~/.ssh/hetzner` |
+| Service | `factory.service` — `systemctl status factory`, logs in `var/uvicorn.log` |
+| TLS | Caddy, `/etc/caddy/Caddyfile`, cert issued automatically for the configured host |
+| Backups | Hetzner daily snapshots, enabled on the server |
+
+systemd, not `nohup`: the old deployment would not have survived a reboot even without the
+corruption. Secrets live in `.env` on the box and are in no other place — not in this repo,
+not in CI. Rebuilding them means `boxd env` plus a fresh `FACTORY_AUTH_PASSWORD`, which is
+also why `scripts/deploy.sh` never touches that file.
 
 Schema changes apply themselves on boot (`db.init()` and `telemetry.store.init()` are both
 idempotent), so there is no migration step. To load telemetry for runs that finished before

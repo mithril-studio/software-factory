@@ -16,12 +16,47 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from boxd import AsyncBoxd
+from boxd import AsyncBoxd, _mappers as _boxd_mappers
 
 from telemetry.recorder import Recorder
 
 from . import agents, db, github
 from .config import settings
+
+# boxd reports a snapshot's timestamps in **milliseconds**, but the SDK's snapshot mapper reads
+# them as seconds (`_epoch`, where the machine mapper alongside it correctly uses `_epoch_ms`),
+# so `snapshots.list()` dies in `datetime.fromtimestamp` with "year 58577 is out of range".
+# That takes golden discovery with it, and with it every dispatch: `agents.available` cannot
+# name a single `golden-<agent>`, so preflight's `fleet readable` check fails fatally and no
+# issue can be picked up. Verified against SDK 0.2.2, 0.2.4 and 0.2.5 — all three fail
+# identically, so there is no version to pin `boxd>=0.2.2` back to.
+#
+# Nothing in this repo reads a snapshot's timestamp, so the narrowest fix is to stop the
+# mapper crashing rather than to reimplement the listing: an epoch beyond any date boxd could
+# plausibly report is milliseconds, and is scaled back down. Delete this once the SDK maps
+# snapshot timestamps with `_epoch_ms`; the patch is idempotent and self-identifying so that
+# removing it is a one-line change and leaving it in is harmless.
+_EPOCH_SECONDS_CEILING = 32_503_680_000  # 3000-01-01, far past anything boxd will report.
+
+
+def _tolerate_millisecond_epochs() -> None:
+    """Make the boxd SDK's epoch mappers accept milliseconds as well as seconds."""
+    for name in ("_epoch", "_epoch_always"):
+        original = getattr(_boxd_mappers, name, None)
+        if original is None or getattr(original, "_factory_patched", False):
+            continue
+
+        def scaled(value, _original=original):
+            if value and abs(value) > _EPOCH_SECONDS_CEILING:
+                value = value // 1000
+            return _original(value)
+
+        scaled._factory_patched = True
+        setattr(_boxd_mappers, name, scaled)
+
+
+_tolerate_millisecond_epochs()
+
 
 # `log` is the per-run RunLog throughout this file, so the module logger takes another name.
 _log = logging.getLogger("factory.runner")
