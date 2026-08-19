@@ -1,0 +1,6 @@
+{"id":"mem_acac","domain":"repository","type":"pattern","title":"control/ is a deterministic state machine; no LLM call belongs there","files":["control/README.md","control"]}
+{"id":"mem_5b24","domain":"repository","type":"convention","title":"Each layer owns its own SQLite store via aiosqlite; no shared connection","files":["control/db.py","telemetry/store.py"]}
+{"id":"mem_b1e0","domain":"repository","type":"pattern","title":"telemetry/normalize.py isolates all runtime-specific event vocabulary behind an adapter","files":["telemetry/normalize.py"]}
+{"id":"mem_783b","domain":"repository","type":"convention","title":"Fast verification is ruff --select F,E9 plus plain __main__ test modules, nothing else","files":["control/agents_test.py","telemetry/normalize_test.py","pyproject.toml","control","telemetry"]}
+{"id":"mem_d79c","domain":"repository","type":"decision","title":"Control plane runs on a Hetzner VM under systemd, not on boxd itself","files":["README.md","scripts/deploy.sh"]}
+{"id":"mem_40b7","domain":"repository","type":"pattern","title":"Golden VMs resolve agent-then-repo, warm tier is a speed-up only","files":["control/agents.py","control/goldens.py"]}
