@@ -1,0 +1,96 @@
+name: Factory health
+
+# Watch the factory from outside the factory.
+#
+# On 2026-08-19 the control plane's boxd VM lost its root filesystem, served nothing for
+# hours, and nobody found out until a human went looking — and the dispatch path had been
+# quietly broken for longer than that by an unrelated SDK bug. Both were visible in
+# `/api/preflight` the whole time. The only thing missing was something outside the machine
+# asking.
+#
+# It lives here, and not on the control plane, because a monitor that shares a disk with the
+# thing it monitors goes quiet in exactly the failure it exists to catch. GitHub Actions is
+# outside boxd and outside the Hetzner box the control plane is moving to, so this survives
+# that move: only the FACTORY_URL variable changes.
+#
+# Setup — one repository variable and two secrets:
+#   gh variable set FACTORY_URL      --body 'https://…'
+#   gh secret   set FACTORY_EMAIL    --body '…'   # FACTORY_AUTH_EMAIL from the control plane
+#   gh secret   set FACTORY_PASSWORD --body '…'   # FACTORY_AUTH_PASSWORD
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub's scheduler is best-effort and skips runs under load, so treat
+    # this as "within the hour", not as a heartbeat you can time an SLA against.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: factory-health
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe the control plane
+        id: probe
+        env:
+          FACTORY_URL: ${{ vars.FACTORY_URL }}
+          FACTORY_EMAIL: ${{ secrets.FACTORY_EMAIL }}
+          FACTORY_PASSWORD: ${{ secrets.FACTORY_PASSWORD }}
+        run: |
+          set +e
+          scripts/factory-health.sh > report.md 2>&1
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          cat report.md
+
+      - name: Open, update, or close the alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.probe.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # `--force` so this is idempotent on a repo that already has the label. The label is
+          # deliberately NOT one of the agent:* lifecycle labels: an alert issue tagged
+          # `agent:queued` would be picked up by the factory and dispatched as work, which is
+          # a fine way to spend a VM asking an agent to fix a machine it cannot reach.
+          gh label create factory-health \
+            --color B60205 \
+            --description "Automated factory health alert — not agent work" \
+            --force >/dev/null
+
+          existing=$(gh issue list --label factory-health --state open \
+                       --limit 1 --json number --jq '.[0].number // empty')
+
+          body=$(printf '%s\n\n---\n\nProbed by [%s](%s). This issue is updated in place while the\nfactory stays unhealthy, and closed automatically when it recovers.\n' \
+                   "$(cat report.md)" "$GITHUB_WORKFLOW" "$RUN_URL")
+
+          if [ "$STATUS" != "0" ]; then
+            if [ -n "$existing" ]; then
+              # Edited in place rather than commented on: an outage lasting a day would
+              # otherwise generate 144 notifications for one fact you already know.
+              gh issue edit "$existing" --body "$body"
+              echo "updated #$existing"
+            else
+              gh issue create --label factory-health \
+                --title "Factory unhealthy: cannot dispatch runs" --body "$body"
+            fi
+            exit 1
+          fi
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            gh issue close "$existing" --reason completed
+            echo "closed #$existing"
+          fi
+          echo "healthy"
