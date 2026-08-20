@@ -164,6 +164,56 @@ async def _provision(boxd: AsyncBoxd, source: str, vm_name: str):
     )
 
 
+async def reap(boxd: AsyncBoxd, machine, log: RunLog, *, keep: bool = False) -> None:
+    """Destroy a run's VM. Idempotent, and it never raises.
+
+    Every path that creates a machine ends here, including the ones that got there by
+    crashing. A machine that outlives its run holds one of the account's 20 slots until the
+    `auto_destroy` timer fires two hours later, and three of those is a factory that cannot
+    dispatch — so a failure to reap is logged and handed to the reconciler rather than raised
+    into a `finally` that is already handling something else.
+    """
+    if machine is None:
+        return
+    if keep:
+        log.write(f"[factory] keeping {machine.name} for inspection (FACTORY_KEEP_FAILED=1)")
+        return
+    try:
+        await boxd.machines.delete(machine.id)
+        log.write(f"[factory] destroyed {machine.name}")
+    except Exception as exc:  # noqa: BLE001 - already gone is fine, and a leak is the reaper's
+        log.write(f"[factory] could not destroy {machine.name}: {exc!r}; reconcile will sweep it")
+
+
+async def headroom(boxd: AsyncBoxd, log: RunLog) -> None:
+    """Refuse to provision when the fleet is at its cap, after trying to make room.
+
+    Nothing counted machines against the quota before this: concurrency was bounded by
+    `FACTORY_MAX_CONCURRENT`, which says nothing about the goldens, the control plane, or a
+    machine somebody left running by hand. Past the cap boxd refuses the create, and the run
+    that finds out is the one that dies.
+
+    So ask first, and sweep before giving up — an orphaned run VM is exactly the thing
+    `reconcile` exists to reclaim, and a factory that reaps and then proceeds is better than
+    one that stops at a limit it could have cleared itself.
+    """
+    if settings.max_machines <= 0:
+        return
+    count = len(await boxd.machines.list())
+    if count < settings.max_machines:
+        return
+    log.write(f"[factory] fleet at {count}/{settings.max_machines}; sweeping for orphans")
+    swept = await reconcile()
+    count = len(await boxd.machines.list())
+    if count >= settings.max_machines:
+        raise RuntimeError(
+            f"the boxd fleet is at {count}/{settings.max_machines} machines and sweeping "
+            f"reclaimed {len(swept.get('destroyed') or [])}; nothing can be provisioned until "
+            "something is destroyed"
+        )
+    log.write(f"[factory] reclaimed to {count}/{settings.max_machines}")
+
+
 async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> str:
     """Which golden this run boots from: this repo's own, or the base image behind it.
 
@@ -1322,6 +1372,7 @@ async def _execute(
 ) -> None:
     boxd = client()
     machine = None
+    reaped = False
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
@@ -1343,6 +1394,7 @@ async def _execute(
         # ---- provision
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{RUN_PREFIX}{run_id[:8]}"
+        await headroom(boxd, log)
         source = await source_for(boxd, repo, log)
         await db.update_run(run_id, golden=source)
         log.write(f"[factory] provisioning {vm_name} from {source}")
@@ -1421,13 +1473,12 @@ async def _execute(
             await _fail_run(run_id, repo, issue, attempt, reason, log, pr_url=pr_url)
 
         # ---- reap
-        if ok or not settings.keep_failed:
+        keep = not ok and settings.keep_failed
+        if not keep:
             # Brief drain so any buffered telemetry flushes before the VM disappears.
             await asyncio.sleep(3)
-            await boxd.machines.delete(machine.id)
-            log.write(f"[factory] destroyed {machine.name}")
-        else:
-            log.write(f"[factory] keeping {machine.name} for inspection (FACTORY_KEEP_FAILED=1)")
+        await reap(boxd, machine, log, keep=keep)
+        reaped = True
 
         # ---- hand off to review, once this run's VM is gone and its slot is free
         if ok and review_next:
@@ -1436,6 +1487,13 @@ async def _execute(
             except Exception as exc:  # noqa: BLE001 - an unreviewed PR beats a lost one
                 log.write(f"[factory] could not queue review: {exc!r}")
     finally:
+        # Everything above can raise: `wait_until_ready` times out, the stream drops, the run
+        # hits `FACTORY_RUN_TIMEOUT`, a GitHub call fails after the agent finished. Each of
+        # those used to leave a machine running until its two-hour self-destruct. The reap in
+        # the body is the ordinary path and this is the one that catches the rest; `reaped`
+        # keeps it from running twice.
+        if not reaped:
+            await reap(boxd, machine, log, keep=settings.keep_failed)
         await boxd.close()
 
 
@@ -1453,10 +1511,13 @@ async def _execute_review(
     base = await github.default_branch(repo)
     criteria = parse_criteria(issue.get("body") or "")
     boxd = client()
+    machine = None
+    reaped = False
     try:
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{REVIEW_PREFIX}{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
+        await headroom(boxd, log)
         source = await source_for(boxd, repo, log)
         await db.update_run(run_id, golden=source)
         log.write(f"[factory] provisioning {vm_name} from {source}")
@@ -1518,8 +1579,8 @@ async def _execute_review(
             log.write(f"[factory]   finding: {finding}")
 
         await asyncio.sleep(3)
-        await boxd.machines.delete(machine.id)
-        log.write(f"[factory] destroyed {machine.name}")
+        await reap(boxd, machine, log)
+        reaped = True
 
         # ---- act on the verdict
         #
@@ -1621,6 +1682,10 @@ async def _execute_review(
             ),
         )
     finally:
+        # The review path leaks a VM the same way the build path does, and for the same
+        # reasons — see the note there.
+        if not reaped:
+            await reap(boxd, machine, log, keep=settings.keep_failed)
         await boxd.close()
 
 
@@ -1800,11 +1865,60 @@ async def cancel(run_id: str) -> bool:
     return True
 
 
+_reconciler: asyncio.Task | None = None
+
+
+async def _reconcile_loop() -> None:
+    _log.info("reconciling the fleet every %ss", settings.reconcile_interval)
+    while True:
+        await asyncio.sleep(settings.reconcile_interval)
+        try:
+            found = await reconcile()
+        except Exception:  # noqa: BLE001 - a boxd outage is a sweep that did nothing
+            _log.exception("reconcile failed")
+            continue
+        if found["destroyed"] or found["stranded"] or found["stuck"]:
+            _log.info(
+                "reconciled: destroyed %s, stranded %s, stuck %s",
+                found["destroyed"], found["stranded"], found["stuck"],
+            )
+
+
+def start_reconciler() -> None:
+    """Run the sweep on a timer.
+
+    `control/README.md` §4 has described "a periodic reconciler" since the layer was designed.
+    Until now the function existed and nothing scheduled it: the only way a leaked VM was ever
+    reclaimed was somebody noticing and pressing a button in the fleet view. Sleeps first, so a
+    control plane in a restart loop cannot turn into a sweep loop.
+    """
+    global _reconciler
+    if _reconciler is not None or settings.reconcile_interval <= 0:
+        return
+    _reconciler = asyncio.create_task(_reconcile_loop())
+
+
+async def stop_reconciler() -> None:
+    global _reconciler
+    if _reconciler is None:
+        return
+    _reconciler.cancel()
+    try:
+        await _reconciler
+    except asyncio.CancelledError:
+        pass
+    _reconciler = None
+
+
 async def reconcile() -> dict:
     """Compare the boxd fleet against the runs table and resolve the difference.
 
     Fleet state belongs in the database, not in anybody's head. Without this, a crashed
     dispatch silently leaks machines against the quota.
+
+    Safe to call at any time and from anywhere: it reads both sides fresh, and a run whose task
+    is still in flight is never touched (`_tasks`). `headroom` calls it before giving up on a
+    full fleet, and `_reconcile_loop` calls it on a timer.
     """
     boxd = client()
     try:
@@ -1815,8 +1929,17 @@ async def reconcile() -> dict:
         orphans = [
             m for m in machines if is_run_vm(m.name) and m.name not in active_vms
         ]
+        # Per machine, because one that refuses to die used to abort the whole sweep — and the
+        # sweep is what reclaims the quota, so a single stuck VM could keep every other orphan
+        # alive behind it. Reported rather than raised: the next sweep tries again.
+        destroyed, stuck = [], []
         for machine in orphans:
-            await boxd.machines.delete(machine.id)
+            try:
+                await boxd.machines.delete(machine.id)
+                destroyed.append(machine.name)
+            except Exception as exc:  # noqa: BLE001 - the message is the finding
+                _log.warning("could not destroy orphan %s: %r", machine.name, exc)
+                stuck.append(machine.name)
 
         # Runs we think are live whose VM no longer exists.
         names = {m.name for m in machines}
@@ -1830,6 +1953,6 @@ async def reconcile() -> dict:
                     finished_at=db.utcnow(),
                 )
                 stranded.append(run["id"])
-        return {"destroyed": [m.name for m in orphans], "stranded": stranded}
+        return {"destroyed": destroyed, "stuck": stuck, "stranded": stranded}
     finally:
         await boxd.close()

@@ -137,10 +137,16 @@ run is lost.
 The reason this layer exists rather than handing an agent CLI access: **fleet state lives in
 a table, not in a context window.**
 
-A periodic reconciler compares `c.box.list()` against the `runs` table and resolves the
-difference: a VM with no active run is an orphan and gets destroyed; a run marked running
-whose VM is gone is a failure and gets marked as one. Without this, crashed dispatches leak
-machines against a 20-machine quota, silently.
+A periodic reconciler (`runner.start_reconciler`, every `FACTORY_RECONCILE_INTERVAL` seconds)
+compares the boxd fleet against the `runs` table and resolves the difference: a VM with no
+active run is an orphan and gets destroyed; a run marked running whose VM is gone is a failure
+and gets marked as one. Without this, crashed dispatches leak machines against a 20-machine
+quota, silently.
+
+It is also the fallback, not the first line. Every path that creates a machine reaps it in a
+`finally`, and `runner.headroom` refuses to provision into a full fleet — sweeping first, since
+an orphan is exactly the thing to reclaim before giving up. A single machine that will not die
+is reported and left to the next sweep rather than aborting the one it is in.
 
 Idempotency everywhere. Every operation must be safe to retry.
 

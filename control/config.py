@@ -95,6 +95,16 @@ class Settings:
     bash_default_timeout: int = int(os.environ.get("FACTORY_BASH_TIMEOUT", "600"))
     bash_max_timeout: int = int(os.environ.get("FACTORY_BASH_MAX_TIMEOUT", "1800"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
+    # The boxd account's concurrent-machine cap. Checked before provisioning, because past it
+    # boxd refuses the create and the run that finds out is the one that dies. It counts the
+    # *whole* fleet — goldens still held as machines, a control plane, somebody's scratch VM —
+    # which is what makes it different from max_concurrent, and why that alone never protected
+    # anything. 0 switches the check off.
+    max_machines: int = int(os.environ.get("FACTORY_MAX_MACHINES", "20"))
+    # How often to sweep the fleet against the runs table, in seconds. 0 switches it off.
+    # Five minutes: a leaked VM holds a slot until its two-hour self-destruct, and the sweep is
+    # one list call plus a delete per orphan.
+    reconcile_interval: int = int(os.environ.get("FACTORY_RECONCILE_INTERVAL", "300"))
     keep_failed: bool = os.environ.get("FACTORY_KEEP_FAILED", "0") == "1"
     # Claude auth injected into each run so the agent authenticates with a durable credential
     # instead of the golden's short-lived OAuth session (which expires and can't run

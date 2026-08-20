@@ -35,11 +35,13 @@ async def lifespan(app: FastAPI):
     await repos.seed()
     poller.start()
     goldens.start()
+    runner.start_reconciler()
     try:
         yield
     finally:
         await poller.stop()
         await goldens.stop()
+        await runner.stop_reconciler()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)

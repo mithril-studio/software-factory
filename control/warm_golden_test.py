@@ -87,9 +87,15 @@ class Machines:
     def __init__(self, boxd):
         self._boxd = boxd
 
+    async def list(self):
+        """What `runner.headroom` counts against the boxd quota before provisioning."""
+        return list(self._boxd.live)
+
     async def create(self, name=None, **kw):
         self._boxd.calls.append(("create", {"name": name, **kw}))
-        return Thing("vm-1", name)
+        machine = Thing("vm-1", name)
+        self._boxd.live.append(machine)
+        return machine
 
     async def fork(self, source, name=None, **kw):
         self._boxd.calls.append(("fork", {"source": source, "name": name}))
@@ -101,6 +107,7 @@ class Machines:
     async def delete(self, machine_id):
         self._boxd.calls.append(("machines.delete", {"id": machine_id}))
         self._boxd.destroyed.append(machine_id)
+        self._boxd.live = [m for m in self._boxd.live if m.id != machine_id]
 
     def stream_exec(self, machine_id, *, command, env=None, close_stdin=False):
         self._boxd.calls.append(("stream_exec", {"id": machine_id, "command": command, "env": env}))
@@ -133,6 +140,7 @@ class FakeBoxd:
     def __init__(self, snapshots=(agents.BASE_SNAPSHOT,), exit_code=0):
         self.calls = []
         self.destroyed = []
+        self.live = []
         self.snapshot_names = list(snapshots)
         self.exit_code = exit_code
         self.machines = Machines(self)
