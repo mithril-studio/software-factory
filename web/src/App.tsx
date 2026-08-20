@@ -36,7 +36,7 @@ const router = createBrowserRouter([
       { path: "/runs/:runId", element: <RunDetail /> },
       { path: "/plan", element: <Plan /> },
       { path: "/projects", element: <Projects /> },
-      { path: "/agents", element: <Machines /> },
+      { path: "/goldens", element: <Machines /> },
       { path: "/telemetry", element: <Telemetry /> },
     ],
   },

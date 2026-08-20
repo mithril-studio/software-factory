@@ -1,15 +1,28 @@
-"""The golden naming contract, and the agent discovery that falls out of it.
+"""The golden naming contract.
 
-A golden is a boxd snapshot, and its *name* carries the whole contract:
+A golden is a boxd snapshot, and its *name* says which repo it was warmed for:
 
-    golden-<agent>                 the agent image — tooling and auth, no repo
-    golden-<agent>--<repo-slug>    that image with one repo already cloned and installed
+    golden-copy               the base image — tooling and the agent's auth, no repo
+    golden-<repo-slug>        the base image with one repo already cloned and installed
 
-There is no registry anywhere else. An agent exists because a snapshot naming it exists, so
-listing the fleet and discovering the agents are the same act. That is why the separator is
-two hyphens: a repo slug collapses every run of non-alphanumerics down to one, so a slug can
-never contain `--`, and the split back into (agent, repo) is unambiguous no matter how many
-hyphens the owner or the repo name carries.
+    resolution:  golden-<repo-slug>  →  golden-copy  →  nothing
+
+The agent is deliberately not in the name any more. It used to be (`golden-<agent>` and
+`golden-<agent>--<repo-slug>`), which made "which agents exist?" a question you answered by
+listing snapshots — elegant, and wrong in the direction the platform is going. A deployment
+watches many repos and runs one agent; encoding the agent meant every repo's warm tier was
+named after the thing that never varies, and the thing that does vary needed a separator
+convention to survive. Now the name carries the repo and only the repo.
+
+Which agent runs inside an image is a property of the image, and the image says so itself:
+each golden carries `/etc/factory/agent.json`, announced into the run log as
+`FACTORY-MANIFEST` and recorded on the run (`runner._stream_agent`). That is the registry,
+and it is the one that cannot drift from what actually booted. Running a *second* agent means
+a second base image and a way to choose between them; that is on the backlog, not here.
+
+Two tiers, not one, and the fallback is what makes connecting a repo cheap: a repo with no
+golden of its own still dispatches onto `golden-copy` and installs for itself. Provisioning is
+a speed-up that can finish later, never a gate on the first run.
 
 Everything here is a pure function over strings apart from `available()`, which is the one
 place that talks to boxd. That is deliberate: dispatch decisions can then be tested without
@@ -23,12 +36,28 @@ import time
 from collections.abc import Iterable
 
 GOLDEN_PREFIX = "golden-"
-SEP = "--"
+
+# The base image. Named by the owner, so it is a constant here rather than something derived:
+# every repo without a warm golden of its own boots this one.
+#
+# It cannot collide with a per-repo name. A slug is built from `owner/name`, and the `/` alone
+# guarantees at least one hyphen, so no repo slug is ever the single word `copy`.
+BASE_SNAPSHOT = f"{GOLDEN_PREFIX}copy"
+
+# What `parse_golden` returns for the base image: a golden that carries no repo. Empty rather
+# than `None` because `None` already means "not a golden at all", and those are different
+# answers — one is the image every run can fall back to, the other is somebody's unrelated
+# snapshot. Test with `is None`, never for truthiness.
+BASE = ""
+
+# The agent every golden currently runs. Recorded on a run so the ledger says which agent did
+# the work, and overwritten by the golden's own manifest when it announces something else.
+# It selects nothing: no snapshot name, no dispatch path.
 DEFAULT_AGENT = "claude"
 
-# How long a fleet listing is reused. Short on purpose: step 3 creates a snapshot and then
-# wants to dispatch onto it moments later, so a stale cache would hide the agent that was
-# just built. Ten seconds still collapses the burst of lookups inside a single poll.
+# How long a fleet listing is reused. Short on purpose: provisioning creates a snapshot and
+# then wants to dispatch onto it moments later, so a stale cache would hide the golden that
+# was just built. Ten seconds still collapses the burst of lookups inside a single poll.
 CACHE_TTL = 10.0
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -39,112 +68,90 @@ def slug(repo: str) -> str:
 
     Lowercase, every run of non-alphanumerics collapsed to a single hyphen. The owner stays
     in: two owners with a repo of the same name must not land on the same snapshot.
+
+    Unchanged from the agent-in-the-name design, and it has to stay unchanged —
+    `scripts/build-golden.sh` and `scripts/refresh-golden.sh` reimplement it in shell, and
+    `control/golden_scripts_test.py` pins the two implementations in agreement. A slug that
+    disagrees by one character names a snapshot no dispatch will ever resolve onto.
     """
     return _SLUG_RE.sub("-", (repo or "").lower()).strip("-")
 
 
-def golden_name(agent: str, repo: str | None = None) -> str:
-    """The snapshot name for an agent, warmed for one repo when given. Inverse of `parse_golden`."""
-    name = f"{GOLDEN_PREFIX}{agent}"
+def golden_name(repo: str | None = None) -> str:
+    """The snapshot name for `repo`, or the base image when given none.
+
+    Inverse of `parse_golden`. A repo whose slug comes out empty — anything with no
+    alphanumerics in it at all — gets the base name, because there is no honest per-repo name
+    to build and silently returning `golden-` would name a snapshot nothing can parse.
+    """
     repo_slug = slug(repo) if repo else ""
-    return f"{name}{SEP}{repo_slug}" if repo_slug else name
+    return f"{GOLDEN_PREFIX}{repo_slug}" if repo_slug else BASE_SNAPSHOT
 
 
-def _well_formed(part: str) -> bool:
-    """A name part is usable only if it is non-empty and not fringed with hyphens."""
-    return bool(part) and not part.startswith("-") and not part.endswith("-")
+def parse_golden(name: str) -> str | None:
+    """The repo slug a golden name carries, `BASE` for the base image, `None` for a non-golden.
 
-
-def parse_golden(name: str) -> tuple[str, str | None] | None:
-    """`(agent, repo_slug_or_None)` for a golden name, or `None` when the name is not one.
-
-    Strict by design — this is what stops an unrelated snapshot from being read as an agent.
-    `goldenrod` is a machine someone named; `golden-` names no agent; `golden-claude--`
-    promises a repo and then does not name it.
+    Strict by design — this is what stops an unrelated snapshot from being read as a golden.
+    `goldenrod` is a machine someone named; `golden-` names no repo; `golden--acme` is fringed
+    with the hyphens a slug can never begin with.
     """
     name = (name or "").strip()
     if not name.startswith(GOLDEN_PREFIX):
         return None
-    agent, sep, repo_slug = name[len(GOLDEN_PREFIX):].partition(SEP)
-    if not _well_formed(agent):
+    if name == BASE_SNAPSHOT:
+        return BASE
+    repo_slug = name[len(GOLDEN_PREFIX):]
+    if not repo_slug or repo_slug.startswith("-") or repo_slug.endswith("-"):
         return None
-    if sep and not _well_formed(repo_slug):
-        return None
-    return agent, repo_slug or None
+    return repo_slug
 
 
-def discover(available: Iterable[str] = ()) -> tuple[str, ...]:
-    """Every distinct agent named by a collection of snapshot names, sorted."""
-    return tuple(sorted({found[0] for n in available or () if (found := parse_golden(n))}))
+def is_golden(name: str) -> bool:
+    """Whether `name` belongs to the factory at all."""
+    return parse_golden(name) is not None
 
 
-def resolve_snapshot(agent: str, repo: str | None, available: Iterable[str] = ()) -> str | None:
-    """Which snapshot a run for `repo` should fork: warm first, then the bare agent image.
+def resolve_snapshot(repo: str | None, available: Iterable[str] = ()) -> str | None:
+    """Which snapshot a run for `repo` boots: its own warm golden, else the base image.
 
-    `None` means this agent has no image at all, which is a configuration error the caller
-    must surface rather than paper over with somebody else's golden.
+    `None` means this deployment has no base image, which is a configuration error the caller
+    must surface rather than paper over with somebody else's snapshot. A repo that simply has
+    not been provisioned yet is *not* that case — it gets the base and installs for itself.
     """
-    if not agent:
-        return None
     names = set(available or ())
-    warm = golden_name(agent, repo) if repo else None
-    if warm and warm in names:
+    warm = golden_name(repo) if repo else ""
+    if warm and warm != BASE_SNAPSHOT and warm in names:
         return warm
-    image = golden_name(agent)
-    return image if image in names else None
+    return BASE_SNAPSHOT if BASE_SNAPSHOT in names else None
 
 
-def resolve_agent(
-    repo: str,
-    watched: dict | None = None,
-    override: str | None = None,
-    default: str | None = None,
-    available: Iterable[str] = (),
-) -> str | None:
-    """Which agent should take an issue in `repo`.
+def api_rows(known: dict[str, dict]) -> list[dict]:
+    """One row per golden snapshot, for the fleet page.
 
-    Most specific wins: an explicit `override` for this run, then whatever the repo was
-    configured with in `watched`, then the deployment's `default`. Those three are taken at
-    their word and never checked against the fleet — a snapshot may be mid-build, and
-    silently substituting a different agent is worse than failing on a name that is missing.
+    `known` is `db.snapshots()` — what the refresh loop last saw, which is the only registry
+    there is. Shaped here rather than in the endpoint because it is a pure function over rows
+    and a name, and everything about the naming contract is testable without a database, a
+    fleet or a clock.
 
-    Only past that does the fleet speak. `claude` is the default when it exists, and when
-    nothing at all was discovered (an empty listing means "we do not know", not "no agents").
-    A deployment that runs one other agent and never says so gets that one. Two candidates
-    and no way to choose is `None`: the caller asks a human rather than guessing.
-    """
-    for choice in (override, (watched or {}).get(repo), default):
-        if choice and choice.strip():
-            return choice.strip()
-    found = discover(available)
-    if not found or DEFAULT_AGENT in found:
-        return DEFAULT_AGENT
-    return found[0] if len(found) == 1 else None
-
-
-def api_rows(known: dict[str, dict], default: str = DEFAULT_AGENT) -> list[dict]:
-    """One row per discovered golden snapshot, for the fleet page.
-
-    `known` is `db.agents()` — what the refresh loop last saw, which is the only registry
-    there is. Shaped here rather than in the endpoint because it is a pure function over
-    rows and a name, and everything about the golden naming contract is testable without a
-    database, a fleet or a clock.
-
-    The default is marked rather than filtered: a deployment wants to see the agent a repo
-    that names none will get, sitting in the same list as the ones that were asked for.
-    Rows whose name is not a golden are dropped — the table is keyed on snapshot names and a
-    row that cannot be parsed as one is a row the refresh should never have written.
+    The base sorts first: an empty per-repo list is explained by the base being missing, and
+    never the other way round. Rows whose name is not a golden are dropped — the table is
+    keyed on snapshot names and a row that cannot be parsed as one is a row the refresh should
+    never have written.
     """
     out = []
     for name, row in (known or {}).items():
-        parsed = parse_golden(name)
-        if not parsed:
+        repo_slug = parse_golden(name)
+        if repo_slug is None:
             continue
-        agent = row.get("agent") or parsed[0]
         out.append(
             {
-                "agent": agent,
                 "snapshot": name,
+                "repo": row.get("repo") or repo_slug or None,
+                "base": repo_slug == BASE,
+                # Which agent this image actually launches, from the manifest it announced on
+                # the way into its last run. Read back from the run rather than from the
+                # machine, because asking the machine means booting it.
+                "agent": row.get("agent") or None,
                 "version": row.get("version") or None,
                 "events": row.get("events") or None,
                 "agent_version": row.get("agent_version") or None,
@@ -154,10 +161,9 @@ def api_rows(known: dict[str, dict], default: str = DEFAULT_AGENT) -> list[dict]
                 "ok": bool(row.get("ok")),
                 "error": row.get("error") or None,
                 "verified_at": row.get("verified_at") or None,
-                "default": agent == (default or "").strip(),
             }
         )
-    out.sort(key=lambda r: (not r["default"], r["agent"], r["snapshot"]))
+    out.sort(key=lambda r: (not r["base"], r["snapshot"]))
     return out
 
 
@@ -185,13 +191,13 @@ async def available(boxd) -> tuple[str, ...]:
 
     Status is deliberately not filtered on. Re-saving a golden bumps its version while the
     previous one stays forkable, so dropping a name because a newer capture is in flight
-    would make a working agent vanish from discovery mid-poll.
+    would make a working golden vanish from discovery mid-poll.
     """
     global _cache, _versions
     now = time.monotonic()
     if _cache and now - _cache[0] < CACHE_TTL:
         return _cache[1]
-    found = [s for s in await boxd.snapshots.list() if parse_golden(s.name)]
+    found = [s for s in await boxd.snapshots.list() if is_golden(s.name)]
     # Replaced wholesale, never merged: a listing is the whole truth about the fleet at that
     # moment, so a snapshot that has been deleted must leave with it rather than linger as a
     # version nobody can fork any more.

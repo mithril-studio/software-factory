@@ -4,6 +4,11 @@ Goldens are moving from long-lived machines to snapshots, so `_provision` has to
 kinds of source at once — the fork path is the rollback for the whole migration, and it has
 to keep working while the snapshot path is proven.
 
+The source is whatever `source_for` resolved: `golden-copy` for a repo nobody has provisioned
+a golden for yet, `golden-<repo-slug>` when one exists. Nothing here decides between them —
+that is the naming contract's job, tested in `agents_test.py` — so both are exercised only to
+prove that neither is treated specially by the provisioning call itself.
+
 Every check below is really the same question from a different side: does the source decide
 the API, and does each API get exactly the arguments it accepts? A snapshot restore is not a
 fork with a different word for it. It rejects `env`, `image`, `cmd`, `restart_policy`,
@@ -89,7 +94,7 @@ class StubBoxd:
         return found[0] if found else None
 
 
-GOLDEN = "golden-claude"
+GOLDEN = "golden-copy"
 VM = "run-abc12345"
 
 
@@ -117,6 +122,14 @@ by_id = StubBoxd(snapshots=[Thing("s-2", GOLDEN)])
 provision(by_id, source="s-2")
 check("from snapshot: an id names a snapshot as well as a name does",
       (by_id.named("create") or {}).get("from_snapshot"), "s-2")
+
+# A repo's own warm golden takes the identical path. Provisioning does not know or care which
+# tier resolved — if it did, the fallback would stop being free.
+WARM = "golden-acme-api"
+warm = StubBoxd(snapshots=[Thing("s-5", GOLDEN), Thing("s-6", WARM)])
+provision(warm, source=WARM)
+check("from snapshot: a repo's warm golden is restored exactly like the base",
+      (warm.named("create") or {}).get("from_snapshot"), WARM)
 
 
 # ---------- AC2: a source naming a machine still resolves its id and forks

@@ -80,14 +80,14 @@ fi
 
 # --- 3. Per repo: can a run actually be dispatched? ----------------------------------------
 # `/api/preflight` already spans all three layers this monitor cares about — the control
-# plane answering, the boxd fleet being listable, and a `golden-<agent>` existing for the
-# repo's agent — so it is asked rather than reimplemented here.
+# plane answering, the boxd fleet being listable, and a golden existing for the repo to boot
+# — so it is asked rather than reimplemented here.
 #
 # Only checks marked `fatal` fail the run. The non-fatal ones are real advice but not an
 # outage: a repo with no `.factory.md` still builds, and a repo with no *warm*
-# `golden-<agent>--<owner-repo>` snapshot still builds from the bare `golden-<agent>` image —
-# the warm tier is a speed-up, never a requirement. Paging on those teaches everyone to
-# ignore the page.
+# `golden-<owner-repo>` snapshot still builds from the `golden-copy` base image — the warm
+# tier is a speed-up, never a requirement. Paging on those teaches everyone to ignore the
+# page.
 while IFS= read -r repo; do
   [ -n "$repo" ] || continue
   echo "### \`$repo\`"

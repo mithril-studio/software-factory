@@ -53,11 +53,11 @@ would otherwise be stdout parsing against a binary that auto-updates underneath 
 
 ### §2.1 Machines
 
-- **One golden per agent, not per project.** Tooling and auth pre-installed, skills installed
-  from [agent-skills](https://github.com/mithril-studio/agent-skills). Forked per task, never
-  worked in directly. The run brings its own repo: it clones the one it was assigned into
-  `$HOME/work/<name>` unless a checkout of that repo is already there, which is the whole
-  difference between a warm `golden-<agent>--<repo-slug>` and a bare `golden-<agent>`.
+- **One base golden, plus one per connected repo.** `golden-copy` carries tooling, auth and
+  skills from [agent-skills](https://github.com/mithril-studio/agent-skills) and no repo.
+  Restored per task, never worked in directly. The run brings its own repo: it clones the one
+  it was assigned into `$HOME/work/<name>` unless a checkout of that repo is already there,
+  which is the whole difference between a warm `golden-<repo-slug>` and the base.
 - **No warm pool.** Forks are ~0.2s. Provision on demand.
 - **`auto-suspend.timeout = 0` on every fork.** The default suspends after 30s without
   inbound TCP, and clocks freeze while suspended. A long build or test run with no network

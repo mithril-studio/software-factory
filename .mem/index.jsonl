@@ -3,5 +3,5 @@
 {"id":"mem_b1e0","domain":"repository","type":"pattern","title":"telemetry/normalize.py isolates all runtime-specific event vocabulary behind an adapter","files":["telemetry/normalize.py"]}
 {"id":"mem_783b","domain":"repository","type":"convention","title":"Fast verification is ruff --select F,E9 plus plain __main__ test modules, nothing else","files":["control/agents_test.py","telemetry/normalize_test.py","pyproject.toml","control","telemetry"]}
 {"id":"mem_d79c","domain":"repository","type":"decision","title":"Control plane runs on a Hetzner VM under systemd, not on boxd itself","files":["README.md","scripts/deploy.sh"]}
-{"id":"mem_40b7","domain":"repository","type":"pattern","title":"Golden VMs resolve agent-then-repo, warm tier is a speed-up only","files":["control/agents.py","control/runner.py","scripts/refresh-golden.sh"]}
 {"id":"mem_c17a","domain":"repository","type":"convention","title":"One GitHub credential serves the control plane and every run VM, and it needs repo + workflow","files":["control/config.py","control/runner.py","control/github.py","control/preflight.py"]}
+{"id":"mem_5f2b","domain":"repository","type":"pattern","title":"Goldens are named for the repo, not the agent; the base is golden-copy","files":["control/agents.py","control/runner.py","control/preflight.py","scripts/refresh-golden.sh"]}

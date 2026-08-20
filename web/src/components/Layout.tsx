@@ -8,7 +8,7 @@ const NAV = [
   { to: "/", label: "Runs", icon: Activity, end: true },
   { to: "/plan", label: "Plan", icon: ListChecks },
   { to: "/projects", label: "Projects", icon: FolderGit2 },
-  { to: "/agents", label: "Agents", icon: Bot },
+  { to: "/goldens", label: "Goldens", icon: Bot },
   { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
 ]
 
