@@ -48,16 +48,27 @@ CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 
 -- Every golden snapshot the fleet holds, one row per name. An observation of a thing that
 -- exists, not an event log — fleet state belongs in a table for the same reason run state
--- does, otherwise "which agents can this deployment run?" is answered by somebody listing
+-- does, otherwise "which goldens can this deployment boot?" is answered by somebody listing
 -- snapshots and remembering.
+--
+-- `repo` is the repo slug the name carries, NULL for the base image. `agent` is which agent
+-- the image announced in its manifest on the way into its last run — a fact reported by the
+-- snapshot, not one derived from its name, which is the whole change this table's rename
+-- records.
+--
+-- Named `snapshots` rather than `goldens` for a dull but load-bearing reason: `goldens` is a
+-- table this schema already drops below, and `executescript` runs before the migrations do,
+-- so a table created here under that name would be created and then immediately dropped on
+-- every start.
 --
 -- Two clocks, deliberately far apart. `checked_at` is when the refresh loop last saw the
 -- name in the fleet, which costs a list call and says only that the snapshot is there.
 -- `verified_at` is when a run last finished on it having produced usage — the only evidence
 -- that its credentials still work, and unlike a probe it is free, because the runs were
 -- happening anyway.
-CREATE TABLE IF NOT EXISTS agents (
+CREATE TABLE IF NOT EXISTS snapshots (
     name          TEXT PRIMARY KEY,
+    repo          TEXT,
     agent         TEXT,
     version       TEXT,
     events        TEXT,
@@ -96,6 +107,13 @@ MIGRATIONS = (
     # checkout, so every column of it became unanswerable at once — dropped rather than left
     # to be read by something that has forgotten it stopped being filled in.
     "DROP TABLE IF EXISTS goldens",
+    # Its replacement, and the same reasoning one design later. The `agents` table was keyed
+    # on snapshot name with an `agent` column filled in *from that name* — so it recorded the
+    # naming convention rather than anything observed. Goldens are named for the repo now and
+    # the agent comes from the image's own manifest; `snapshots` above holds both. Dropped
+    # rather than migrated because every row is a cache of the last fleet listing, rebuilt on
+    # the next refresh.
+    "DROP TABLE IF EXISTS agents",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -170,27 +188,27 @@ async def list_runs(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def record_agent(name: str, **fields: Any) -> None:
+async def record_snapshot(name: str, **fields: Any) -> None:
     """Store what the refresh saw. One row per golden snapshot, replaced each time."""
     fields = {"name": name, **fields}
     cols = ", ".join(fields)
     marks = ", ".join("?" for _ in fields)
     async with connect() as conn:
         await conn.execute(
-            f"INSERT OR REPLACE INTO agents ({cols}) VALUES ({marks})", tuple(fields.values())
+            f"INSERT OR REPLACE INTO snapshots ({cols}) VALUES ({marks})", tuple(fields.values())
         )
         await conn.commit()
 
 
-async def agents() -> dict[str, dict]:
+async def snapshots() -> dict[str, dict]:
     """The last refresh's findings, keyed by snapshot name."""
     async with connect() as conn:
-        async with conn.execute("SELECT * FROM agents") as cur:
+        async with conn.execute("SELECT * FROM snapshots") as cur:
             rows = await cur.fetchall()
     return {r["name"]: dict(r) for r in rows}
 
 
-async def agent_evidence() -> dict[str, dict]:
+async def snapshot_evidence() -> dict[str, dict]:
     """What the runs already prove about each golden, keyed by snapshot name.
 
     This is the whole grading strategy: a golden is not asked how it is, it is judged by

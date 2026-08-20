@@ -25,7 +25,7 @@ export function Projects() {
               <TableRow>
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
-                <TableHead>Agent</TableHead>
+                <TableHead>Golden</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
               </TableRow>
@@ -45,9 +45,9 @@ export function Projects() {
                     </a>
                   </TableCell>
                   <TableCell className="font-mono">
-                    {p.agent}
+                    {p.golden || "—"}
                     {p.warm && (
-                      <Badge variant="outline" className="ml-2" title={p.golden}>
+                      <Badge variant="outline" className="ml-2">
                         warm
                       </Badge>
                     )}

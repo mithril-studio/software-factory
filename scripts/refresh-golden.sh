@@ -2,8 +2,8 @@
 # Bring a warm golden back in line with its repo: reset the checkout to the base branch, run
 # the project's own setup, and re-save the snapshot under the same name.
 #
-#   scripts/refresh-golden.sh claude mithril-studio/software-factory
-#   scripts/refresh-golden.sh claude acme/api --setup 'cd app && npm clean-install'
+#   scripts/refresh-golden.sh mithril-studio/software-factory
+#   scripts/refresh-golden.sh acme/api --setup 'cd app && npm clean-install'
 #
 # A snapshot cannot be edited in place, so refreshing one is restore, update, re-save, destroy.
 # Re-saving under the same name is not a mistake: boxd captures a new version and the previous
@@ -15,11 +15,10 @@
 # command became every project's, and that bug cost more than a missing install ever did.
 #
 # Refreshing is optional. A warm golden is a speed-up; every run installs for itself, and a
-# repo with no warm snapshot resolves to the bare `golden-<agent>` image and is merely slower.
+# repo with no warm snapshot resolves to the `golden-copy` base image and is merely slower.
 set -euo pipefail
 
 repo=""
-agent=""
 base=""
 setup=""
 dir=""
@@ -27,7 +26,7 @@ keep=0
 
 usage() {
   cat >&2 <<'USAGE'
-usage: refresh-golden.sh <agent> <owner/repo> [options]
+usage: refresh-golden.sh <owner/repo> [options]
 
   --setup CMD   how this project installs (default: the `## Setup` command in its .factory.md)
   --base REF    the branch to reset to (default: the repo's own default branch)
@@ -37,10 +36,9 @@ USAGE
   exit 2
 }
 
-[ $# -ge 2 ] || usage
-agent=$1
-repo=$2
-shift 2
+[ $# -ge 1 ] || usage
+repo=$1
+shift
 while [ $# -gt 0 ]; do
   case $1 in
     --setup) setup=${2:?--setup needs a command}; shift 2 ;;
@@ -61,8 +59,8 @@ esac
 # of non-alphanumerics collapsed to one hyphen, no hyphen at either end. A slug that disagrees
 # by one character names a snapshot no dispatch will ever resolve onto.
 slug=$(printf '%s' "$repo" | tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-*//' -e 's/-*$//')
-snapshot="golden-$agent--$slug"
-vm="refresh-$agent-$slug-$$"
+snapshot="golden-$slug"
+vm="refresh-$slug-$$"
 name=${repo##*/}
 # Tilde, not $HOME: `boxd machine cp` expands `~` on the remote side and does not expand a
 # variable, and this path is handed to both `cp` and `exec`.
@@ -109,7 +107,7 @@ esac
 
 if ! boxd snapshots list --json | grep -q "\"$snapshot\""; then
   echo "refusing: no snapshot named $snapshot" >&2
-  echo "a repo with no warm golden is not broken — its runs use golden-$agent." >&2
+  echo "a repo with no warm golden is not broken — its runs use golden-copy." >&2
   exit 1
 fi
 
@@ -184,4 +182,4 @@ else
   boxd machine remove "$vm" --confirm > /dev/null
 fi
 
-echo "==> $snapshot re-saved at $base. Runs for $repo resolve onto it ahead of golden-$agent."
+echo "==> $snapshot re-saved at $base. Runs for $repo resolve onto it ahead of golden-copy."

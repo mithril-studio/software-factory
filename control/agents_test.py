@@ -1,10 +1,14 @@
-"""The golden naming contract: what counts as an agent, and which snapshot a run forks.
+"""The golden naming contract: what counts as a golden, and which snapshot a run boots.
 
-Snapshot names are the only registry this platform has, so every check below is really the
-same question asked from a different side: can a name be misread? A machine someone called
-`goldenrod` must not become an agent. A repo full of hyphens must not swallow the separator
-and take the agent's name with it. A repo with no warm snapshot must fall back to the agent
-image rather than to some other repo's golden.
+Snapshot names are the only registry the fleet has, so every check below is really the same
+question asked from a different side: can a name be misread? A machine someone called
+`goldenrod` must not become a golden. The base image must not read as a repo, and no repo
+must ever be able to produce the base image's name. A repo with no warm snapshot must fall
+back to the base rather than to some other repo's golden.
+
+The agent is deliberately absent from all of it. It used to be the first half of every name;
+now it is something an image announces about itself in its manifest, which is why the refresh
+checks below assert that `agent` is read out of a run's manifest and never off a name.
 
 Nothing here needs credentials, a VM or a database. `available()` and the refresh loop are
 exercised against stubs precisely because a test that needs any of those is a test that stops
@@ -19,16 +23,15 @@ import sys
 
 from control import db, goldens, runner
 from control.agents import (
-    DEFAULT_AGENT,
+    BASE,
+    BASE_SNAPSHOT,
     GOLDEN_PREFIX,
-    SEP,
+    api_rows,
     available,
-    discover,
     forget,
     golden_name,
+    is_golden,
     parse_golden,
-    resolve_agent,
-    api_rows,
     resolve_snapshot,
     slug,
     version,
@@ -44,25 +47,34 @@ def check(name, got, want=True):
         fails.append(name)
 
 
+REPO = "mithril-studio/software-factory"
+WARM = "golden-mithril-studio-software-factory"
+
 # ---------- parse_golden
 
-# The two ways a name lies about being an agent. Both are AC1.
-check("parse_golden: goldenrod is a machine name, not an agent", parse_golden("goldenrod"), None)
-check("parse_golden: golden- names no agent", parse_golden("golden-"), None)
-check("parse_golden: golden-claude-- promises a repo it never names",
-      parse_golden("golden-claude--"), None)
-check("parse_golden: golden--repo has no agent either", parse_golden("golden--repo"), None)
-check("parse_golden: an unrelated snapshot is not an agent", parse_golden("software-factory"), None)
-check("parse_golden: the empty name is not an agent", parse_golden(""), None)
+# The ways a name can lie about being a golden.
+check("parse_golden: goldenrod is a machine name, not a golden", parse_golden("goldenrod"), None)
+check("parse_golden: golden- names no repo", parse_golden("golden-"), None)
+check("parse_golden: golden--repo is fringed with a hyphen a slug never carries",
+      parse_golden("golden--repo"), None)
+check("parse_golden: and so is a trailing one", parse_golden("golden-acme-"), None)
+check("parse_golden: an unrelated snapshot is not a golden", parse_golden("software-factory"), None)
+check("parse_golden: the empty name is not a golden", parse_golden(""), None)
 
-check("parse_golden: the bare agent image", parse_golden("golden-claude"), ("claude", None))
-check("parse_golden: a warm golden carries both halves",
-      parse_golden("golden-claude--mithril-studio-software-factory"),
-      ("claude", "mithril-studio-software-factory"))
-check("parse_golden: another agent parses the same way",
-      parse_golden("golden-codex--acme-api"), ("codex", "acme-api"))
+# `BASE` and `None` are the two answers that must never be confused: one is the image every
+# run falls back to, the other is somebody else's snapshot. Both are falsy, which is exactly
+# why every caller compares against `None` explicitly.
+check("parse_golden: the base image carries no repo", parse_golden(BASE_SNAPSHOT), BASE)
+check("parse_golden: and that is not the same answer as 'not a golden'",
+      parse_golden(BASE_SNAPSHOT) is None, False)
+check("parse_golden: a warm golden carries the repo slug", parse_golden(WARM),
+      "mithril-studio-software-factory")
 check("parse_golden: surrounding whitespace does not change the answer",
-      parse_golden("  golden-claude  "), ("claude", None))
+      parse_golden(f"  {WARM}  "), "mithril-studio-software-factory")
+
+check("is_golden: reads the same way, without the caller minding the difference",
+      [is_golden(n) for n in (BASE_SNAPSHOT, WARM, "goldenrod", "")],
+      [True, True, False, False])
 
 # ---------- slug
 
@@ -74,107 +86,83 @@ check("slug: dots and underscores collapse too", slug("acme/my_api.v2"), "acme-m
 check("slug: the owner is kept, so two owners cannot collide",
       slug("a/app") == slug("b/app"), False)
 
-# AC4: the separator survives a repo that is nothing but hyphens.
 HYPHENATED = [
     "mithril-studio/software-factory",
     "a-b-c/d-e-f",
     "owner/--weird--name--",
     "UPPER-CASE/Repo_Name",
+    "a/app",
 ]
 for repo in HYPHENATED:
-    name = golden_name("claude", repo)
-    check(f"slug: {repo} round-trips without losing the agent",
-          parse_golden(name), ("claude", slug(repo)))
-    check(f"slug: {repo} never contains the separator", SEP in slug(repo), False)
+    check(f"slug: {repo} round-trips through its golden name",
+          parse_golden(golden_name(repo)), slug(repo))
 
-check("slug: a golden name for no repo is just the agent image",
-      golden_name("claude"), GOLDEN_PREFIX + "claude")
+# The one collision that would matter, and why it cannot happen: `owner/name` always contains
+# a `/`, which always becomes a hyphen, so no slug is ever the single word the base is named
+# for. If that ever stops holding, a repo would silently overwrite the image every other repo
+# falls back to.
+check("slug: no repo can ever produce the base image's name",
+      any(golden_name(r) == BASE_SNAPSHOT for r in HYPHENATED), False)
+check("slug: because every slug carries the separator the owner half forces",
+      all("-" in slug(r) for r in HYPHENATED), True)
+
+check("golden_name: no repo means the base image", golden_name(), BASE_SNAPSHOT)
+check("golden_name: and so does a repo with nothing nameable in it",
+      golden_name("///"), BASE_SNAPSHOT)
+check("golden_name: a repo names itself, with no agent anywhere in it",
+      golden_name(REPO), GOLDEN_PREFIX + "mithril-studio-software-factory")
 
 # ---------- resolve_snapshot
 
-REPO = "mithril-studio/software-factory"
-WARM = "golden-claude--mithril-studio-software-factory"
-IMAGE = "golden-claude"
-FLEET = (IMAGE, WARM, "golden-codex", "goldenrod", "software-factory")
+FLEET = (BASE_SNAPSHOT, WARM, "golden-acme-api", "goldenrod", "software-factory")
 
-# AC2, both directions.
-check("resolve_snapshot: a warm snapshot wins", resolve_snapshot("claude", REPO, FLEET), WARM)
-check("resolve_snapshot: no warm snapshot falls back to the agent image",
-      resolve_snapshot("claude", "mithril-studio/other-repo", FLEET), IMAGE)
-check("resolve_snapshot: another agent's warm golden is never borrowed",
-      resolve_snapshot("codex", REPO, FLEET), "golden-codex")
-check("resolve_snapshot: no repo asks for the image directly",
-      resolve_snapshot("claude", None, FLEET), IMAGE)
-check("resolve_snapshot: an agent with no image at all is a configuration error",
-      resolve_snapshot("cursor", REPO, FLEET), None)
-check("resolve_snapshot: an empty fleet resolves to nothing",
-      resolve_snapshot("claude", REPO, ()), None)
-check("resolve_snapshot: no agent resolves to nothing", resolve_snapshot("", REPO, FLEET), None)
+check("resolve_snapshot: a warm snapshot wins", resolve_snapshot(REPO, FLEET), WARM)
+check("resolve_snapshot: no warm snapshot falls back to the base",
+      resolve_snapshot("mithril-studio/other-repo", FLEET), BASE_SNAPSHOT)
+check("resolve_snapshot: another repo's warm golden is never borrowed",
+      resolve_snapshot("acme/other", FLEET), BASE_SNAPSHOT)
+check("resolve_snapshot: no repo asks for the base directly",
+      resolve_snapshot(None, FLEET), BASE_SNAPSHOT)
+check("resolve_snapshot: a fleet with no base image resolves to nothing",
+      resolve_snapshot("acme/other", ("golden-acme-api",)), None)
+check("resolve_snapshot: an empty fleet resolves to nothing", resolve_snapshot(REPO, ()), None)
 
-# ---------- discover
+# The fallback is the whole reason connecting a repo does not wait on provisioning: an
+# unprovisioned repo is not an error state, it is the ordinary first run.
+check("resolve_snapshot: an unprovisioned repo still dispatches",
+      bool(resolve_snapshot("brand/new", (BASE_SNAPSHOT,))), True)
 
-check("discover: each agent is named once, sorted", discover(FLEET), ("claude", "codex"))
-check("discover: nothing in the fleet, nothing discovered", discover(()), ())
-
-# ---------- resolve_agent
-
-WATCHED = {"mithril-studio/other-repo": "codex"}
-
-# AC3: nothing anywhere names an agent, so the default takes it.
-check("resolve_agent: a repo that names no agent anywhere resolves to claude",
-      resolve_agent(REPO, {}), DEFAULT_AGENT)
-check("resolve_agent: claude is still the answer when it is the discovered agent",
-      resolve_agent(REPO, {}, available=FLEET), "claude")
-
-check("resolve_agent: an override wins over everything",
-      resolve_agent(REPO, WATCHED, override="cursor", default="codex", available=FLEET), "cursor")
-check("resolve_agent: the repo's own entry beats the deployment default",
-      resolve_agent("mithril-studio/other-repo", WATCHED, default="claude"), "codex")
-check("resolve_agent: the deployment default beats the built-in one",
-      resolve_agent(REPO, WATCHED, default="codex"), "codex")
-check("resolve_agent: blank choices are not choices",
-      resolve_agent(REPO, {REPO: "  "}, override="", default=None), DEFAULT_AGENT)
-check("resolve_agent: surrounding whitespace is trimmed off a choice",
-      resolve_agent(REPO, {}, override=" codex "), "codex")
-
-# Past the explicit choices the fleet decides, and only when it can decide alone.
-check("resolve_agent: one discovered agent and no claude is unambiguous",
-      resolve_agent(REPO, {}, available=("golden-codex", "golden-codex--acme-api")), "codex")
-check("resolve_agent: two discovered agents and no claude asks a human",
-      resolve_agent(REPO, {}, available=("golden-codex", "golden-cursor")), None)
-
-# ---------- api rows  (AC1)
+# ---------- api rows
 # What the fleet page is handed. The rows come from the refresh loop's table, which is the
-# only registry there is — so this is a pure function over rows and the default agent's name,
-# and the whole thing is testable without a database, a fleet or a clock.
+# only registry there is — so this is a pure function over rows, and the whole thing is
+# testable without a database, a fleet or a clock.
 
 KNOWN = {
-    "golden-claude": {
-        "agent": "claude", "version": "3", "events": "claude-code", "agent_version": "2.1",
-        "ok": 1, "error": None, "verified_at": "2026-08-18T10:00:00+00:00",
+    BASE_SNAPSHOT: {
+        "repo": None, "agent": "claude", "version": "3", "events": "claude-code",
+        "agent_version": "2.1", "ok": 1, "error": None,
+        "verified_at": "2026-08-18T10:00:00+00:00",
         "manifest": "{}", "checked_at": "2026-08-18T12:00:00+00:00",
     },
-    "golden-codex": {
-        "agent": "codex", "version": "1", "events": "codex", "agent_version": None,
-        "ok": 0, "error": "boom", "verified_at": None,
+    "golden-acme-api": {
+        "repo": "acme-api", "agent": "codex", "version": "1", "events": "codex",
+        "agent_version": None, "ok": 0, "error": "boom", "verified_at": None,
         "manifest": None, "checked_at": "2026-08-18T12:00:00+00:00",
     },
     WARM: {
-        "agent": "claude", "version": "7", "events": None, "agent_version": None,
-        "ok": 0, "error": None, "verified_at": None,
+        "repo": "mithril-studio-software-factory", "agent": None, "version": "7",
+        "events": None, "agent_version": None, "ok": 0, "error": None, "verified_at": None,
         "manifest": None, "checked_at": "2026-08-18T12:00:00+00:00",
     },
 }
 
-rows = api_rows(KNOWN, "claude")
-check("api rows: one row per discovered golden snapshot",
-      [r["snapshot"] for r in rows], ["golden-claude", WARM, "golden-codex"])
+rows = api_rows(KNOWN)
+check("api rows: the base sorts first, because an empty list below it is explained by it",
+      [r["snapshot"] for r in rows], [BASE_SNAPSHOT, "golden-acme-api", WARM])
 check("api rows: nothing is invented and nothing is dropped", len(rows), len(KNOWN))
-check("api rows: the default agent's snapshots are marked, and only those",
-      {r["snapshot"]: r["default"] for r in rows},
-      {"golden-claude": True, WARM: True, "golden-codex": False})
-check("api rows: and they sort first, so the agent a repo gets by default is at the top",
-      rows[0]["agent"], "claude")
+check("api rows: the base is marked as one, and only the base",
+      {r["snapshot"]: r["base"] for r in rows},
+      {BASE_SNAPSHOT: True, "golden-acme-api": False, WARM: False})
 check("api rows: each row carries what the refresh recorded",
       {k: rows[0][k] for k in ("agent", "version", "events", "agent_version", "ok", "error")},
       {"agent": "claude", "version": "3", "events": "claude-code", "agent_version": "2.1",
@@ -182,24 +170,26 @@ check("api rows: each row carries what the refresh recorded",
 check("api rows: verified_at is passed through as the evidence it is",
       rows[0]["verified_at"], "2026-08-18T10:00:00+00:00")
 check("api rows: a golden no run has proved reads unproven, not broken",
-      (rows[1]["ok"], rows[1]["error"], rows[1]["verified_at"]), (False, None, None))
+      (rows[2]["ok"], rows[2]["error"], rows[2]["verified_at"]), (False, None, None))
 check("api rows: a golden whose last run failed carries that error",
-      (rows[2]["ok"], rows[2]["error"]), (False, "boom"))
+      (rows[1]["ok"], rows[1]["error"]), (False, "boom"))
 check("api rows: the columns are exactly what the page asks for",
       sorted(rows[0]),
-      ["agent", "agent_version", "default", "error", "events", "ok", "snapshot", "verified_at",
-       "version"])
+      ["agent", "agent_version", "base", "error", "events", "ok", "repo", "snapshot",
+       "verified_at", "version"])
+check("api rows: the base row names no repo, because it serves every repo",
+      rows[0]["repo"], None)
+check("api rows: a row that recorded no agent says so rather than guessing one from the name",
+      rows[2]["agent"], None)
+check("api rows: the repo falls back to the slug its name carries",
+      api_rows({"golden-acme-api": {}})[0]["repo"], "acme-api")
 
 # The registry is the name. A row for something that is not a golden is a row the refresh
-# should never have written, and rendering it would put a machine in a table of agents.
+# should never have written, and rendering it would put a machine in a table of goldens.
 check("api rows: a row whose name is not a golden is dropped",
-      api_rows({"goldenrod": {"agent": "x"}, "golden-claude": {"agent": "claude"}}, "claude"),
-      [r for r in api_rows({"golden-claude": {"agent": "claude"}}, "claude")])
+      [r["snapshot"] for r in api_rows({"goldenrod": {}, BASE_SNAPSHOT: {}})],
+      [BASE_SNAPSHOT])
 check("api rows: an empty table is an empty list, not an error", api_rows({}), [])
-check("api rows: with no default configured nothing is marked as one",
-      [r["default"] for r in api_rows(KNOWN, "")], [False, False, False])
-check("api rows: the agent falls back to the one its name carries",
-      api_rows({"golden-pi": {}}, "claude")[0]["agent"], "pi")
 
 
 # ---------- available
@@ -227,9 +217,9 @@ class FakeBoxd:
 
 
 forget()
-boxd = FakeBoxd(["golden-claude", WARM, "goldenrod", "software-factory", "golden-"])
+boxd = FakeBoxd([BASE_SNAPSHOT, WARM, "goldenrod", "software-factory", "golden-"])
 names = asyncio.run(available(boxd))
-check("available: only goldens come back, sorted", names, tuple(sorted(["golden-claude", WARM])))
+check("available: only goldens come back, sorted", names, tuple(sorted([BASE_SNAPSHOT, WARM])))
 asyncio.run(available(boxd))
 check("available: a second lookup inside the TTL does not re-read the fleet", boxd.calls, 1)
 
@@ -238,24 +228,24 @@ asyncio.run(available(boxd))
 check("available: forgetting the cache re-reads the fleet", boxd.calls, 2)
 
 check("available: the version arrives with the listing, no second round trip",
-      version("golden-claude"), "1")
-check("available: a name the listing never held has no version", version("golden-codex"), "")
+      version(BASE_SNAPSHOT), "1")
+check("available: a name the listing never held has no version", version("golden-acme-api"), "")
 
-# AC2: a snapshot somebody deleted must leave the answer, not linger in a cache. This is what
-# stops a dispatch resolving onto a golden that is no longer forkable.
+# A snapshot somebody deleted must leave the answer, not linger in a cache. This is what stops
+# a dispatch resolving onto a golden that is no longer forkable.
 boxd.names.remove(WARM)
 forget()
 check("vanished: a deleted snapshot stops being available",
       WARM in asyncio.run(available(boxd)), False)
-check("vanished: and stops being resolvable for the repo it was warmed for",
-      resolve_snapshot("claude", REPO, asyncio.run(available(boxd))), IMAGE)
+check("vanished: and the repo it was warmed for falls back to the base rather than failing",
+      resolve_snapshot(REPO, asyncio.run(available(boxd))), BASE_SNAPSHOT)
 check("vanished: its version leaves with it", version(WARM), "")
 check("vanished: the snapshots that remain are untouched",
-      asyncio.run(available(boxd)), ("golden-claude",))
+      asyncio.run(available(boxd)), (BASE_SNAPSHOT,))
 forget()
 
 
-# ---------- refresh  (AC1)
+# ---------- refresh
 # The loop that replaced the freshness sweep. It reads the fleet and writes what it saw; the
 # grading is done from rows the runs already wrote, so nothing here boots a VM. Both the
 # database and boxd are stubbed — a golden's health is a question about evidence, and
@@ -265,7 +255,7 @@ recorded: dict[str, dict] = {}
 evidence: dict[str, dict] = {}
 
 
-async def fake_record_agent(name, **fields):
+async def fake_record_snapshot(name, **fields):
     recorded[name] = fields
 
 
@@ -278,24 +268,25 @@ def run_refresh(names, seen=None):
     recorded.clear()
     evidence.clear()
     evidence.update(seen or {})
-    real = (runner.client, db.record_agent, db.agent_evidence)
+    real = (runner.client, db.record_snapshot, db.snapshot_evidence)
     runner.client = lambda: FakeBoxd(names)
-    db.record_agent, db.agent_evidence = fake_record_agent, fake_evidence
+    db.record_snapshot, db.snapshot_evidence = fake_record_snapshot, fake_evidence
     try:
         return asyncio.run(goldens.refresh())
     finally:
-        runner.client, db.record_agent, db.agent_evidence = real
+        runner.client, db.record_snapshot, db.snapshot_evidence = real
         forget()
 
 
-FLEET_ROWS = ["golden-claude", WARM, "golden-codex", "goldenrod", "software-factory"]
+FLEET_ROWS = [BASE_SNAPSHOT, WARM, "golden-acme-api", "goldenrod", "software-factory"]
 
 rows = run_refresh(FLEET_ROWS)
 check("refresh: one row per discovered golden, and none for anything else",
-      sorted(recorded), sorted(["golden-claude", WARM, "golden-codex"]))
+      sorted(recorded), sorted([BASE_SNAPSHOT, WARM, "golden-acme-api"]))
 check("refresh: what it returns is what it wrote", sorted(rows), sorted(recorded))
-check("refresh: each row names the agent its snapshot name carries",
-      recorded[WARM]["agent"], "claude")
+check("refresh: each row names the repo its snapshot name carries",
+      recorded[WARM]["repo"], "mithril-studio-software-factory")
+check("refresh: and the base names none", recorded[BASE_SNAPSHOT]["repo"], None)
 check("refresh: and carries the version the listing saw", recorded[WARM]["version"], "1")
 check("refresh: a golden nothing has run on is unproven, not broken",
       (recorded[WARM]["ok"], recorded[WARM]["error"], recorded[WARM]["verified_at"]),
@@ -311,28 +302,33 @@ check("refresh: listing the same fleet again writes the same one row per name",
 
 # The grade comes from the runs, including the manifest the golden announced on the way in.
 rows = run_refresh(FLEET_ROWS, {
-    "golden-claude": {
+    BASE_SNAPSHOT: {
         "last_run": "r1", "ok": 1, "error": None, "verified_at": "2026-08-18T10:00:00+00:00",
         "manifest": '{"agent": "codex", "events": "codex", "transcript": "/t/*.jsonl", '
                     '"version": "0.4.1"}',
     },
-    "golden-codex": {"last_run": "r2", "ok": 0, "error": "boom", "manifest": None},
+    "golden-acme-api": {"last_run": "r2", "ok": 0, "error": "boom", "manifest": None},
 })
 check("refresh: a golden a run finished on carries that run's verdict",
-      (recorded["golden-claude"]["ok"], recorded["golden-claude"]["last_run"]), (1, "r1"))
+      (recorded[BASE_SNAPSHOT]["ok"], recorded[BASE_SNAPSHOT]["last_run"]), (1, "r1"))
 check("refresh: verified_at is evidence from a run, not a probe",
-      recorded["golden-claude"]["verified_at"], "2026-08-18T10:00:00+00:00")
+      recorded[BASE_SNAPSHOT]["verified_at"], "2026-08-18T10:00:00+00:00")
 check("refresh: the manifest the golden announced is unpacked into columns",
-      (recorded["golden-claude"]["events"], recorded["golden-claude"]["transcript"],
-       recorded["golden-claude"]["agent_version"]),
+      (recorded[BASE_SNAPSHOT]["events"], recorded[BASE_SNAPSHOT]["transcript"],
+       recorded[BASE_SNAPSHOT]["agent_version"]),
       ("codex", "/t/*.jsonl", "0.4.1"))
+# The whole point of taking the agent out of the name: which agent an image runs is what the
+# image said, not what somebody called the snapshot.
+check("refresh: the agent comes from the manifest and from nowhere else",
+      (recorded[BASE_SNAPSHOT]["agent"], recorded["golden-acme-api"]["agent"]), ("codex", None))
 check("refresh: a failed last run is reported as the error it was",
-      (recorded["golden-codex"]["ok"], recorded["golden-codex"]["error"]), (0, "boom"))
+      (recorded["golden-acme-api"]["ok"], recorded["golden-acme-api"]["error"]), (0, "boom"))
 check("refresh: an unreadable manifest costs the columns, not the row",
-      (recorded["golden-codex"]["events"], recorded["golden-codex"]["agent_version"]),
+      (recorded["golden-acme-api"]["events"], recorded["golden-acme-api"]["agent_version"]),
       (None, None))
 check("refresh: evidence for a snapshot the fleet no longer holds is not written",
       "golden-gone" in recorded, False)
+
 
 # A fleet nobody can list is a refresh that recorded nothing, never a control plane that fell
 # over: this loop runs unattended every five minutes.
@@ -343,15 +339,15 @@ class BrokenBoxd(FakeBoxd):
 
 recorded.clear()
 real_client = runner.client
-real_record, real_evidence = db.record_agent, db.agent_evidence
+real_record, real_evidence = db.record_snapshot, db.snapshot_evidence
 runner.client = lambda: BrokenBoxd([])
-db.record_agent, db.agent_evidence = fake_record_agent, fake_evidence
+db.record_snapshot, db.snapshot_evidence = fake_record_snapshot, fake_evidence
 try:
     check("refresh: an unlistable fleet returns nothing and raises nothing",
           asyncio.run(goldens.refresh()), {})
 finally:
     runner.client = real_client
-    db.record_agent, db.agent_evidence = real_record, real_evidence
+    db.record_snapshot, db.snapshot_evidence = real_record, real_evidence
     forget()
 check("refresh: and writes no rows", recorded, {})
 

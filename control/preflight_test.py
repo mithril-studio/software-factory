@@ -20,7 +20,7 @@ import sys
 import httpx
 
 import control.github as gh
-from control.preflight import Check, agent_check, profile_checks, push_check, report
+from control.preflight import Check, golden_check, profile_checks, push_check, report
 from control.probe import parse
 
 fails: list[str] = []
@@ -105,35 +105,50 @@ check("setup warning: a whitespace-only profile is no profile",
 check("setup warning: a missing profile is not also blamed for the setup line",
       any("setup" in c.name for c in profile_checks(None)), False)
 
-# ---------- no agent  (AC3)
+# ---------- is there a golden to boot?
 # The one machine-side question left, and the cheapest of the six the VM probe used to ask.
-# Blocking, unlike the profile warnings: a repo whose agent resolves to no snapshot does not
-# build worse, it cannot be dispatched at all — the fork has nothing to fork from.
+#
+# It got narrower when the agent left the snapshot name. It used to fail for a repo whose
+# *agent* had no image — a state a deployment could reach by typo. Now a repo with no golden
+# of its own boots the base and installs for itself, so the only blocking answer is a fleet
+# with no base image at all: not this repo's problem to fix, and one that stops every other
+# repo too. Reporting an unprovisioned repo as not-ready would make connecting one wait on
+# provisioning, which is exactly what the two-tier fallback exists to avoid.
 REPO = "acme/api"
-WARM = "golden-claude--acme-api"
+BASE = "golden-copy"
+WARM = "golden-acme-api"
 
-check("no agent: a fleet with the agent's image is ready",
-      agent_check(REPO, "claude", ["golden-claude"]).ok, True)
-check("no agent: a warm snapshot answers for it too",
-      agent_check(REPO, "claude", [WARM]).ok, True)
-check("no agent: the detail names the snapshot that would boot",
-      agent_check(REPO, "claude", [WARM]).detail, f"claude boots {WARM}")
+warm = golden_check(REPO, [BASE, WARM])
+check("golden: a repo with its own warm snapshot is ready", warm.ok, True)
+check("golden: and the detail names the snapshot that would boot", BASE in warm.detail, False)
+check("golden: which is the warm one", WARM in warm.detail, True)
 
-missing = agent_check(REPO, "pi", ["golden-claude", WARM])
-check("no agent: an agent no snapshot provides is not ready", missing.ok, False)
-check("no agent: and it blocks, rather than warning", missing.fatal, True)
-check("no agent: so the repo is reported not ready", report(REPO, [missing]), False)
-check("no agent: the detail names the snapshot somebody has to build",
-      "golden-pi" in missing.detail, True)
-check("no agent: and what the fleet does hold, so the fix is obvious",
+cold = golden_check(REPO, [BASE])
+check("golden: a repo with no golden of its own is ready anyway", cold.ok, True)
+check("golden: and it does not block", cold.fatal, True)
+check("golden: so the repo is reported ready", report(REPO, [cold]), True)
+check("golden: the detail says which tier answered", BASE in cold.detail, True)
+check("golden: and says provisioning is a speed-up rather than a repair",
+      "not a blocker" in cold.detail, True)
+
+check("golden: another repo's warm golden is never borrowed, the base answers instead",
+      golden_check("acme/other", [BASE, WARM]).detail.startswith(BASE), True)
+
+# The one thing that really stops a dispatch. Asked of a repo with no warm golden of its own,
+# because a repo that has one is the case where the base is not needed.
+missing = golden_check("acme/other", [WARM])
+check("golden: a fleet with no base image is not ready", missing.ok, False)
+check("golden: and it blocks, rather than warning", missing.fatal, True)
+check("golden: so the repo is reported not ready", report("acme/other", [missing]), False)
+check("golden: the detail names the snapshot somebody has to build",
+      BASE in missing.detail, True)
+check("golden: and what the fleet does hold, so the fix is obvious",
       WARM in missing.detail, True)
 
-empty = agent_check(REPO, "claude", [])
-check("no agent: an empty fleet is not ready either", empty.ok, False)
-check("no agent: and says so rather than listing nothing",
+empty = golden_check(REPO, [])
+check("golden: an empty fleet is not ready either", empty.ok, False)
+check("golden: and says so rather than listing nothing",
       "no golden snapshots at all" in empty.detail, True)
-check("no agent: another repo's warm golden is never borrowed",
-      agent_check("acme/other", "claude", [WARM]).ok, False)
 
 
 # ---------- can this token push?  (the check that used to answer without asking)

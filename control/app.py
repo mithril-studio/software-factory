@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import agents, auth, config, db, github, goldens, poller, preflight, runner
+from . import agents, auth, db, github, goldens, poller, preflight, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -106,21 +106,16 @@ async def _available() -> tuple[str, ...]:
 
 @app.get("/api/config")
 async def api_config():
-    """What the shell needs: watched repos and their agents, limits, and what is wrong.
+    """What the shell needs: the repos being watched, limits, and what is wrong.
 
     Two kinds of wrong, kept apart. `missing` is a setting nobody filled in; `problems` is a
-    configuration that is complete but has nothing to run on — an agent with no snapshot yet.
-    The second question needs the fleet, which is why it lives here (async) and not in
+    configuration that is complete but has nothing to run on — no base image yet. The second
+    question needs the fleet, which is why it lives here (async) and not in
     `settings.missing()`, which is synchronous and gates starting a run.
     """
     available = await _available()
     return {
         "repos": list(settings.repos),
-        "watched": [
-            {"repo": repo, "agent": settings.agent_for(repo)} for repo, _ in settings.watched
-        ],
-        "agents": list(agents.discover(available)),
-        "agent_default": settings.agent_default,
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
@@ -172,7 +167,6 @@ async def api_telemetry():
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    agent: str | None = None
     # A review of a pull request a build already opened, rather than a build. Both are runs
     # on a fork, which is why one endpoint starts either.
     kind: str = "build"
@@ -197,29 +191,15 @@ async def api_start_run(body: StartRun):
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
     repo = body.repo.strip()
-    if body.agent:
-        # Validated against the snapshots that exist, because this is the one place a typo
-        # should be loud: quietly running somebody's issue on a different agent than they
-        # asked for is worse than refusing to start.
-        wrong = config.unknown_agent(body.agent, await _available())
-        if wrong:
-            raise HTTPException(400, wrong)
     try:
         if body.kind == "review":
             if not body.pr_url or not body.branch:
                 raise ValueError("a review needs pr_url and branch")
             run_id = await runner.create_review(
-                repo,
-                body.issue_number,
-                body.pr_url,
-                body.branch,
-                agent=body.agent,
-                cycle=body.attempt,
+                repo, body.issue_number, body.pr_url, body.branch, cycle=body.attempt
             )
         elif body.kind == "build":
-            run_id = await runner.create(
-                repo, body.issue_number, agent=body.agent, attempt=body.attempt
-            )
+            run_id = await runner.create(repo, body.issue_number, attempt=body.attempt)
         else:
             raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001
@@ -305,15 +285,15 @@ async def api_plan(repo: str | None = None):
     return out
 
 
-@app.post("/api/agents/refresh")
-async def api_agent_refresh():
+@app.post("/api/goldens/refresh")
+async def api_goldens_refresh():
     """Re-list the golden snapshots now, rather than waiting for the next refresh."""
     return await goldens.refresh()
 
 
 @app.get("/api/preflight")
 async def api_preflight(repo: str):
-    """Whether `repo` is ready to be dispatched to, and an agent exists to take it.
+    """Whether `repo` is ready to be dispatched to, and a golden exists to boot for it.
 
     Read-only: it reports, it never repairs. Answers here cost a second; the same answers
     found during a run cost a VM and forty minutes.
@@ -332,9 +312,9 @@ async def api_preflight(repo: str):
 async def api_projects():
     """Watched repos with their run tallies and the snapshot their runs boot."""
     stats = await db.stats_by_repo()
-    # `watched` names an agent, not a machine, so the golden is derived the same way a
-    # dispatch derives it — otherwise this column would report an agent where the fleet
-    # views report a snapshot name.
+    # Derived the same way a dispatch derives it, rather than by reading a name off a config
+    # value — otherwise this column would say what the repo was configured with where the
+    # fleet views say what would actually boot.
     boxd = runner.client()
     try:
         sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
@@ -343,18 +323,16 @@ async def api_projects():
     finally:
         await boxd.close()
     out = []
-    for repo, _ in settings.watched:
+    for repo in settings.repos:
         golden = sources.get(repo, "")
         s = stats.get(repo, {})
-        agent = settings.agent_for(repo)
         out.append(
             {
                 "repo": repo,
-                "agent": agent,
                 "golden": golden,
                 # Whether the snapshot that boots is this repo's own warm tier rather than
-                # the bare agent image. Decided here, where the naming contract lives.
-                "warm": bool(golden) and golden == agents.golden_name(agent, repo),
+                # the base image. Decided here, where the naming contract lives.
+                "warm": bool(golden) and golden == agents.golden_name(repo),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -365,23 +343,23 @@ async def api_projects():
     return out
 
 
-# --------------------------------------------------------------------------- agents / fleet
+# --------------------------------------------------------------------------- goldens / fleet
 
 # Two different questions, and they stopped having the same answer when goldens became
-# snapshots. What the factory *can run* is a list of snapshots (`/api/agents`); what is
+# snapshots. What the factory *can boot* is a list of snapshots (`/api/goldens`); what is
 # *running* is a list of machines (`/api/machines`). The old endpoint answered the second and
-# was named for the first, which is why nothing in the fleet view could tell you an agent
+# was named for the first, which is why nothing in the fleet view could tell you a golden
 # existed until a run had already failed to find it.
 
 
-@app.get("/api/agents")
-async def api_agents():
+@app.get("/api/goldens")
+async def api_goldens():
     """The golden snapshots this deployment can dispatch onto, as the refresh loop last saw them.
 
     Served from the table rather than from boxd, so this stays cheap enough to poll and says
     the same thing a dispatch would: `goldens.refresh()` is the one place that reads the fleet.
     """
-    return agents.api_rows(await db.agents(), settings.agent_default)
+    return agents.api_rows(await db.snapshots())
 
 
 @app.get("/api/machines")

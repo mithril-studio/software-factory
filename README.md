@@ -98,7 +98,7 @@ that layer existed:
 ## What a run does
 
 1. Fetch the issue from GitHub
-2. Fork the golden VM (~0.2s), with idle-suspend disabled and a self-destruct timer set
+2. Restore a VM from the golden snapshot (~0.2s), with idle-suspend disabled and a self-destruct timer set
 3. Clone the assigned repo (or reuse a checkout the golden already has), then `git fetch` and
    check out `factory/issue-<n>` from the default branch
 4. Run `claude -p` with the issue as the prompt, streaming its event log back live
@@ -119,30 +119,39 @@ The name is the whole registry. There is no list of goldens anywhere else:
 
 | Snapshot | What it is |
 |---|---|
-| `golden-<agent>` | The **agent image**. Tooling, skills, an agent login, warm toolchain caches — and no repo. Serves every repo. |
-| `golden-<agent>--<owner-repo>` | The **warm tier**: the same image with one repo already cloned at `$HOME/work/<name>` and installed. |
+| `golden-copy` | The **base image**. Tooling, skills, an agent login, warm toolchain caches — and no repo. Serves every repo. |
+| `golden-<owner-repo>` | The **warm tier**: the same image with one repo already cloned at `$HOME/work/<name>` and installed. |
 
 A run resolves in that order, most specific first (`agents.resolve_snapshot`):
 
-1. `golden-<agent>--<owner-repo>` for the repo it was assigned, if that snapshot exists;
-2. otherwise `golden-<agent>`;
+1. `golden-<owner-repo>` for the repo it was assigned, if that snapshot exists;
+2. otherwise `golden-copy`;
 3. otherwise nothing — the dispatch fails rather than borrowing somebody else's golden, and
    `preflight` says so before you spend a run finding out.
 
-`<agent>` comes from `FACTORY_REPOS` (`owner/repo=agent`) or `FACTORY_AGENT_DEFAULT`.
 `<owner-repo>` is the repo slugged: lowercase, every run of non-alphanumerics collapsed to one
-hyphen. The separator is **two** hyphens precisely so a repo full of hyphens can never be
-misread as part of the agent's name.
+hyphen. The owner half is kept, so two owners with a repo of the same name cannot collide —
+and because `owner/name` always contains a `/`, every slug carries a hyphen and no repo can
+ever produce the bare name `copy`.
+
+**The agent is not in the name.** It used to be (`golden-<agent>--<owner-repo>`), which made
+listing the snapshots the way to discover the agents — elegant, and backwards for a platform
+that watches many repos and runs one agent. Which agent an image launches is now something the
+image says about itself: every golden carries `/etc/factory/agent.json` and announces it into
+the run log, which is recorded on the run. That registry cannot drift from what actually
+booted. Running a *second* agent needs a second base image and a way to choose between them —
+on the backlog, deliberately, since nothing needs it yet.
 
 **The warm tier is only a speed-up.** Every run installs the repo for itself either way — the
 prompt says so, and says nothing about dependencies being present. So a repo with no warm
 snapshot is not broken, and a warm snapshot that has gone stale costs minutes, not
-correctness. That is the whole reason a golden can be repo-agnostic at all.
+correctness. That is what lets a repo be connected and dispatched in the same minute, with
+provisioning catching up afterwards.
 
-### Building one: `scripts/build-golden.sh <agent>`
+### Building the base: `scripts/build-golden.sh`
 
 ```bash
-scripts/build-golden.sh claude
+scripts/build-golden.sh
 ```
 
 Creates a machine from the `factory-base` snapshot, installs that agent's CLI, the skills from
@@ -150,7 +159,7 @@ Creates a machine from the `factory-base` snapshot, installs that agent's CLI, t
 package-manager download caches (node versions, pnpm/yarn, CPython — toolchains, never a
 project's packages), writes the two files a golden owes the control plane
 (`/usr/local/bin/factory-agent` and `/etc/factory/agent.json`, see `control/README.md` §2.3),
-runs its checks while the machine is still alive, saves `golden-<agent>`, and destroys the
+runs its checks while the machine is still alive, saves `golden-copy`, and destroys the
 machine.
 
 It stops once, in the middle, for the one step a script cannot do: **the agent's login is a
@@ -159,18 +168,18 @@ credential has to be on disk inside the machine before the snapshot captures it.
 credential expires, which is what re-running this script is for. `--no-login` skips the pause
 for a deployment that sets `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` instead.
 
-An agent the script has never seen needs `--cli-install`, `--launch` and `--manifest`. It
-refuses rather than guessing: a wrong launch line produces a golden that looks built and dies
-at the first dispatch.
+An agent the script has never seen needs `--cli-install`, `--launch` and `--manifest`, and
+`--name` to keep it off `golden-copy`. It refuses rather than guessing: a wrong launch line
+produces a golden that looks built and dies at the first dispatch.
 
-### Refreshing a warm one: `scripts/refresh-golden.sh <agent> <owner/repo>`
+### Refreshing a warm one: `scripts/refresh-golden.sh <owner/repo>`
 
 ```bash
-scripts/refresh-golden.sh claude mithril-studio/software-factory
+scripts/refresh-golden.sh mithril-studio/software-factory
 ```
 
 A snapshot cannot be edited in place, so this is restore, update, re-save, destroy: create a
-machine from `golden-<agent>--<slug>`, **refuse if the working tree is dirty**, fetch and hard
+machine from `golden-<slug>`, **refuse if the working tree is dirty**, fetch and hard
 reset to the base branch, run the project's setup command, re-save under the same name (boxd
 captures a new version; the old one stays forkable, so a run dispatched mid-refresh keeps
 working), destroy the machine.
@@ -194,15 +203,17 @@ Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials
 ### Knowing which goldens work
 
 There used to be an hourly sweep that `exec`d into every golden and asked how far behind its
-checkout was and whether a dependency manifest had moved. A golden is a repo-agnostic
-snapshot now: it has no checkout, so all of that stopped having an answer at once — and the
-thing that actually kills a golden was never on the list. What kills one is credential
-expiry, and the only real test of a credential is using it.
+checkout was and whether a dependency manifest had moved. A golden is a snapshot now: there is
+no machine to ask, and a stale warm tier is re-provisioned rather than diagnosed — so all of
+that stopped being worth asking at once, and the thing that actually kills a golden was never
+on the list. What kills one is credential expiry, and the only real test of a credential is
+using it.
 
 So the control plane grades by evidence instead. Every `FACTORY_AGENT_REFRESH` seconds (300
 by default) it re-lists the golden snapshots — one API call, no VM — and records a row per
-name in the `agents` table: which agent it is, its snapshot version, what its last run did on
-it, and what that run's manifest announced. `POST /api/agents/refresh` runs one on demand.
+name in the `snapshots` table: which repo it was warmed for, its snapshot version, what its
+last run did on it, and what that run's manifest announced (including which agent it runs).
+`POST /api/goldens/refresh` runs one on demand.
 
 The column that matters is `verified_at`: **when a run last finished on that snapshot having
 produced usage.** A golden that emitted tokens authenticated, so its `claude` login and its
@@ -215,11 +226,11 @@ re-snapshot it under the same name.
 
 ## Adding a repo
 
-1. Make sure an agent exists for it — a `golden-<agent>` snapshot, built by
-   `scripts/build-golden.sh <agent>` (above). A repo does not need one of its own; a
-   `golden-claude` serves every repo that names no other agent. A warm
-   `golden-<agent>--<owner-repo>` is optional and only makes runs faster.
-2. Add it to `FACTORY_REPOS`, as `owner/repo` or as `owner/repo=agent`.
+1. Make sure the base image exists — a `golden-copy` snapshot, built by
+   `scripts/build-golden.sh` (above). A repo does not need a golden of its own; `golden-copy`
+   serves every repo that has none. A warm `golden-<owner-repo>` is optional and only makes
+   runs faster.
+2. Add it to `FACTORY_REPOS` as `owner/repo`.
 3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
    without checks, auto-merge can never pass its gate and every pull request waits for a
    human.
@@ -300,7 +311,7 @@ FastAPI — one deployable, at the cost of a `vite build` step. It reads the JSO
 - **Projects** — watched repos with run tallies, the agent each one dispatches to, and
   whether that agent has a warm snapshot for it.
 - **Agents** — two tables, because they stopped being one question when goldens became
-  snapshots. What the factory *can run*: every golden snapshot (`/api/agents`), its version,
+  snapshots. What the factory *can boot*: every golden snapshot (`/api/goldens`), its version,
   its telemetry adapter, and whether a run has ever proved its credentials. What *is* running:
   the boxd machines (`/api/machines`), by role, orphans flagged, with a reconcile button.
 - **Telemetry** — where the money and the time go: cost by token class (cache reads are most

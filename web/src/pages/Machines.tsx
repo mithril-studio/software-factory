@@ -1,4 +1,4 @@
-import { post, usePoll, type Agent, type Machine } from "@/lib/api"
+import { post, usePoll, type Golden, type Machine } from "@/lib/api"
 import { useState } from "react"
 import { Boxes, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -8,44 +8,48 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { PageHeader, Empty, ErrorNote } from "@/components/Page"
 
 /** One page, two questions that stopped having the same answer when goldens became snapshots:
- *  what this deployment *can* run, and what is running. The agents table is first because an
- *  empty one explains an empty second table, and never the other way round. */
+ *  what this deployment *can* boot, and what is running. The goldens table is first because
+ *  an empty one explains an empty second table, and never the other way round. */
 
 /** Evidence, not a probe. A golden is graded by whether a run finished on it having produced
  *  usage — its credential is what expires, and using one is the only test that proves anything.
  *  So "unproven" is a real third state and must not read as broken. */
-function Health({ a }: { a: Agent }) {
+function Health({ a }: { a: Golden }) {
   if (a.error) return <Badge variant="bad">{a.error}</Badge>
   if (a.verified_at) return <Badge variant="ok">verified {a.verified_at.slice(0, 10)}</Badge>
   if (a.ok) return <Badge variant="muted">ran, no usage</Badge>
   return <span className="text-muted-foreground">unproven</span>
 }
 
-function AgentTable({ agents }: { agents: Agent[] }) {
+function GoldenTable({ goldens }: { goldens: Golden[] }) {
   return (
     <Card>
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Agent</TableHead>
             <TableHead>Snapshot</TableHead>
+            <TableHead>Repo</TableHead>
+            <TableHead>Agent</TableHead>
             <TableHead>Version</TableHead>
             <TableHead>Events</TableHead>
             <TableHead>Health</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {agents.map((a) => (
+          {goldens.map((a) => (
             <TableRow key={a.snapshot}>
               <TableCell className="font-mono">
-                {a.agent}
-                {a.default && (
+                {a.snapshot}
+                {a.base && (
                   <Badge variant="outline" className="ml-2">
-                    default
+                    base
                   </Badge>
                 )}
               </TableCell>
-              <TableCell className="font-mono text-muted-foreground">{a.snapshot}</TableCell>
+              <TableCell className="font-mono text-muted-foreground">
+                {a.base ? "— every repo without one of its own" : a.repo}
+              </TableCell>
+              <TableCell className="font-mono text-muted-foreground">{a.agent ?? "—"}</TableCell>
               <TableCell className="font-mono text-muted-foreground">
                 {a.version ?? "—"}
                 {a.agent_version && ` · ${a.agent_version}`}
@@ -94,7 +98,7 @@ function MachineTable({ machines }: { machines: Machine[] }) {
 }
 
 export function Machines() {
-  const { data: agents, error: agentsError } = usePoll<Agent[]>("/api/agents", 15000)
+  const { data: goldens, error: goldensError } = usePoll<Golden[]>("/api/goldens", 15000)
   const { data: machines, error, refresh } = usePoll<Machine[]>("/api/machines", 15000)
   const [reconciling, setReconciling] = useState(false)
 
@@ -112,17 +116,17 @@ export function Machines() {
     <div className="space-y-8">
       <div>
         <PageHeader
-          title="Agents"
-          subtitle="Golden snapshots this deployment can dispatch onto. The name is the whole registry."
+          title="Goldens"
+          subtitle="Snapshots this deployment can boot. One per connected repo, plus the base they all fall back to."
         />
-        {agentsError && <ErrorNote message={agentsError} />}
-        {agents && agents.length === 0 && (
+        {goldensError && <ErrorNote message={goldensError} />}
+        {goldens && goldens.length === 0 && (
           <Empty>
             <Boxes className="mx-auto mb-2 size-6" />
-            No goldens. Build one with scripts/build-golden.sh, or check BOXD_API_KEY.
+            No goldens. Build the base with scripts/build-golden.sh, or check BOXD_API_KEY.
           </Empty>
         )}
-        {agents && agents.length > 0 && <AgentTable agents={agents} />}
+        {goldens && goldens.length > 0 && <GoldenTable goldens={goldens} />}
       </div>
 
       <div>

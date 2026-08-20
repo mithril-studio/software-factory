@@ -27,8 +27,8 @@ from .config import settings
 # them as seconds (`_epoch`, where the machine mapper alongside it correctly uses `_epoch_ms`),
 # so `snapshots.list()` dies in `datetime.fromtimestamp` with "year 58577 is out of range".
 # That takes golden discovery with it, and with it every dispatch: `agents.available` cannot
-# name a single `golden-<agent>`, so preflight's `fleet readable` check fails fatally and no
-# issue can be picked up. Verified against SDK 0.2.2, 0.2.4 and 0.2.5 — all three fail
+# name a single `golden-*`, so preflight's `fleet readable` check fails fatally and no issue
+# can be picked up. Verified against SDK 0.2.2, 0.2.4 and 0.2.5 — all three fail
 # identically, so there is no version to pin `boxd>=0.2.2` back to.
 #
 # Nothing in this repo reads a snapshot's timestamp, so the narrowest fix is to stop the
@@ -125,8 +125,7 @@ async def _is_snapshot(boxd: AsyncBoxd, source: str) -> bool:
     """Does `source` name a snapshot in this account?
 
     Asked of the fleet rather than of the name, because both kinds of source are named the
-    same way: the golden `golden-claude` is a snapshot on the new path and was a machine on
-    the old one. A name alone cannot tell them apart, and guessing wrong picks the wrong API.
+    same way: `golden-copy` is a snapshot on the new path and was a machine on the old one. A name alone cannot tell them apart, and guessing wrong picks the wrong API.
     """
     return any(s.id == source or s.name == source for s in await boxd.snapshots.list())
 
@@ -162,37 +161,31 @@ async def _provision(boxd: AsyncBoxd, source: str, vm_name: str):
     )
 
 
-async def source_for(
-    boxd: AsyncBoxd, repo: str, agent: str = "", log: RunLog | None = None
-) -> str:
-    """Which golden this run boots from: the agent's snapshot, warmed for this repo if there is one.
+async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> str:
+    """Which golden this run boots from: this repo's own, or the base image behind it.
 
-    Public because a run is not the only thing that needs the answer — the golden sweep and
-    preflight both report on the machine a repo's runs would actually boot, and a second
-    derivation of that would be a second thing to keep in step. Without a `log` the two
-    fallbacks are noted on the module logger instead of in a run's own log.
+    Public because a run is not the only thing that needs the answer — the projects page and
+    preflight both report on the snapshot a repo's runs would actually boot, and a second
+    derivation of that would be a second thing to keep in step. Without a `log` the fallback
+    is noted on the module logger instead of in a run's own log.
 
-    `runs.agent` records what was asked for and this records what answered, so a run says both
-    which agent took the issue and which tier of its image served it.
+    One fallback, and it is the ordinary case rather than an error path: a repo nobody has
+    provisioned a golden for yet boots `golden-copy` and installs for itself. That is what
+    lets a repo be connected and dispatched in the same minute, with provisioning catching up
+    afterwards.
 
-    Two fallbacks, both deliberate. An agent no snapshot provides falls back to the default
-    agent and says so, because a poller that halts a repo over one stale config value is worse
-    than one that keeps building — a typo is rejected at the API instead, where somebody is
-    watching (`config.unknown_agent`). And when the snapshot fleet answers to nothing at all,
-    the conventional name is handed to `_provision` anyway: on the rollback path `golden-<agent>`
-    is still a *machine*, and forking it is exactly what should happen.
+    When the snapshot fleet answers to nothing at all, the base name is handed to `_provision`
+    anyway. On the rollback path `golden-copy` is still a *machine*, and forking it is exactly
+    what should happen.
     """
-    agent = agent or settings.agent_for(repo)
     note = log.write if log is not None else _log.info
     names = await agents.available(boxd)
-    source = agents.resolve_snapshot(agent, repo, names)
+    source = agents.resolve_snapshot(repo, names)
     if not source:
-        source = agents.resolve_snapshot(settings.agent_default, repo, names)
-        if source:
-            note(f"[factory] no snapshot for agent {agent!r}; falling back to {source}")
-    if not source:
-        source = agents.golden_name(agent)
-        note(f"[factory] no golden snapshot for agent {agent!r}; trying machine {source}")
+        source = agents.BASE_SNAPSHOT
+        note(f"[factory] no golden snapshot in the fleet; trying machine {source}")
+    elif source == agents.BASE_SNAPSHOT:
+        note(f"[factory] no warm golden for {repo}; booting {source} and installing for itself")
     return source
 
 
@@ -524,11 +517,11 @@ anything on GitHub — writing that file is the entirety of your output.
 # resolves the branch differently from the build VM that wrote it reviews something nobody
 # built.
 #
-# The run brings its own repo now. A golden used to carry exactly one checkout, which is why a
-# second watched repo needed a second golden; a golden is an *agent* image, and which repo it
-# works on is a property of the run. So this clones — and the warm tier is the same script
-# taking the other branch: a snapshot with the repo already in place skips the clone, which is
-# all "warm" has ever meant.
+# The run brings its own repo. `golden-copy` carries tooling and auth and no checkout at all,
+# so this clones — and the warm tier is the same script taking the other branch: a
+# `golden-<repo-slug>` with the repo already in place skips the clone, which is all "warm" has
+# ever meant. Writing it as one script rather than two is what lets a repo be dispatched before
+# it has been provisioned.
 #
 # `--filter=blob:none` rather than `--depth 1`: reviews need real ancestry (they diff against
 # a merge base) and agents run `git log`, but the file contents of history nobody reads can be
@@ -576,10 +569,9 @@ git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
 # before the checkout and you assert against whatever commit the machine happened to be sitting
 # on, which is exactly the stale answer this guard exists to catch.
 #
-# It repairs before it refuses. A golden pre-matched to one repo's pin was possible while a
-# golden carried one repo; an agent image serves every repo the deployment watches, and they do
-# not agree on a Node version. So the mismatch is now ordinary and the fix is to install what
-# the repo asks for. Only a mismatch that survives the install is fatal — and the old advice,
+# It repairs before it refuses. A warm golden is pre-matched to its own repo's pin, but the
+# base image serves every repo the deployment watches and they do not agree on a Node version.
+# So on the base a mismatch is ordinary and the fix is to install what the repo asks for. Only a mismatch that survives the install is fatal — and the old advice,
 # "the golden needs rebuilding", is no longer the right sentence for it.
 NODE_GUARD = r"""
 if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
@@ -1019,7 +1011,6 @@ async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt
 async def _fix_cycle(
     repo: str,
     number: int,
-    agent: str,
     cycle: int,
     log: RunLog,
     *,
@@ -1042,7 +1033,6 @@ async def _fix_cycle(
         await create(
             repo,
             number,
-            agent=agent,
             attempt=cycle + 1,
             prior_error=reason,
             prior_log=detail,
@@ -1064,7 +1054,6 @@ async def _fail_run(
     run_id: str,
     repo: str,
     issue: dict,
-    agent: str,
     attempt: int,
     reason: str,
     log: RunLog,
@@ -1083,7 +1072,6 @@ async def _fail_run(
             await create(
                 repo,
                 number,
-                agent=agent,
                 attempt=attempt + 1,
                 prior_error=reason,
                 prior_log=_log_tail(run_id),
@@ -1122,7 +1110,6 @@ async def _fail_run(
 async def create(
     repo: str,
     issue_number: int,
-    agent: str | None = None,
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
@@ -1130,15 +1117,17 @@ async def create(
 ) -> str:
     """Register a run and schedule it. Returns the run id immediately.
 
-    `agent` names which agent takes the issue; without one the repo's configured agent does.
-    Which snapshot that agent boots is resolved when the run actually starts, so a golden
-    built while the run sat in the queue is still picked up.
+    Which snapshot the run boots is resolved when it actually starts, not now, so a golden
+    provisioned while the run sat in the queue is still picked up.
+
+    The `agent` column is seeded with the one agent this deployment runs and then overwritten
+    by whatever the golden announces in its manifest on the way in. It is a record of what did
+    the work, not an instruction — nothing about dispatch reads it, and no caller chooses it.
 
     `attempt` > 1 marks a retry: the previous attempt's error and log tail are woven into
     the prompt so the agent diagnoses the failure instead of repeating it. Retries reuse the
     same branch, so the whole chain resolves into one pull request.
     """
-    agent = (agent or "").strip() or settings.agent_for(repo)
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     branch = f"factory/issue-{issue_number}"
@@ -1153,14 +1142,14 @@ async def create(
         branch=branch,
         status="queued",
         attempt=attempt,
-        agent=agent,
+        agent=agents.DEFAULT_AGENT,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
     task = asyncio.create_task(
         _guarded(
-            run_id, repo, issue, branch, agent,
+            run_id, repo, issue, branch,
             attempt, prior_error, prior_log, review_cycle,
         )
     )
@@ -1174,11 +1163,9 @@ async def create_review(
     issue_number: int,
     pr_url: str,
     branch: str,
-    agent: str | None = None,
     cycle: int = 1,
 ) -> str:
     """Register and schedule a review of the pull request a build run opened."""
-    agent = (agent or "").strip() or settings.agent_for(repo)
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"
@@ -1193,14 +1180,14 @@ async def create_review(
         status="queued",
         kind="review",
         attempt=cycle,
-        agent=agent,
+        agent=agents.DEFAULT_AGENT,
         pr_url=pr_url,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
     task = asyncio.create_task(
-        _guarded_review(run_id, repo, issue, branch, pr_url, agent, cycle)
+        _guarded_review(run_id, repo, issue, branch, pr_url, cycle)
     )
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
@@ -1247,13 +1234,12 @@ async def _guarded_review(
     issue: dict,
     branch: str,
     pr_url: str,
-    agent: str,
     cycle: int,
 ) -> None:
     log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
     try:
         async with semaphore():
-            await _execute_review(run_id, repo, issue, branch, pr_url, agent, log, cycle)
+            await _execute_review(run_id, repo, issue, branch, pr_url, log, cycle)
     except asyncio.CancelledError:
         log.write("[factory] review cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
@@ -1288,7 +1274,6 @@ async def _guarded(
     repo: str,
     issue: dict,
     branch: str,
-    agent: str,
     attempt: int,
     prior_error: str | None,
     prior_log: str | None,
@@ -1298,7 +1283,7 @@ async def _guarded(
     try:
         async with semaphore():
             await _execute(
-                run_id, repo, issue, branch, agent, log,
+                run_id, repo, issue, branch, log,
                 attempt, prior_error, prior_log, review_cycle,
             )
     except asyncio.CancelledError:
@@ -1315,7 +1300,7 @@ async def _guarded(
             reason = f"timed out after {settings.run_timeout}s"
         else:
             reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        await _fail_run(run_id, repo, issue, agent, attempt, reason, log)
+        await _fail_run(run_id, repo, issue, attempt, reason, log)
     finally:
         await _salvage_usage(run_id, log)
         log.close()
@@ -1326,7 +1311,6 @@ async def _execute(
     repo: str,
     issue: dict,
     branch: str,
-    agent: str,
     log: RunLog,
     attempt: int = 1,
     prior_error: str | None = None,
@@ -1356,9 +1340,9 @@ async def _execute(
         # ---- provision
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{RUN_PREFIX}{run_id[:8]}"
-        source = await source_for(boxd, repo, agent, log)
+        source = await source_for(boxd, repo, log)
         await db.update_run(run_id, golden=source)
-        log.write(f"[factory] provisioning {vm_name} from {source} (agent {agent})")
+        log.write(f"[factory] provisioning {vm_name} from {source}")
         machine = await _provision(boxd, source, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
@@ -1431,7 +1415,7 @@ async def _execute(
             )
         else:
             reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
-            await _fail_run(run_id, repo, issue, agent, attempt, reason, log, pr_url=pr_url)
+            await _fail_run(run_id, repo, issue, attempt, reason, log, pr_url=pr_url)
 
         # ---- reap
         if ok or not settings.keep_failed:
@@ -1445,7 +1429,7 @@ async def _execute(
         # ---- hand off to review, once this run's VM is gone and its slot is free
         if ok and review_next:
             try:
-                await create_review(repo, number, pr_url, branch, agent, cycle=review_cycle)
+                await create_review(repo, number, pr_url, branch, cycle=review_cycle)
             except Exception as exc:  # noqa: BLE001 - an unreviewed PR beats a lost one
                 log.write(f"[factory] could not queue review: {exc!r}")
     finally:
@@ -1458,7 +1442,6 @@ async def _execute_review(
     issue: dict,
     branch: str,
     pr_url: str,
-    agent: str,
     log: RunLog,
     cycle: int,
 ) -> None:
@@ -1471,9 +1454,9 @@ async def _execute_review(
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{REVIEW_PREFIX}{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
-        source = await source_for(boxd, repo, agent, log)
+        source = await source_for(boxd, repo, log)
         await db.update_run(run_id, golden=source)
-        log.write(f"[factory] provisioning {vm_name} from {source} (agent {agent})")
+        log.write(f"[factory] provisioning {vm_name} from {source}")
         machine = await _provision(boxd, source, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
@@ -1586,7 +1569,6 @@ async def _execute_review(
             await _fix_cycle(
                 repo,
                 number,
-                agent,
                 cycle,
                 log,
                 reason=f"CI failed after an approved review: {merge_attempt.ci_failure}",
@@ -1625,7 +1607,6 @@ async def _execute_review(
         await _fix_cycle(
             repo,
             number,
-            agent,
             cycle,
             log,
             reason=f"review requested changes: {why}",
@@ -1726,8 +1707,9 @@ async def _stream(
                     await db.update_run(
                         run_id,
                         manifest=json.dumps(manifest),
-                        # What actually ran, overwriting what was asked for. They differ
-                        # when a golden was rebuilt onto another agent under the same name.
+                        # What actually ran, overwriting the default the row was seeded
+                        # with. This is the registry: the image says which agent it launches,
+                        # and nothing else in the system claims to know.
                         **({"agent": named} if named else {}),
                     )
                     continue

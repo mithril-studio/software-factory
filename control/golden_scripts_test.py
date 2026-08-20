@@ -5,10 +5,12 @@ is testable is the part that rots silently: the places where a shell script has 
 character for character, with Python it never imports.
 
 Two such places, and both fail the same quiet way. `refresh-golden.sh` computes a repo slug
-in `sed` to name the snapshot `golden-<agent>--<slug>`; `control/agents.py` computes it in
-`re` to decide which snapshot a run forks. Disagree by one character and the refresh updates
-a snapshot no dispatch will ever resolve onto — no error anywhere, just a warm golden nobody
-uses. And `refresh-golden.sh` reads the install command out of a repo's `## Setup` section in
+in `sed` to name the snapshot `golden-<slug>`; `control/agents.py` computes it in `re` to
+decide which snapshot a run boots. Disagree by one character and the refresh updates a
+snapshot no dispatch will ever resolve onto — no error anywhere, just a warm golden nobody
+uses, and every run for that repo quietly paying the cold path instead.
+
+And `refresh-golden.sh` reads the install command out of a repo's `## Setup` section in
 `awk` while `preflight` warns about a missing one in `re`: disagree, and preflight calls a
 repo ready that the refresh then refuses.
 
@@ -79,8 +81,11 @@ REPOS = [
 ]
 for repo in REPOS:
     check(f"slug: the script and agents.py agree on {repo}", shell_slug(repo), slug(repo))
-check("slug: and never produces the separator that would split the name back wrong",
-      any("--" in shell_slug(r) for r in REPOS), False)
+# The base image is `golden-copy`, and a repo that could produce that name would overwrite the
+# one image every unprovisioned repo falls back to. It cannot: `owner/name` always carries a
+# `/`, which always becomes a hyphen, so no slug is ever a single bare word.
+check("slug: no repo the script slugs could ever name the base image",
+      any("golden-" + shell_slug(r) == "golden-copy" for r in REPOS), False)
 
 
 # ---------- the same headings count as a setup section

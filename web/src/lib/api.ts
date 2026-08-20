@@ -46,11 +46,9 @@ export type PlanIssue = {
 
 export type Project = {
   repo: string
-  /** The agent that takes this repo's issues. */
-  agent: string
-  /** The snapshot that agent actually boots for this repo. */
+  /** The snapshot this repo's runs actually boot. */
   golden: string
-  /** True when that snapshot is this repo's own warm tier rather than the bare agent image.
+  /** True when that snapshot is this repo's own warm tier rather than the `golden-copy` base.
    *  A speed-up only — every run installs the repo for itself either way. */
   warm: boolean
   runs: number
@@ -65,9 +63,14 @@ export type Project = {
  *  Not a machine. Goldens stopped being machines when they became snapshots, which is why
  *  this and `Machine` are two types served from two endpoints instead of one list that could
  *  answer neither question fully. */
-export type Agent = {
-  agent: string
+export type Golden = {
   snapshot: string
+  /** The repo slug the name carries, null for the base image every run falls back to. */
+  repo: string | null
+  base: boolean
+  /** Which agent the image launches, from the manifest it announced into its last run — not
+   *  from its name, which says nothing about the agent any more. Null until a run has read one. */
+  agent: string | null
   version: string | null
   /** The telemetry adapter this golden's stream is read with, from its manifest. */
   events: string | null
@@ -78,8 +81,6 @@ export type Agent = {
   /** When a run last finished on it having produced usage — the only proof its credentials
    *  still work. Null means unproven, not broken. */
   verified_at: string | null
-  /** True when this is the agent a repo that names none of its own gets. */
-  default: boolean
 }
 
 /** A boxd machine in the fleet. */
@@ -95,18 +96,13 @@ export type Machine = {
 
 export type Config = {
   repos: string[]
-  /** Each watched repo with the agent that takes its issues. */
-  watched: { repo: string; agent: string }[]
-  /** Every agent the snapshot fleet can name. */
-  agents: string[]
-  agent_default: string
   max_concurrent: number
   max_attempts: number
   poll_enabled: boolean
   poll_interval: number
   /** A setting nobody filled in. Blocks starting a run. */
   missing: string[]
-  /** A complete configuration with nothing to run on — an agent with no snapshot yet. */
+  /** A complete configuration with nothing to run on — no `golden-copy` to fall back to. */
   problems: string[]
 }
 
