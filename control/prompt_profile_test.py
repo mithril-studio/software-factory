@@ -12,6 +12,7 @@ Run it directly, no framework needed:
     .venv/bin/python -m control.prompt_profile_test
 """
 import asyncio
+import json
 import sys
 
 from control import github, runner
@@ -153,6 +154,21 @@ check("the body is context, not a second contract",
       "do not mine it for extra gates" in rev, True)
 check("a criterion is still the only thing that blocks on its own",
       "prose in the body is not one" in rev, True)
+
+# ---------- memory receipt contract (AC1)
+# The prompt used to send an agent off to prime from `.mem/` with no obligation to report
+# what it actually loaded, so retrieval was only ever visible by scraping a transcript. Both
+# a repo with a profile and one without get the same obligation, and it names the marker and
+# the exact empty form so a repo with no `.mem/` still produces a receipt rather than silence.
+for kind, built in (("with a profile", p), ("without one", d)):
+    check(f"memory receipt: {kind}, the marker is named", runner.MEMORY_RECEIPT_MARKER in built, True)
+    check(f"memory receipt: {kind}, it comes right after priming, before the setup step",
+          built.find(runner.MEMORY_RECEIPT_MARKER) < built.find("Install this project's dependencies"),
+          True)
+    check(f"memory receipt: {kind}, the shape is spelled out",
+          all(field in built for field in ('"indexed"', '"opened"', '"domains"')), True)
+    check(f"memory receipt: {kind}, a missing `.mem/` still gets an explicit receipt",
+          json.dumps(runner.EMPTY_MEMORY_RECEIPT) in built, True)
 
 # ---------- which machines the factory owns
 # The leak this pins down: reconcile swept `run-` only, so an orphaned review VM survived on
