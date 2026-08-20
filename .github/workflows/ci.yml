@@ -1,13 +1,14 @@
 name: CI
 
-# The floor, not the ceiling: undefined names, syntax errors, and the test modules this repo
-# already carries. It exists because an `F821` — a bare `ci_failure` where every sibling line
-# says `merge_attempt.ci_failure` — reached main and would have raised NameError on the one
-# path it guards, the fix run after CI goes red on an approved pull request.
+# The floor, not the ceiling: undefined names, syntax errors, the test modules this repo already
+# carries, and the repository-memory validator. It exists because an `F821` — a bare `ci_failure`
+# where every sibling line says `merge_attempt.ci_failure` — reached main and would have raised
+# NameError on the one path it guards, the fix run after CI goes red on an approved pull request.
 #
-# `ruff check` in full still reports pre-existing findings, so the gate selects the rules that
-# catch real errors rather than style. Widen it when the backlog is clean, not before: a gate
-# that is red on arrival teaches everyone to ignore it.
+# What runs is `scripts/verify.sh`, not a list repeated here. It used to be a list repeated here,
+# and it drifted: the memory validator was added in #65 and `.factory.md` kept telling agents
+# there were two gates and that those were the only ones. Two of the four issues in the #49-54
+# batch failed on the gate nobody had been told to run. One file, two callers, no drift.
 on:
   pull_request:
   push:
@@ -29,21 +30,8 @@ jobs:
 
       - run: pip install -e . ruff
 
-      - name: Errors (undefined names, unused imports, syntax)
-        run: ruff check --select F,E9 control telemetry
-
-      # Every *_test.py in the repo, run as a module the way its own docstring says to. A new
-      # test file is picked up by existing here, not by being added to a list.
-      - name: Tests
-        run: |
-          set -e
-          for f in control/*_test.py telemetry/*_test.py; do
-            m=$(echo "${f%.py}" | tr / .)
-            echo "== $m"
-            python -m "$m"
-          done
-
-      # This repo's own .mem/ is checked-in context for future runs; a malformed or
-      # unscoped record in it must fail the same way it would in any other repo.
-      - name: Repository memory
-        run: python -m control.memory validate .
+      # One step rather than three named ones: the script prints an `== <gate>` header before
+      # each, so the log still says which gate failed, and nothing here can fall out of step
+      # with what an agent is told to run before opening the pull request.
+      - name: Verify
+        run: scripts/verify.sh

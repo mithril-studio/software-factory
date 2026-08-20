@@ -1448,8 +1448,19 @@ async def _execute(
         link = _run_link(run_id)
         if link:
             started += f"\n\nLive log: {link}"
+        # Clear every label that means "stopped", not just `agent:queued`. A run dispatched by
+        # hand onto a blocked or failed issue used to leave that label in place, and the poller
+        # halts a repo while any open issue carries one — so an issue that was resumed and fixed
+        # went on halting every issue behind it unless it happened to close. Whatever the run
+        # goes on to do will set the right label at the end; while it is running, none of these
+        # is true.
         await _mirror_issue(
-            repo, number, github.LABEL_RUNNING, [github.LABEL_QUEUED], log, comment=started
+            repo,
+            number,
+            github.LABEL_RUNNING,
+            [github.LABEL_QUEUED, github.LABEL_BLOCKED, github.LABEL_FAILED],
+            log,
+            comment=started,
         )
 
         # ---- provision
