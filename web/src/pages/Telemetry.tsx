@@ -6,6 +6,17 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { PageHeader, Empty, ErrorNote } from "@/components/Page"
 import { Meter, StatTile } from "@/components/Meter"
 
+/** Panel masthead: serif title over a hairline, the same voice as the page header one
+ *  level down. The standfirst stays in Inter — it is prose, not a label. */
+function PanelHead({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="border-b border-subtle p-optical pb-3">
+      <h2 className="font-serif text-2xl leading-none">{title}</h2>
+      <p className="mt-2 max-w-prose text-xs text-muted-foreground">{children}</p>
+    </div>
+  )
+}
+
 function pct(part: number, whole: number): string {
   if (!whole) return "—"
   return `${((part / whole) * 100).toFixed(1)}%`
@@ -49,6 +60,7 @@ export function Telemetry() {
   return (
     <div>
       <PageHeader
+        kicker="The bill"
         title="Telemetry"
         subtitle="Every model call and tool call the factory has made, priced against model_prices."
       />
@@ -60,25 +72,30 @@ export function Telemetry() {
           No calls recorded yet. Rows land as runs happen.
           <div className="mt-2 text-xs">
             To load history from runs that finished earlier:{" "}
-            <code className="font-mono">python -m telemetry.backfill</code>
+            <code className="border border-subtle bg-muted px-1.5 py-0.5 font-mono">
+              python -m telemetry.backfill
+            </code>
           </div>
         </Empty>
       )}
 
       {data && !empty && (
         <div className="space-y-6">
-          {/* The four numbers worth leading with. Cost per shipped issue is the one the
-              run table could never produce: an issue costs its build plus every retry,
-              review and fix, and only the ones that opened a PR count as delivered. */}
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <StatTile label="Total spend" value={cost(spend)} note={`${runs} runs observed`} />
+          {/* Asymmetric on purpose. Cost per shipped issue is the figure the run table
+              could never produce — an issue costs its build plus every retry, review and
+              fix, and only the ones that opened a PR count as delivered — so it takes
+              half the row and the accent shadow, and the other three report to it. */}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
             <StatTile
+              featured
+              className="sm:col-span-2 lg:col-span-3"
               label="Cost per shipped issue"
               value={shipped ? cost(spend / shipped) : "—"}
               note={shipped ? `${shipped} issues reached a pull request` : "nothing shipped yet"}
             />
+            <StatTile label="Total spend" value={cost(spend)} note={`${runs} runs observed`} />
             <StatTile
-              label="Spend on runs that shipped nothing"
+              label="Wasted spend"
               value={cost(wasted)}
               note={spend ? `${pct(wasted, spend)} of everything spent` : undefined}
             />
@@ -89,13 +106,12 @@ export function Telemetry() {
             />
           </div>
 
-          <Card className="p-4">
-            <h2 className="text-sm font-semibold">Where the money goes</h2>
-            <p className="mt-1 text-xs text-muted-foreground">
+          <Card>
+            <PanelHead title="Where the money goes">
               By token class. Cache reads are the cost of rediscovery — the agent
               re-reading a codebase it has already read.
-            </p>
-            <Table className="mt-3">
+            </PanelHead>
+            <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Token class</TableHead>
@@ -123,14 +139,13 @@ export function Telemetry() {
             </Table>
           </Card>
 
-          <div className="grid gap-6 lg:grid-cols-2">
-            <Card className="p-4">
-              <h2 className="text-sm font-semibold">Where the time goes</h2>
-              <p className="mt-1 text-xs text-muted-foreground">
+          <div className="grid gap-6 lg:grid-cols-5">
+            <Card className="lg:col-span-3">
+              <PanelHead title="Where the time goes">
                 Tools by total wall time. A tool with failures is a harness problem, not
                 an agent one.
-              </p>
-              <Table className="mt-3">
+              </PanelHead>
+              <Table>
                 <TableHeader>
                   <TableRow>
                     <TableHead>Tool</TableHead>
@@ -163,12 +178,11 @@ export function Telemetry() {
               </Table>
             </Card>
 
-            <Card className="p-4">
-              <h2 className="text-sm font-semibold">Spend by day</h2>
-              <p className="mt-1 text-xs text-muted-foreground">
+            <Card className="lg:col-span-2">
+              <PanelHead title="Spend by day">
                 Derived from the price table, not from what the runtime reported.
-              </p>
-              <Table className="mt-3">
+              </PanelHead>
+              <Table>
                 <TableHeader>
                   <TableRow>
                     <TableHead>Day</TableHead>
@@ -198,12 +212,11 @@ export function Telemetry() {
             </Card>
           </div>
 
-          <Card className="p-4">
-            <h2 className="text-sm font-semibold">Unit economics</h2>
-            <p className="mt-1 text-xs text-muted-foreground">
+          <Card>
+            <PanelHead title="Unit economics">
               What a repo costs, and how much of that reached a pull request.
-            </p>
-            <Table className="mt-3">
+            </PanelHead>
+            <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Repo</TableHead>

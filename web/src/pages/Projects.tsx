@@ -69,10 +69,10 @@ function Connect({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <Card className="mb-6 p-5">
+    <Card className="mb-6 p-optical-lg">
       <form onSubmit={onCheck} className="flex items-end gap-3">
         <div className="flex flex-1 flex-col gap-1.5">
-          <label htmlFor="repo" className="text-sm font-medium">
+          <label htmlFor="repo" className="eyebrow text-muted-foreground">
             Repository
           </label>
           <Input
@@ -116,11 +116,16 @@ function Connect({ onDone }: { onDone: () => void }) {
 
       {result && (
         <div className="mt-5 text-sm">
-          <p className="font-medium text-ok">{result.repo} is connected.</p>
+          <p className="font-mono text-xs uppercase tracking-wider text-ok">
+            {result.repo} is connected.
+          </p>
           {result.provision_run ? (
             <p className="mt-1 text-muted-foreground">
               Warming its golden —{" "}
-              <Link to={`/runs/${result.provision_run}`} className="text-primary hover:underline">
+              <Link
+                to={`/runs/${result.provision_run}`}
+                className="text-primary underline-offset-4 hover:underline"
+              >
                 watch the log
               </Link>
               . Its runs work on <span className="font-mono">golden-copy</span> until that
@@ -169,7 +174,7 @@ function Actions({ repo, warm, onChanged }: { repo: string; warm: boolean; onCha
 
   return (
     <div className="flex items-center justify-end gap-2">
-      {error && <span className="text-xs text-bad">{error}</span>}
+      {error && <span className="font-mono text-[10px] text-bad">{error}</span>}
       <Button
         variant="ghost"
         size="sm"
@@ -214,6 +219,7 @@ export function Projects() {
   return (
     <div>
       <PageHeader
+        kicker="Watchlist"
         title="Projects"
         subtitle="Repos the factory watches for labelled issues."
         actions={
@@ -243,25 +249,25 @@ export function Projects() {
             <TableBody>
               {projects.map((p) => (
                 <TableRow key={p.repo}>
-                  <TableCell className="font-mono">{p.repo}</TableCell>
-                  <TableCell>
+                  <TableCell className="whitespace-nowrap font-mono">{p.repo}</TableCell>
+                  <TableCell className="whitespace-nowrap">
                     <a
                       href={gitUrl(p.repo)}
                       target="_blank"
                       rel="noreferrer"
-                      className="font-mono text-primary hover:underline"
+                      className="font-mono text-primary underline-offset-4 hover:underline"
                     >
                       {gitUrl(p.repo)}
                     </a>
                   </TableCell>
-                  <TableCell className="font-mono">
+                  <TableCell className="whitespace-nowrap font-mono">
                     {p.golden || "—"}
-                    <span className="ml-2 font-sans">
+                    <span className="ml-2">
                       <Provisioning status={p.provision_status} />
                     </span>
                   </TableCell>
-                  <TableCell className="text-right font-mono">{p.runs}</TableCell>
-                  <TableCell className="text-right font-mono text-ok">{p.succeeded}</TableCell>
+                  <TableCell className="text-right font-mono tabular-nums">{p.runs}</TableCell>
+                  <TableCell className="text-right font-mono tabular-nums text-ok">{p.succeeded}</TableCell>
                   <TableCell>
                     <Actions repo={p.repo} warm={p.warm} onChanged={refresh} />
                   </TableCell>

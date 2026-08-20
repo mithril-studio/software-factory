@@ -28,14 +28,17 @@ export function Login() {
 
   return (
     <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card/40 p-8">
-        <div className="mb-6 flex items-center gap-2.5">
-          <Boxes className="size-8 text-primary" />
-          <span className="text-3xl font-semibold tracking-tight text-foreground">Factory</span>
+      {/* The accent shadow, used here and on the lead stat tile and nowhere else: it
+          marks the one thing on the screen the reader is meant to act on. */}
+      <div className="w-full max-w-sm border border-border bg-card p-optical-lg shadow-hard-accent">
+        <div className="flex items-center gap-2.5">
+          <Boxes className="size-7 text-primary" />
+          <span className="font-serif text-4xl leading-none text-foreground">Factory</span>
         </div>
+        <div className="eyebrow mt-2.5 mb-7 text-muted-foreground">Issue in · PR out</div>
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="email" className="text-sm font-medium text-foreground">
+            <label htmlFor="email" className="eyebrow text-muted-foreground">
               Email
             </label>
             <Input
@@ -48,7 +51,7 @@ export function Login() {
             />
           </div>
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="password" className="text-sm font-medium text-foreground">
+            <label htmlFor="password" className="eyebrow text-muted-foreground">
               Password
             </label>
             <Input
@@ -60,8 +63,8 @@ export function Login() {
               required
             />
           </div>
-          {error && <p className="text-sm text-bad">{error}</p>}
-          <Button type="submit" disabled={busy}>
+          {error && <p className="font-mono text-xs text-bad">{error}</p>}
+          <Button type="submit" disabled={busy} className="mt-1">
             {busy ? "Signing in…" : "Sign in"}
           </Button>
         </form>
