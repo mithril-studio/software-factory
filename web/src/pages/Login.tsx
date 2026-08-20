@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react"
 import { useNavigate } from "react-router-dom"
 import { Boxes } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { login } from "@/lib/api"
 
 export function Login() {
@@ -37,28 +38,26 @@ export function Login() {
             <label htmlFor="email" className="text-sm font-medium text-foreground">
               Email
             </label>
-            <input
+            <Input
               id="email"
               type="email"
               autoComplete="username"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
-              className="h-9 rounded-md border border-border bg-transparent px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
             />
           </div>
           <div className="flex flex-col gap-1.5">
             <label htmlFor="password" className="text-sm font-medium text-foreground">
               Password
             </label>
-            <input
+            <Input
               id="password"
               type="password"
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
-              className="h-9 rounded-md border border-border bg-transparent px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
             />
           </div>
           {error && <p className="text-sm text-bad">{error}</p>}

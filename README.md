@@ -248,12 +248,13 @@ re-snapshot it under the same name.
    `scripts/build-golden.sh` (above). A repo does not need a golden of its own; `golden-copy`
    serves every repo that has none. A warm `golden-<owner-repo>` is optional and only makes
    runs faster.
-2. Connect it: `POST /api/repos {"repo": "owner/name"}`. Preflight runs first and a blocking
-   failure refuses the connection with its checks in the response. On success the repo is in
-   the register, its lifecycle labels exist, and the poller picks it up on its next tick —
-   **no restart and no `.env` edit.** `DELETE /api/repos/owner/name` disconnects it again; its
-   runs stay, because they are the ledger of what was spent and shipped rather than
-   configuration.
+2. Connect it — **Projects → Connect repo**, or `POST /api/repos {"repo": "owner/name"}`.
+   The form names the repo, shows what preflight says about it, and connects on a second
+   click; a blocking check refuses the connection and says which one. On success the repo is
+   in the register, its lifecycle labels exist, a golden starts warming if the repo names a
+   setup command, and the poller picks it up on its next tick — **no restart and no `.env`
+   edit.** Disconnecting keeps the repo's runs, because they are the ledger of what was spent
+   and shipped rather than configuration.
 
    `FACTORY_REPOS` is now the *seed* for that register: entries are added on boot if they are
    not already there, and removing one does not unwatch the repo.

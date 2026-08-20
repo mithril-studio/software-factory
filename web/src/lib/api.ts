@@ -63,6 +63,35 @@ export type Project = {
   last_run: string | null
 }
 
+/** One preflight question and its answer.
+ *
+ *  `ok: false` with `fatal: false` is a warning, not a failure — a repo with no `.factory.md`
+ *  still builds, it just builds with less context. Only a fatal one blocks connecting. */
+export type Check = {
+  name: string
+  ok: boolean
+  detail: string
+  fatal: boolean
+}
+
+export type Preflight = {
+  repo: string
+  ready: boolean
+  checks: Check[]
+}
+
+/** What `POST /api/repos` answers with.
+ *
+ *  `provision_run` is the golden-warming run it started, if it could start one.
+ *  `provision_skipped` is why it could not — almost always "this repo names no setup command".
+ *  Neither is a failure: the repo is watched and dispatchable either way, on `golden-copy`. */
+export type Connected = {
+  repo: string
+  checks: Check[]
+  provision_run: string | null
+  provision_skipped: string | null
+}
+
 /** A golden snapshot the factory can dispatch onto, as the refresh loop last saw it.
  *
  *  Not a machine. Goldens stopped being machines when they became snapshots, which is why
@@ -215,6 +244,33 @@ export async function del<T>(url: string): Promise<T> {
     throw new Error(await detail(resp))
   }
   return resp.json()
+}
+
+// ---- repos ----
+
+/** Ask whether a repo could be dispatched to. Read-only; safe to call on anything. */
+export function preflight(repo: string): Promise<Preflight> {
+  return get<Preflight>(`/api/preflight?repo=${encodeURIComponent(repo)}`)
+}
+
+/** Watch a repo from now on. Throws with the failing check when preflight blocks it. */
+export function connectRepo(repo: string): Promise<Connected> {
+  return post<Connected>("/api/repos", { repo })
+}
+
+export function disconnectRepo(repo: string): Promise<{ removed: boolean }> {
+  return del<{ removed: boolean }>(`/api/repos/${repo}`)
+}
+
+/** Warm this repo's golden now. Also how a stale one is refreshed — provisioning always
+ *  rebuilds from the base rather than updating a snapshot in place. */
+export function warmGolden(repo: string): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>(`/api/repos/${repo}/golden`)
+}
+
+/** Drop this repo's golden. Its runs fall back to the base and install for themselves. */
+export function dropGolden(repo: string): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/api/repos/${repo}/golden`)
 }
 
 // ---- auth ----

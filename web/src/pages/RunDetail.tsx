@@ -83,8 +83,10 @@ export function RunDetail() {
             <Field label="Status">
               <StateBadge state={runOutcome(run)} />
             </Field>
-            <Field label="Issue">
-              {run.repo}#{run.issue_number}
+            {/* No issue behind a provisioning run — it warms the repo's golden. */}
+            <Field label={run.issue_number > 0 ? "Issue" : "Repo"}>
+              {run.repo}
+              {run.issue_number > 0 && `#${run.issue_number}`}
             </Field>
             <Field label="Kind">{run.kind}</Field>
             <Field label="Branch">{run.branch || "—"}</Field>
