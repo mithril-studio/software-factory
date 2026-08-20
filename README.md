@@ -95,6 +95,45 @@ that layer existed:
 .venv/bin/python -m telemetry.backfill      # replays every salvaged transcript
 ```
 
+### The test server
+
+A second control plane, on boxd this time, for looking at a change before it reaches
+Hetzner: **`software-factory-test-server`**, live at
+<https://software-factory-test-server.boxd.sh>.
+
+```bash
+scripts/deploy-test.sh --ref my-branch     # put a branch on it
+scripts/deploy-test.sh --refresh-db        # reload prod's runs, telemetry and logs first
+```
+
+It carries a copy of production's database so the UI has real runs, real telemetry and real
+money in it — the pages that are easiest to break are the ones with no data behind them.
+`--refresh-db` takes a `sqlite3` backup on the Hetzner box rather than copying a live file,
+and rewrites the absolute `log_path`/`transcript_path` columns, which point at `/home/factory`
+and would otherwise resolve to nothing here.
+
+The copy is a snapshot, not a replica: it stops being prod's data the moment either side
+moves, and nothing on the test box ever writes back.
+
+Two things are deliberately different from Hetzner, and both are safety rails rather than
+convenience. `FACTORY_POLL=0` and `FACTORY_AUTO_MERGE=0`, so a staging control plane can
+never claim a queued issue out from under production or merge a pull request — dispatch a run
+here by hand and it still opens a real PR, which is the point, but nothing lands. And its
+`.env` is not a copy of prod's: it is built on the box from the credentials boxd already
+injects into the machine (`GITHUB_PAT_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`), so those secrets
+never travel through a laptop.
+
+Being a boxd VM also means it needs no `BOXD_API_KEY` to *read* the fleet — the SDK mints a
+token from the machine's own identity, which is why `factory.service` sets `BOXD_VM_NAME`
+(systemd does not inherit boxd's injected environment). `POST /api/runs` still checks for the
+key explicitly, so dispatching from the UI needs one:
+
+```bash
+boxd auth keys create software-factory-test-server \
+  | boxd machine cp - software-factory-test-server:/tmp/boxd-key
+boxd machine exec software-factory-test-server -- 'bash ~/set-boxd-key.sh'
+```
+
 ## What a run does
 
 1. Fetch the issue from GitHub
