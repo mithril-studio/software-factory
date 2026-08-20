@@ -85,6 +85,21 @@ def profile_checks(profile: str | None) -> list[Check]:
     ]
 
 
+def push_check(ok: bool, detail: str) -> Check:
+    """Read `github.can_push`'s answer as a check.
+
+    Split from the request so the verdict is testable without credentials, the same way
+    `agent_check` takes the fleet rather than fetching it. Blocking either way: a token that
+    cannot write is not a run that goes worse, it is a run that cannot finish — it clones,
+    spends an agent's whole context, and dies at the push with a branch that never existed.
+
+    "Could not tell" is also blocking, and deliberately. The failure this replaces was a check
+    that answered `ok` without ever asking the question; anything less than a yes should read
+    as a no.
+    """
+    return Check("token can push", ok, detail)
+
+
 def agent_check(repo: str, agent: str, available: Iterable[str] = ()) -> Check:
     """Is there a golden snapshot for the agent this repo's runs would boot?
 
@@ -113,11 +128,12 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
     info = await github.repo_info(repo)
     if info is None:
         return [Check("repo readable", False, f"the token cannot read {repo}")]
-    permissions = info.get("permissions", {})
     checks = [
         Check("repo readable", True, f"default branch {base}"),
-        # The agent pushes its branch and opens the pull request as this token.
-        Check("token can push", bool(permissions.get("push")), f"permissions: {permissions}"),
+        # The agent pushes its branch and opens the pull request as this token. Asked of git
+        # rather than of `info["permissions"]`, which answers for the account and not the
+        # token — see `github.can_push`.
+        push_check(*await github.can_push(repo)),
     ]
     # With no workflows, every pull request the factory opens waits out
     # FACTORY_MERGE_CHECK_TIMEOUT for a check run that never comes, and then stops for a

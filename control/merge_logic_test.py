@@ -80,16 +80,24 @@ check(
 
 
 class FakeResponse:
-    def __init__(self, code):
+    """A merge response. Error bodies look like GitHub's, because the message is the point.
+
+    A refusal used to be raised as `raise_for_status()` wrote it — the status and nothing
+    else. That is how a token which had lost its write grants presented as a bare
+    "403 Forbidden", indistinguishable from rate limiting or a branch rule, and it took a
+    live probe against the API to tell which. The body and the
+    `x-accepted-github-permissions` header both say it outright.
+    """
+
+    def __init__(self, code, body=None, headers=None):
         self.status_code = code
         self.request = httpx.Request("PUT", "http://example.invalid")
+        self._body = body if body is not None else {"merged": True}
+        self.headers = headers or {}
+        self.text = str(self._body)
 
     def json(self):
-        return {"merged": True}
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError("boom", request=self.request, response=self)
+        return self._body
 
 
 sent: list[dict] = []
@@ -108,7 +116,10 @@ def run_merge(statuses, **kwargs):
         sent.append(kw.get("json"))
 
         async def respond():
-            return FakeResponse(statuses[min(len(sent) - 1, len(statuses) - 1)])
+            spec = statuses[min(len(sent) - 1, len(statuses) - 1)]
+            # A bare int stays a bare int; a tuple carries the body and headers a real
+            # refusal would.
+            return FakeResponse(*spec) if isinstance(spec, tuple) else FakeResponse(spec)
 
         return respond()
 
@@ -138,6 +149,31 @@ for code in (405, 409, 422, 404):
         check(f"{code} raises rather than merging", "merged", "raised")
     except httpx.HTTPStatusError:
         check(f"{code} raises at once, no retry", len(sent), 1)
+
+# ---------- a refusal carries GitHub's own explanation, not just its status
+
+REFUSAL = (
+    403,
+    {"message": "Resource not accessible by personal access token"},
+    {"x-accepted-github-permissions": "contents=write"},
+)
+try:
+    run_merge([REFUSAL])
+    check("a refusal raises", "merged", "raised")
+except httpx.HTTPStatusError as exc:
+    check("the refusal names the status", "403" in str(exc), True)
+    check("...and quotes GitHub's message rather than dropping it",
+          "Resource not accessible by personal access token" in str(exc), True)
+    check("...and names the permission that was missing",
+          "contents=write" in str(exc), True)
+
+# An error whose body is not a GitHub error object still says something: the raw text, not
+# an empty string. 405 rather than 5xx, so this tests the refusal path and not the retry one.
+try:
+    run_merge([(405, "upstream said no", {})])
+    check("a bodyless refusal raises", "merged", "raised")
+except httpx.HTTPStatusError as exc:
+    check("a non-JSON body is quoted rather than swallowed", "upstream said no" in str(exc), True)
 
 try:
     run_merge([503], attempts=3)
