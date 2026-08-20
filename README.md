@@ -276,6 +276,29 @@ A React + Tailwind + shadcn single-page app in `web/`, built to `web/dist` and s
 FastAPI — one deployable, at the cost of a `vite build` step. It reads the JSON API under
 `/api`; the control plane holds no HTML.
 
+**Visual language.** Brutalist-editorial, and deliberate — agents edit this UI, so the rules
+are written down rather than inferred from the diff. Every token lives in `web/src/index.css`;
+change them there, not in a component.
+
+- **Type is mixed by job.** Instrument Serif for headings and display figures, JetBrains Mono
+  for every label and every datum, Inter for prose. A number the reader compares is mono; a
+  number that *is* the headline is serif.
+- **No border radius.** `--radius: 0px`, and the `radius-*` scale is pinned to zero so a
+  stray `rounded-lg` cannot reintroduce a soft corner.
+- **Hard shadows, never blur.** `shadow-hard` / `-sm` / `-accent` are solid offsets. The
+  accent (terracotta) shadow marks the one thing on a screen worth acting on — the lead stat
+  tile, the sign-in card — and nothing else.
+- **Two border weights.** Black `border-border` frames anything that is its own object;
+  grey `border-subtle` divides rows inside one.
+- **Warm neutrals.** Paper, not screen: the ground is a warm off-white, the sidebar a slab of
+  ink in both themes. The app ships light; dark inverts the ground and keeps the logic.
+- **Hover is tactile.** `hard-lift` shifts an object -2px and deepens its shadow by the same
+  amount; press seats it flat. Only put it on things that are actually clickable.
+- **Labels are uppercase mono.** The `eyebrow` utility, used for column heads, field labels,
+  section heads and page kickers — one voice for everything that names a thing.
+- **Optical padding.** `p-optical` / `p-optical-lg` carry more top and left than bottom and
+  right, because equal padding reads bottom-heavy once type sits in it.
+
 - **Runs** — every run: state, id, agent, project, duration, token spend, cost, PR link.
   Start a run by repo + issue number.
 - **Run detail** — live agent output over SSE, tool calls and errors highlighted. The single

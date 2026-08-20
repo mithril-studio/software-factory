@@ -11,6 +11,7 @@ export function Plan() {
   return (
     <div>
       <PageHeader
+        kicker="Queue"
         title="Plan"
         subtitle="Open issues across watched repos, in the order the factory works them."
       />
@@ -39,14 +40,19 @@ export function Plan() {
                   <TableCell className="font-mono">{i.repo}</TableCell>
                   <TableCell className="font-mono">
                     {i.url ? (
-                      <a href={i.url} target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                      <a
+                        href={i.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-primary underline-offset-4 hover:underline"
+                      >
                         {i.number}
                       </a>
                     ) : (
                       i.number
                     )}
                   </TableCell>
-                  <TableCell className="max-w-md truncate">{i.title}</TableCell>
+                  <TableCell className="max-w-md truncate text-[13px]">{i.title}</TableCell>
                   <TableCell>
                     <div className="flex flex-wrap gap-1">
                       {i.labels.map((l) => (

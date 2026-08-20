@@ -7,26 +7,27 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { StateBadge } from "@/components/StateBadge"
 import { Meter } from "@/components/Meter"
-import { PageHeader, ErrorNote } from "@/components/Page"
+import { PageHeader, SectionHead, ErrorNote } from "@/components/Page"
 import { cn } from "@/lib/utils"
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div>
-      <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-        {label}
-      </div>
-      <div className="mt-1 font-mono text-sm">{children}</div>
+    <div className="border-l border-subtle pl-3">
+      <div className="eyebrow text-muted-foreground">{label}</div>
+      <div className="mt-1.5 font-mono text-sm">{children}</div>
     </div>
   )
 }
 
+/** Fixed hues, not the theme tokens. The log panel keeps its ink ground in both
+ *  themes, so the light-mode `ok`/`warn`/`bad` values — darkened to sit on paper —
+ *  would be unreadable here. These are the same four hues, lifted for a dark ground. */
 function lineClass(line: string): string {
-  if (line.startsWith("[factory]")) return "text-primary"
-  if (line.startsWith("[tool]")) return "text-warn"
-  if (line.startsWith("[agent]")) return "text-ok"
-  if (line.startsWith("[stderr]")) return "text-bad"
-  return "text-foreground/80"
+  if (line.startsWith("[factory]")) return "text-[hsl(16_75%_66%)]"
+  if (line.startsWith("[tool]")) return "text-[hsl(38_90%_62%)]"
+  if (line.startsWith("[agent]")) return "text-[hsl(152_45%_58%)]"
+  if (line.startsWith("[stderr]")) return "text-[hsl(4_78%_66%)]"
+  return "text-white/75"
 }
 
 export function RunDetail() {
@@ -51,8 +52,9 @@ export function RunDetail() {
   return (
     <div>
       <PageHeader
+        kicker={`Run ${shortId(runId)}`}
         title={run?.issue_title || "Run"}
-        subtitle={<span className="font-mono">{shortId(runId)}</span>}
+        subtitle={run ? `${run.repo} #${run.issue_number}` : undefined}
         actions={
           <>
             <Button asChild variant="ghost">
@@ -78,8 +80,8 @@ export function RunDetail() {
       {error && <ErrorNote message={error} />}
 
       {run && (
-        <Card className="mb-6 p-5">
-          <div className="grid grid-cols-2 gap-5 sm:grid-cols-4">
+        <Card className="mb-6 p-optical-lg">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-6 sm:grid-cols-4">
             <Field label="Status">
               <StateBadge state={runOutcome(run)} />
             </Field>
@@ -97,7 +99,12 @@ export function RunDetail() {
             <Field label="Agent">{run.agent ?? "—"}</Field>
             <Field label="Pull request">
               {run.pr_url ? (
-                <a href={run.pr_url} target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                <a
+                  href={run.pr_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-primary underline-offset-4 hover:underline"
+                >
                   view PR
                 </a>
               ) : (
@@ -105,7 +112,11 @@ export function RunDetail() {
               )}
             </Field>
           </div>
-          {run.error && <div className="mt-4 font-mono text-sm text-bad">{run.error}</div>}
+          {run.error && (
+            <div className="mt-6 border border-border bg-bad/15 px-4 py-3 font-mono text-xs text-bad">
+              {run.error}
+            </div>
+          )}
         </Card>
       )}
 
@@ -114,17 +125,15 @@ export function RunDetail() {
           even when the run died before reporting anything. The two disagreeing slightly
           is expected — the runtime bills side calls that never reach the event stream. */}
       {trace && (trace.totals.calls ?? 0) > 0 && (
-        <Card className="mb-6 p-5">
-          <div className="grid grid-cols-2 gap-5 sm:grid-cols-4">
+        <Card className="mb-6 p-optical-lg">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-6 sm:grid-cols-4">
             <Field label="Model calls">{trace.totals.calls}</Field>
             <Field label="Turns">{trace.totals.turns ?? "—"}</Field>
             <Field label="Cache read">{tokens(trace.totals.cache_read_tokens ?? null)}</Field>
             <Field label="Cache write">{tokens(trace.totals.cache_write_tokens ?? null)}</Field>
             <Field label="Output tokens">{tokens(trace.totals.output_tokens ?? null)}</Field>
             <Field label="Derived cost">{cost(trace.totals.derived_cost_usd ?? null)}</Field>
-            <Field label="Models">
-              {trace.by_model.map((m) => m.model).join(", ") || "—"}
-            </Field>
+            <Field label="Models">{trace.by_model.map((m) => m.model).join(", ") || "—"}</Field>
             <Field label="Tool calls">
               {trace.tools.reduce((s, t) => s + t.calls, 0)}
               {trace.tools.some((t) => t.failures > 0) && (
@@ -136,11 +145,9 @@ export function RunDetail() {
             </Field>
           </div>
           {trace.tools.length > 0 && (
-            <div className="mt-5">
-              <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                Tool time
-              </div>
-              <div className="mt-2 space-y-1.5">
+            <div className="mt-7 border-t border-subtle pt-5">
+              <SectionHead>Tool time</SectionHead>
+              <div className="mt-2 space-y-2">
                 {trace.tools.slice(0, 6).map((t) => (
                   <div key={t.tool} className="flex items-center gap-3">
                     <span className="w-24 shrink-0 font-mono text-xs">{t.tool}</span>
@@ -156,15 +163,15 @@ export function RunDetail() {
         </Card>
       )}
 
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        Agent output
-      </h2>
+      <SectionHead>Agent output</SectionHead>
+      {/* The log keeps its own ink ground in both themes — a terminal that turned to
+          paper in light mode would stop reading as a terminal. */}
       <div
         ref={logRef}
-        className="h-[60vh] overflow-y-auto rounded-xl border border-border bg-[oklch(0.13_0.006_285.9)] p-4 font-mono text-[12.5px] leading-relaxed"
+        className="h-[60vh] overflow-y-auto border border-border bg-log p-4 font-mono text-[12.5px] leading-relaxed shadow-hard"
       >
         {lines.length === 0 ? (
-          <span className="text-muted-foreground">{done ? "no output" : "connecting…"}</span>
+          <span className="text-white/40">{done ? "no output" : "connecting…"}</span>
         ) : (
           lines.map((line, i) => (
             <div key={i} className={cn("whitespace-pre-wrap break-words", lineClass(line))}>

@@ -81,7 +81,7 @@ function MachineTable({ machines }: { machines: Machine[] }) {
               <TableCell>
                 <Badge variant={m.role === "other" ? "muted" : "ok"}>{m.role}</Badge>
               </TableCell>
-              <TableCell>{m.status ?? "—"}</TableCell>
+              <TableCell className="font-mono text-muted-foreground">{m.status ?? "—"}</TableCell>
               <TableCell className="text-right">
                 {m.orphan && <Badge variant="bad">orphan</Badge>}
               </TableCell>
@@ -109,9 +109,10 @@ export function Machines() {
   }
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-12">
       <div>
         <PageHeader
+          kicker="Registry"
           title="Agents"
           subtitle="Golden snapshots this deployment can dispatch onto. The name is the whole registry."
         />
@@ -127,6 +128,7 @@ export function Machines() {
 
       <div>
         <PageHeader
+          kicker="Fleet"
           title="Machines"
           subtitle="Boxd VMs: the machines runs are happening on, plus anything else in the fleet."
           actions={

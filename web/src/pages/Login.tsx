@@ -4,6 +4,9 @@ import { Boxes } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { login } from "@/lib/api"
 
+const FIELD =
+  "h-9 border border-input bg-background px-3 font-mono text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card"
+
 export function Login() {
   const navigate = useNavigate()
   const [email, setEmail] = useState("")
@@ -27,14 +30,17 @@ export function Login() {
 
   return (
     <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card/40 p-8">
-        <div className="mb-6 flex items-center gap-2.5">
-          <Boxes className="size-8 text-primary" />
-          <span className="text-3xl font-semibold tracking-tight text-foreground">Factory</span>
+      {/* The accent shadow, used here and on the lead stat tile and nowhere else: it
+          marks the one thing on the screen the reader is meant to act on. */}
+      <div className="w-full max-w-sm border border-border bg-card p-optical-lg shadow-hard-accent">
+        <div className="flex items-center gap-2.5">
+          <Boxes className="size-7 text-primary" />
+          <span className="font-serif text-4xl leading-none text-foreground">Factory</span>
         </div>
+        <div className="eyebrow mt-2.5 mb-7 text-muted-foreground">Issue in · PR out</div>
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="email" className="text-sm font-medium text-foreground">
+            <label htmlFor="email" className="eyebrow text-muted-foreground">
               Email
             </label>
             <input
@@ -44,11 +50,11 @@ export function Login() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
-              className="h-9 rounded-md border border-border bg-transparent px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+              className={FIELD}
             />
           </div>
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="password" className="text-sm font-medium text-foreground">
+            <label htmlFor="password" className="eyebrow text-muted-foreground">
               Password
             </label>
             <input
@@ -58,11 +64,11 @@ export function Login() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
-              className="h-9 rounded-md border border-border bg-transparent px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+              className={FIELD}
             />
           </div>
-          {error && <p className="text-sm text-bad">{error}</p>}
-          <Button type="submit" disabled={busy}>
+          {error && <p className="font-mono text-xs text-bad">{error}</p>}
+          <Button type="submit" disabled={busy} className="mt-1">
             {busy ? "Signing in…" : "Sign in"}
           </Button>
         </form>

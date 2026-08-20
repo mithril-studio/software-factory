@@ -2,17 +2,22 @@ import * as React from "react"
 import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
+/**
+ * Square, mono, uppercase. The black hairline is what makes a tinted chip read as a
+ * stamped object rather than as a highlighted word, so every variant keeps it.
+ */
 const badgeVariants = cva(
-  "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap",
+  "inline-flex items-center whitespace-nowrap border px-1.5 py-px font-mono text-[10px] font-medium uppercase tracking-wider leading-4",
   {
     variants: {
       variant: {
-        default: "border-transparent bg-secondary text-secondary-foreground",
-        outline: "border-border text-foreground",
-        ok: "border-transparent bg-ok/15 text-ok",
-        warn: "border-transparent bg-warn/15 text-warn",
-        bad: "border-transparent bg-bad/15 text-bad",
-        muted: "border-transparent bg-muted text-muted-foreground",
+        default: "border-border bg-secondary text-secondary-foreground",
+        outline: "border-subtle text-muted-foreground",
+        ok: "border-border bg-ok/20 text-ok",
+        warn: "border-border bg-warn/20 text-warn",
+        bad: "border-border bg-bad/20 text-bad",
+        muted: "border-subtle bg-muted text-muted-foreground",
+        accent: "border-border bg-accent text-accent-foreground",
       },
     },
     defaultVariants: { variant: "default" },

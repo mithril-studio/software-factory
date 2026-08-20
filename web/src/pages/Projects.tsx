@@ -13,7 +13,11 @@ export function Projects() {
 
   return (
     <div>
-      <PageHeader title="Projects" subtitle="Repos the factory watches for labelled issues." />
+      <PageHeader
+        kicker="Watchlist"
+        title="Projects"
+        subtitle="Repos the factory watches for labelled issues."
+      />
       {error && <ErrorNote message={error} />}
       {projects && projects.length === 0 && (
         <Empty>No repos configured. Set FACTORY_REPOS on the control plane.</Empty>
@@ -39,7 +43,7 @@ export function Projects() {
                       href={gitUrl(p.repo)}
                       target="_blank"
                       rel="noreferrer"
-                      className="font-mono text-primary hover:underline"
+                      className="font-mono text-primary underline-offset-4 hover:underline"
                     >
                       {gitUrl(p.repo)}
                     </a>
@@ -52,8 +56,8 @@ export function Projects() {
                       </Badge>
                     )}
                   </TableCell>
-                  <TableCell className="text-right font-mono">{p.runs}</TableCell>
-                  <TableCell className="text-right font-mono text-ok">{p.succeeded}</TableCell>
+                  <TableCell className="text-right font-mono tabular-nums">{p.runs}</TableCell>
+                  <TableCell className="text-right font-mono tabular-nums text-ok">{p.succeeded}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

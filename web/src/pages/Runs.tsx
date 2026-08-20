@@ -40,22 +40,20 @@ function ProjectFilter({
         <Filter />
         Filter
         {selected.size > 0 && (
-          <span className="rounded-full bg-primary px-1.5 text-xs text-primary-foreground">
+          <span className="border border-border bg-primary px-1.5 text-[10px] text-primary-foreground">
             {selected.size}
           </span>
         )}
         <ChevronDown className={cn("transition-transform", open && "rotate-180")} />
       </Button>
       {open && (
-        <div className="absolute right-0 z-20 mt-2 w-60 rounded-lg border border-border bg-popover p-1.5 shadow-xl">
+        <div className="absolute right-0 z-20 mt-2 w-64 border border-border bg-popover p-1.5 shadow-hard">
           <div className="flex items-center justify-between px-2 py-1.5">
-            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Projects
-            </span>
+            <span className="eyebrow text-muted-foreground">Projects</span>
             {selected.size > 0 && (
               <button
                 onClick={onClear}
-                className="text-xs text-primary hover:underline"
+                className="font-mono text-[10px] uppercase tracking-wider text-primary hover:underline"
                 type="button"
               >
                 Clear
@@ -64,7 +62,7 @@ function ProjectFilter({
           </div>
           <div className="max-h-72 overflow-y-auto">
             {projects.length === 0 && (
-              <div className="px-2 py-2 text-sm text-muted-foreground">No projects</div>
+              <div className="px-2 py-2 font-mono text-xs text-muted-foreground">No projects</div>
             )}
             {projects.map((repo) => {
               const on = selected.has(repo)
@@ -73,15 +71,15 @@ function ProjectFilter({
                   key={repo}
                   type="button"
                   onClick={() => onToggle(repo)}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-secondary/60"
+                  className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-sm transition-colors hover:bg-secondary"
                 >
                   <span
                     className={cn(
-                      "flex size-4 items-center justify-center rounded border",
-                      on ? "border-primary bg-primary text-primary-foreground" : "border-border"
+                      "flex size-4 items-center justify-center border border-border",
+                      on ? "bg-primary text-primary-foreground" : "bg-card"
                     )}
                   >
-                    {on && <Check className="size-3" />}
+                    {on && <Check className="size-3" strokeWidth={3} />}
                   </span>
                   <span className="truncate font-mono text-xs">{repo}</span>
                 </button>
@@ -119,6 +117,7 @@ export function Runs() {
   return (
     <div>
       <PageHeader
+        kicker="Dispatch log"
         title="Runs"
         subtitle="Every dispatch — issue in, pull request out."
         actions={
@@ -158,42 +157,39 @@ export function Runs() {
                     <div className="flex items-center gap-2">
                       <StateBadge state={runOutcome(r)} />
                       {r.attempt && r.attempt > 1 && (
-                        <span className="text-[10px] text-muted-foreground">
+                        <span className="font-mono text-[10px] text-muted-foreground">
                           {r.kind === "review" ? "cycle" : "try"} {r.attempt}
                         </span>
                       )}
                     </div>
                   </TableCell>
                   <TableCell>
-                    <Link to={`/runs/${r.id}`} className="font-mono text-primary hover:underline">
+                    <Link
+                      to={`/runs/${r.id}`}
+                      className="font-mono text-primary underline-offset-4 hover:underline"
+                    >
                       {shortId(r.id)}
                     </Link>
                   </TableCell>
-                  <TableCell>{r.agent ?? "—"}</TableCell>
+                  <TableCell className="font-mono text-muted-foreground">{r.agent ?? "—"}</TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1.5">
-                      <Link to={`/runs/${r.id}`} className="hover:underline">
+                      <Link to={`/runs/${r.id}`} className="underline-offset-4 hover:underline">
                         <span className="font-mono">{r.repo}</span>
-                        <span className="text-muted-foreground"> #{r.issue_number}</span>
+                        <span className="font-mono text-muted-foreground"> #{r.issue_number}</span>
                       </Link>
-                      <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
-                        {r.kind}
-                      </Badge>
+                      <Badge variant="outline">{r.kind}</Badge>
                     </div>
-                    <div className="max-w-72 truncate text-[10px] text-muted-foreground">
+                    <div className="max-w-72 truncate text-[11px] text-muted-foreground">
                       {r.issue_title}
                     </div>
                   </TableCell>
-                  <TableCell className="font-mono">
-                    {duration(r)}
-                  </TableCell>
-                  <TableCell className="font-mono">
+                  <TableCell className="font-mono tabular-nums">{duration(r)}</TableCell>
+                  <TableCell className="font-mono tabular-nums">
                     {tokens((r.tokens_in ?? 0) + (r.tokens_out ?? 0) || null)}
                   </TableCell>
-                  <TableCell className="font-mono">
-                    {cost(r.cost_usd)}
-                  </TableCell>
-                  <TableCell>
+                  <TableCell className="font-mono tabular-nums">{cost(r.cost_usd)}</TableCell>
+                  <TableCell className="font-mono text-muted-foreground">
                     {ago(r.started_at ?? r.created_at)}
                   </TableCell>
                   <TableCell>
@@ -202,7 +198,7 @@ export function Runs() {
                         href={r.pr_url}
                         target="_blank"
                         rel="noreferrer"
-                        className="text-primary hover:underline"
+                        className="font-mono text-primary underline-offset-4 hover:underline"
                       >
                         open
                       </a>
