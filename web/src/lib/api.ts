@@ -106,6 +106,12 @@ export type Golden = {
    *  from its name, which says nothing about the agent any more. Null until a run has read one. */
   agent: string | null
   version: string | null
+  /** What boxd says the snapshot is doing: `ready`, `pending`. */
+  status: string | null
+  /** Whether a run could boot it *now*. Not `status === "ready"`: a re-save is `pending` while
+   *  its previous version stays restorable, and a first capture is `pending` with nothing
+   *  behind it at all. Having a version is the question. */
+  ready: boolean
   /** The telemetry adapter this golden's stream is read with, from its manifest. */
   events: string | null
   agent_version: string | null

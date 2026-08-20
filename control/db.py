@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     repo          TEXT,
     agent         TEXT,
     version       TEXT,
+    status        TEXT,
     events        TEXT,
     transcript    TEXT,
     manifest      TEXT,
@@ -137,6 +138,10 @@ MIGRATIONS = (
     # rather than migrated because every row is a cache of the last fleet listing, rebuilt on
     # the next refresh.
     "DROP TABLE IF EXISTS agents",
+    # What boxd says the snapshot is doing. `pending` with no version is a capture still being
+    # written and nothing can boot it; `pending` with one is a re-save, and the older version
+    # stays restorable. The distinction cost a run to learn.
+    "ALTER TABLE snapshots ADD COLUMN status TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.
