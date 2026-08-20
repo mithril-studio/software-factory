@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -24,6 +25,22 @@ from . import agents, auth, db, github, goldens, poller, preflight, provision, r
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
+
+# Nothing configured logging, so every `log.info` in this package went nowhere. uvicorn sets up
+# its own `uvicorn.*` loggers and leaves the root alone, which is why the access log was the
+# only thing in `var/uvicorn.log` — a poller that halted a repo, a golden refresh that found
+# nothing, a reconciler destroying a leaked VM, all silent. Configured here rather than in each
+# module because a library that configures logging on import steals it from whoever imports it;
+# this module *is* the application.
+logging.basicConfig(
+    level=settings.log_level,
+    format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# The libraries are noisy at INFO and say nothing about this system. Raise FACTORY_LOG_LEVEL to
+# DEBUG deliberately when the question is about HTTP or the database, not as a default.
+for noisy in ("httpx", "httpcore", "aiosqlite", "urllib3"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 @contextlib.asynccontextmanager

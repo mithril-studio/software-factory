@@ -151,6 +151,10 @@ class Settings:
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
     poll_interval: int = int(os.environ.get("FACTORY_POLL_INTERVAL", "30"))
+    # How much the control plane says about itself. Everything under the `factory.` loggers —
+    # the poller's dispatches and halts, the golden refresh, the fleet reconciler — goes to
+    # stdout, which systemd appends to var/uvicorn.log. DEBUG adds the libraries.
+    log_level: str = os.environ.get("FACTORY_LOG_LEVEL", "INFO").upper()
     # Public URL of this control plane, used only to link runs from issue comments.
     base_url: str = os.environ.get("FACTORY_BASE_URL", "").rstrip("/")
     db_path: Path = ROOT / "var" / "factory.db"
