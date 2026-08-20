@@ -180,6 +180,7 @@ async def _execute(run_id: str, repo: str, base: str, command: str, run_log: run
     try:
         await db.update_run(run_id, status="forking", started_at=db.utcnow(), golden=snapshot)
         run_log.write(f"[factory] warming {snapshot} for {repo} from {agents.BASE_SNAPSHOT}")
+        await runner.headroom(boxd, run_log)
         machine = await runner._provision(boxd, agents.BASE_SNAPSHOT, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
@@ -217,12 +218,9 @@ async def _execute(run_id: str, repo: str, base: str, command: str, run_log: run
         await db.update_run(run_id, status="succeeded", finished_at=db.utcnow())
         run_log.write(f"[factory] {snapshot} saved; {repo}'s runs now boot it")
     finally:
-        if machine is not None:
-            try:
-                await boxd.machines.delete(machine.id)
-                run_log.write(f"[factory] destroyed {machine.name}")
-            except Exception as exc:  # noqa: BLE001 - already gone is fine; a leak is not fatal
-                run_log.write(f"[factory] could not destroy {machine.name}: {exc!r}")
+        # Never kept for inspection, whatever FACTORY_KEEP_FAILED says: this machine exists
+        # only to be photographed, and a failed warm-up leaves nothing on it worth an SSH.
+        await runner.reap(boxd, machine, run_log)
         await boxd.close()
 
 
