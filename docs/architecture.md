@@ -2,8 +2,8 @@
 
 An agentic development system. GitHub issues go in; reviewed pull requests come out.
 
-A control plane on the boxd VM `software-factory` watches repos for work, forks an isolated
-boxd VM per task, runs a coding agent inside it, and reaps the VM when done. The control
+A control plane watches repos for work, restores an isolated boxd VM per task, runs a coding
+agent inside it, and reaps the VM when done. The control
 plane is deterministic and contains no LLM. All intelligence lives in the agent, inside the
 VM.
 
@@ -19,7 +19,7 @@ once it has earned an independent release cycle — build it working first, frag
 
 | Folder | Layer | Responsibility | Contains an LLM? |
 |---|---|---|---|
-| `control/` | Control plane | Watch issues, fork VMs, dispatch agents, reap, serve the UI | No |
+| `control/` | Control plane | Watch issues, provision VMs, dispatch agents, reap, serve the UI | No |
 | `telemetry/` | Trace | Ingest OTLP, normalize, store runs and token usage | No |
 
 `control/` rather than `exec/`: `exec` is a Python keyword and cannot name a package.
@@ -44,17 +44,18 @@ Nothing in this system calls a model except the agent running inside a boxd VM. 
         │ boxd SDK (gRPC)             ▲
         ▼                             │ agent event stream
    ┌─────────────────────────────┐    │
-   │  boxd VM (fork of golden)   │────┘
+   │  boxd VM (from a golden)    │────┘
    │    agent + skills           │
    │    → pushes branch, opens PR│
    └─────────────────────────────┘
 ```
 
-Both are boxd machines: one long-lived control plane, and one short-lived fork per task.
-The control plane is deployed by `git pull` on `software-factory`; it is not a container.
+One short-lived boxd machine per task, restored from a golden snapshot. The control plane
+runs on a Hetzner VM under systemd and is deployed by `git pull`; it is not a container and it
+is not on boxd.
 
-One fork per task. Forks take ~0.2s, so there is **no warm pool** — provision on demand,
-destroy on completion. The agent's isolation boundary is the VM.
+One machine per task. Restoring one takes ~0.2s, so there is **no warm pool** — provision on
+demand, destroy on completion. The agent's isolation boundary is the VM.
 
 ## §3 Contracts between layers
 
