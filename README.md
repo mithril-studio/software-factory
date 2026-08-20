@@ -129,10 +129,12 @@ token from the machine's own identity, which is why `factory.service` sets `BOXD
 key explicitly, so dispatching from the UI needs one:
 
 ```bash
-boxd auth keys create software-factory-test-server \
-  | boxd machine cp - software-factory-test-server:/tmp/boxd-key
-boxd machine exec software-factory-test-server -- 'bash ~/set-boxd-key.sh'
+scripts/test-server-key.sh          # mints one, straight into the box, never onto your disk
 ```
+
+Rebuilding the box from nothing is `scripts/provision-test-server.sh`, and
+`.claude/skills/test-server/SKILL.md` is the working guide: the rails, the failure modes, and
+why the database copy needs a real `sqlite3` backup rather than a file copy.
 
 ## What a run does
 
