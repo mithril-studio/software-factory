@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# Build a golden snapshot for one agent, from scratch, reproducibly.
+# Build the base golden snapshot from scratch, reproducibly.
 #
 # Every golden before this one was configured by hand over `boxd machine exec`, which makes
 # it a pet: nobody can rebuild it, and a rebuild loses whatever the last person typed without
 # saying so. A golden is a snapshot now, so building one is a script that ends in
 # `snapshots save` — and what it installs is reviewable in a diff rather than remembered.
 #
-#   scripts/build-golden.sh claude
+#   scripts/build-golden.sh
 #   scripts/build-golden.sh codex --launch ./codex-agent.sh --manifest ./codex.json
 #
-# It produces `golden-<agent>`: the bare agent image, no repo. That is the tier every run
-# falls back to, and the one a warm `golden-<agent>--<owner-repo>` is made from (see
-# scripts/refresh-golden.sh and README "The golden VM").
+# It produces `golden-copy`: tooling and the agent's auth, no repo. That is the tier every run
+# falls back to, and the one a warm `golden-<owner-repo>` is made from (see
+# scripts/refresh-golden.sh and README "The golden snapshot").
+#
+# The agent argument chooses which CLI goes in, not what the snapshot is called. The name
+# carries the repo now, and the base carries none — so a deployment wanting a *second* agent
+# needs `--name` to keep it off `golden-copy`, and gets no help picking a name that a repo slug
+# could not also produce. That, and having nothing that says which repo boots which base, is
+# what keeps multi-agent on the backlog rather than in this script.
 #
 # The one thing it cannot finish is the agent's own login. That is a browser OAuth, so the
 # script stops, tells you how to do it, and waits — the credential has to be inside the
@@ -24,7 +30,8 @@ SKILLS_REPO=${FACTORY_SKILLS_REPO:-https://github.com/mithril-studio/agent-skill
 NODE_VERSIONS=${FACTORY_WARM_NODE:-"22 20"}
 PYTHON_VERSIONS=${FACTORY_WARM_PYTHON:-"3.12 3.11"}
 
-agent=""
+agent="claude"
+snapshot=""
 launch_file=""
 manifest_file=""
 cli_install=""
@@ -33,8 +40,9 @@ keep=0
 
 usage() {
   cat >&2 <<'USAGE'
-usage: build-golden.sh <agent> [options]
+usage: build-golden.sh [agent] [options]
 
+  --name NAME         the snapshot to save (default: golden-copy, the base every run falls back to)
   --cli-install CMD   how to install this agent's CLI (required for an unknown agent)
   --launch FILE       the /usr/local/bin/factory-agent to install (required for an unknown agent)
   --manifest FILE     the /etc/factory/agent.json to install (required for an unknown agent)
@@ -44,11 +52,13 @@ USAGE
   exit 2
 }
 
-[ $# -ge 1 ] || usage
-agent=$1
-shift
+case ${1:-} in
+  ""|-*) ;;
+  *) agent=$1; shift ;;
+esac
 while [ $# -gt 0 ]; do
   case $1 in
+    --name)        snapshot=${2:?--name needs a snapshot name}; shift 2 ;;
     --cli-install) cli_install=${2:?--cli-install needs a command}; shift 2 ;;
     --launch)      launch_file=${2:?--launch needs a file}; shift 2 ;;
     --manifest)    manifest_file=${2:?--manifest needs a file}; shift 2 ;;
@@ -59,14 +69,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# The name is the registry. `control/agents.py` parses `golden-<agent>` and
-# `golden-<agent>--<repo-slug>` back apart on the double hyphen, so an agent name carrying one
-# would split into something nobody meant — rejected here rather than discovered at dispatch.
 case $agent in
-  *--*|-*|*-|"") echo "refusing: '$agent' is not a usable agent name" >&2; exit 1 ;;
+  -*|*-|"") echo "refusing: '$agent' is not a usable agent name" >&2; exit 1 ;;
 esac
 case $agent in
   *[!a-z0-9-]*) echo "refusing: agent names are lowercase letters, digits and hyphens" >&2; exit 1 ;;
+esac
+
+# `control/agents.py` reads everything after `golden-` as a repo slug, so a name it cannot
+# parse names a snapshot no dispatch will ever resolve onto — rejected here rather than
+# discovered at the first run that needed it.
+[ -n "$snapshot" ] || snapshot="golden-copy"
+case $snapshot in
+  golden-?*) ;;
+  *) echo "refusing: a golden snapshot is named golden-<something>, not '$snapshot'" >&2; exit 1 ;;
+esac
+case ${snapshot#golden-} in
+  -*|*-) echo "refusing: '$snapshot' is fringed with hyphens a slug can never carry" >&2; exit 1 ;;
 esac
 
 if [ "$skip_login" = "0" ] && [ ! -t 0 ]; then
@@ -75,7 +94,6 @@ if [ "$skip_login" = "0" ] && [ ! -t 0 ]; then
   exit 1
 fi
 
-snapshot="golden-$agent"
 vm="build-$snapshot-$$"
 
 say() { echo "==> $vm: $*"; }

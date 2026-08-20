@@ -16,8 +16,8 @@ resume-on-retry, `checks_green` gating auto-merge, and Sentry removal (PR #44). 
 **Also shipped:** item 0 (CI repaired + change guards), item 2 (golden warm, on Node 22, with a
 toolchain assertion in `VM_SCRIPT`), and executable acceptance criteria in `factory-compose`.
 
-**Not yet started:** 8 (budget ceiling), 8b (dependency safety), 8c (script the golden build),
-9 (memory), CodeRabbit under 6 — and the three pipeline pieces below.
+**Not yet started:** 8 (budget ceiling), 8b (dependency safety), 9 (memory), 12 (credential
+rotation), CodeRabbit under 6 — and the three pipeline pieces below.
 
 **Shipped 2026-08-17:** item 10, the telemetry layer — per-call rows, derived cost, and the
 ledger fix that item 8 depends on.
@@ -341,7 +341,7 @@ Then, in order of value:
 Not recommended: switching Dependabot for Renovate. Renovate is more configurable, but
 Dependabot is working and configured, and the gap does not pay for the migration.
 
-### 8c. Provision the golden from a script, not by hand
+### 8c. Provision the golden from a script, not by hand — ✅ `scripts/build-golden.sh`
 
 Everything in item 2 was done by hand over `boxd machine exec`. That makes the golden a pet:
 nobody can reproduce it, and a rebuild loses all of it silently. It should be a
@@ -350,6 +350,26 @@ reviewable, repeatable, and the same script the re-sync-after-merge job can call
 
 This is the difference between "the golden is warm" being a fact about a machine somebody
 once configured, and a property the system maintains.
+
+### 12. Rotate the control-plane credentials, and make rotating them a documented step
+
+Filed as [#61](https://github.com/mithril-studio/software-factory/issues/61). Deferred by
+Joost on 2026-08-19 and again on 2026-08-20 — it is real, it is not urgent, and it is written
+down here so it stops being re-discovered every session.
+
+Three parts, in order:
+
+1. **Rotate `FACTORY_AUTH_PASSWORD` and `FACTORY_SECRET_KEY` together.** The session cookie
+   key does not derive from the password once it is set explicitly, so changing the password
+   alone does not invalidate sessions already issued.
+2. **Rate-limit `POST /api/login`.** There is none today, on a publicly reachable control
+   plane that holds `CLAUDE_CODE_OAUTH_TOKEN`, `GITHUB_TOKEN` and `BOXD_API_KEY`.
+3. **Write the rotation down** next to the deploy steps, so it is a procedure rather than an
+   archaeology exercise.
+
+Related and already agreed: Infisical for secrets, on Joost's own backlog. Until that lands,
+credentials live in `.env` on the Hetzner box and in `boxd env` for the machines, and
+mirroring between the two is by hand.
 
 ## later
 

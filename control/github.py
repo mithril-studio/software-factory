@@ -12,6 +12,7 @@ a label the API refuses must never fail an otherwise good run.
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 
 import httpx
@@ -19,6 +20,9 @@ import httpx
 from .config import settings
 
 API = "https://api.github.com"
+# Pushes are authorised by the git host, not the API host, and the difference matters:
+# `can_push` below has to ask the endpoint that will actually enforce the answer.
+GIT = "https://github.com"
 
 # Lifecycle labels. One is meant to be present at a time; `agent:queued` is also the
 # trigger — dropping it on an open issue is the whole contract for "please build this".
@@ -44,6 +48,35 @@ def _headers() -> dict[str, str]:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def _api_error(resp) -> str:
+    """GitHub's own explanation of a refusal, which `raise_for_status()` throws away.
+
+    A status line on its own is not actionable. A 403 from the merge API is "this token may
+    not write here", "you are being rate limited", or "a ruleset forbids it" — three different
+    repairs, and only the body says which. `x-accepted-github-permissions` is appended because
+    for a fine-grained token it names the exact grant that is missing, which is most of the
+    answer in one header.
+    """
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - a body we cannot parse is still worth quoting
+        body = None
+    parts: list[str] = []
+    if isinstance(body, dict):
+        parts.append(str(body.get("message") or "").strip())
+        parts += [
+            str(e.get("message")).strip()
+            for e in body.get("errors") or []
+            if isinstance(e, dict) and e.get("message")
+        ]
+    if not any(parts):
+        parts = [(getattr(resp, "text", "") or "").strip()[:200]]
+    needs = (getattr(resp, "headers", None) or {}).get("x-accepted-github-permissions")
+    if needs:
+        parts.append(f"needs {needs}")
+    return "; ".join(p for p in parts if p)
 
 
 async def get_issue(repo: str, number: int) -> dict:
@@ -363,7 +396,16 @@ async def merge_pr(
                     json=payload,
                 )
                 if resp.status_code not in TRANSIENT_STATUS:
-                    resp.raise_for_status()  # a refusal, not an outage - surface it now
+                    if resp.status_code >= 400:
+                        # Deliberately not raise_for_status(): its message is the status and
+                        # nothing else. A merge that will not happen strands a green pull
+                        # request for a human, and the only thing that human needs is the
+                        # sentence GitHub already wrote.
+                        raise httpx.HTTPStatusError(
+                            f"merge refused: {resp.status_code} {_api_error(resp)}",
+                            request=resp.request,
+                            response=resp,
+                        )
                     return resp.json()
                 last = httpx.HTTPStatusError(
                     f"merge API returned {resp.status_code}",
@@ -377,6 +419,47 @@ async def merge_pr(
             await asyncio.sleep(delay)
             delay *= 2
     raise RuntimeError("unreachable")  # pragma: no cover
+
+
+async def can_push(repo: str) -> tuple[bool, str]:
+    """Whether this token may actually push to `repo` — asked of git, not of metadata.
+
+    `GET /repos/{repo}` carries a `permissions` block, and reading `push` off it is the
+    obvious thing to do and the wrong one: it describes what the *account* may do, so it says
+    `push: true` for a repo you own however narrowly the token itself is scoped. A read-only
+    token reads green there. Preflight said READY about this very repo while its token could
+    not write a byte, and the first thing to notice was a pull request that could never merge.
+
+    So ask git. Fetching `info/refs?service=git-receive-pack` is the handshake every push
+    opens with: 200 for a credential that may write, 403 for one that may not. It sends no
+    objects and updates no refs, so it cannot change anything — the question is asked in
+    exactly the terms the answer will be enforced in.
+
+    Returns (ok, detail). Never raises: an unreachable github.com is a finding, not a crash.
+    """
+    if not settings.github_token:
+        return False, "no GitHub token is configured, so nothing can push"
+    # Basic auth is how git speaks to GitHub over HTTPS. The username is not read when the
+    # password is a token, so any constant does; this is the one GitHub's own docs use.
+    auth = base64.b64encode(f"x-access-token:{settings.github_token}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}", "User-Agent": "git/2.40"}
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.get(
+                f"{GIT}/{repo}.git/info/refs",
+                params={"service": "git-receive-pack"},
+                headers=headers,
+            )
+    except httpx.TransportError as exc:
+        return False, f"could not reach {GIT} to ask: {exc!r}"
+    if resp.status_code == 200:
+        return True, "git-receive-pack accepts this token"
+    if resp.status_code in (401, 403):
+        return False, (
+            f"git-receive-pack refused this token ({resp.status_code}) — it can read {repo} "
+            "but not write to it, so a run would clone, work, and die at the push"
+        )
+    return False, f"git-receive-pack answered {resp.status_code}, which is neither yes nor no"
 
 
 # GitHub Actions marks a failure with this, and puts the cause in the lines just above it.

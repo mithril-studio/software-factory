@@ -39,7 +39,10 @@ function TableRow({ className, ...props }: React.ComponentProps<"tr">) {
 function TableHead({ className, ...props }: React.ComponentProps<"th">) {
   return (
     <th
-      className={cn("eyebrow h-9 px-5 text-left align-middle text-muted-foreground", className)}
+      className={cn(
+        "eyebrow h-9 whitespace-nowrap px-5 text-left align-middle text-muted-foreground",
+        className
+      )}
       {...props}
     />
   )

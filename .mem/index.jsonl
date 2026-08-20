@@ -1,0 +1,7 @@
+{"id":"mem_acac","domain":"repository","type":"pattern","title":"control/ is a deterministic state machine; no LLM call belongs there","files":["control/README.md","control"]}
+{"id":"mem_5b24","domain":"repository","type":"convention","title":"control and telemetry share one SQLite file but own separate tables and connection helpers","files":["control/db.py","telemetry/store.py","control/config.py","telemetry/config.py"]}
+{"id":"mem_b1e0","domain":"repository","type":"pattern","title":"telemetry/normalize.py isolates all runtime-specific event vocabulary behind an adapter","files":["telemetry/normalize.py"]}
+{"id":"mem_783b","domain":"repository","type":"convention","title":"Fast verification is ruff --select F,E9 plus plain __main__ test modules, nothing else","files":["control/agents_test.py","telemetry/normalize_test.py","pyproject.toml","control","telemetry"]}
+{"id":"mem_d79c","domain":"repository","type":"decision","title":"Control plane runs on a Hetzner VM under systemd, not on boxd itself","files":["README.md","scripts/deploy.sh"]}
+{"id":"mem_c17a","domain":"repository","type":"convention","title":"One GitHub credential serves the control plane and every run VM, and it needs repo + workflow","files":["control/config.py","control/runner.py","control/github.py","control/preflight.py"]}
+{"id":"mem_5f2b","domain":"repository","type":"pattern","title":"Goldens are named for the repo, not the agent; the base is golden-copy","files":["control/agents.py","control/runner.py","control/preflight.py","scripts/refresh-golden.sh"]}

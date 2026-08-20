@@ -53,11 +53,11 @@ would otherwise be stdout parsing against a binary that auto-updates underneath 
 
 ### §2.1 Machines
 
-- **One golden per agent, not per project.** Tooling and auth pre-installed, skills installed
-  from [agent-skills](https://github.com/mithril-studio/agent-skills). Forked per task, never
-  worked in directly. The run brings its own repo: it clones the one it was assigned into
-  `$HOME/work/<name>` unless a checkout of that repo is already there, which is the whole
-  difference between a warm `golden-<agent>--<repo-slug>` and a bare `golden-<agent>`.
+- **One base golden, plus one per connected repo.** `golden-copy` carries tooling, auth and
+  skills from [agent-skills](https://github.com/mithril-studio/agent-skills) and no repo.
+  Restored per task, never worked in directly. The run brings its own repo: it clones the one
+  it was assigned into `$HOME/work/<name>` unless a checkout of that repo is already there,
+  which is the whole difference between a warm `golden-<repo-slug>` and the base.
 - **No warm pool.** Forks are ~0.2s. Provision on demand.
 - **`auto-suspend.timeout = 0` on every fork.** The default suspends after 30s without
   inbound TCP, and clocks freeze while suspended. A long build or test run with no network
@@ -137,10 +137,16 @@ run is lost.
 The reason this layer exists rather than handing an agent CLI access: **fleet state lives in
 a table, not in a context window.**
 
-A periodic reconciler compares `c.box.list()` against the `runs` table and resolves the
-difference: a VM with no active run is an orphan and gets destroyed; a run marked running
-whose VM is gone is a failure and gets marked as one. Without this, crashed dispatches leak
-machines against a 20-machine quota, silently.
+A periodic reconciler (`runner.start_reconciler`, every `FACTORY_RECONCILE_INTERVAL` seconds)
+compares the boxd fleet against the `runs` table and resolves the difference: a VM with no
+active run is an orphan and gets destroyed; a run marked running whose VM is gone is a failure
+and gets marked as one. Without this, crashed dispatches leak machines against a 20-machine
+quota, silently.
+
+It is also the fallback, not the first line. Every path that creates a machine reaps it in a
+`finally`, and `runner.headroom` refuses to provision into a full fleet — sweeping first, since
+an orphan is exactly the thing to reclaim before giving up. A single machine that will not die
+is reported and left to the next sweep rather than aborting the one it is in.
 
 Idempotency everywhere. Every operation must be safe to retry.
 

@@ -48,16 +48,48 @@ CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 
 -- Every golden snapshot the fleet holds, one row per name. An observation of a thing that
 -- exists, not an event log — fleet state belongs in a table for the same reason run state
--- does, otherwise "which agents can this deployment run?" is answered by somebody listing
+-- does, otherwise "which goldens can this deployment boot?" is answered by somebody listing
 -- snapshots and remembering.
+--
+-- `repo` is the repo slug the name carries, NULL for the base image. `agent` is which agent
+-- the image announced in its manifest on the way into its last run — a fact reported by the
+-- snapshot, not one derived from its name, which is the whole change this table's rename
+-- records.
+--
+-- Named `snapshots` rather than `goldens` for a dull but load-bearing reason: `goldens` is a
+-- table this schema already drops below, and `executescript` runs before the migrations do,
+-- so a table created here under that name would be created and then immediately dropped on
+-- every start.
 --
 -- Two clocks, deliberately far apart. `checked_at` is when the refresh loop last saw the
 -- name in the fleet, which costs a list call and says only that the snapshot is there.
 -- `verified_at` is when a run last finished on it having produced usage — the only evidence
 -- that its credentials still work, and unlike a probe it is free, because the runs were
 -- happening anyway.
-CREATE TABLE IF NOT EXISTS agents (
+-- The repos this deployment watches. Connecting one used to mean editing FACTORY_REPOS in
+-- `.env` on the box and restarting systemd, which is not a thing a web interface can do — so
+-- the register moved into the database and `FACTORY_REPOS` became the seed for it.
+--
+-- `golden` and `provision_status` are about the *warm tier* only, and nothing gates on them.
+-- A repo with no golden of its own dispatches onto `golden-copy` and installs for itself, so
+-- provisioning may still be running, may have failed, or may never have been started, and the
+-- repo works either way. These columns say what happened, not whether it may run.
+--
+-- `agent` is nullable and always NULL today. Kept because a second agent needs somewhere to
+-- record which one a repo uses, and adding the column later is a migration for something that
+-- costs nothing now — but nothing reads it, and nothing should until a second base image
+-- exists to choose between.
+CREATE TABLE IF NOT EXISTS repos (
+    repo             TEXT PRIMARY KEY,
+    added_at         TEXT NOT NULL,
+    golden           TEXT,
+    provision_status TEXT NOT NULL DEFAULT 'none',
+    agent            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
     name          TEXT PRIMARY KEY,
+    repo          TEXT,
     agent         TEXT,
     version       TEXT,
     events        TEXT,
@@ -80,9 +112,11 @@ MIGRATIONS = (
     "ALTER TABLE runs ADD COLUMN tokens_in INTEGER",
     "ALTER TABLE runs ADD COLUMN tokens_out INTEGER",
     "ALTER TABLE runs ADD COLUMN cost_usd REAL",
-    # 'build' (an agent resolving an issue) or 'review' (an agent checking the resulting PR
-    # against the issue's acceptance criteria). Both are runs on a forked VM, which is why
-    # they share this table rather than getting one of their own.
+    # 'build' (an agent resolving an issue), 'review' (an agent checking the resulting PR
+    # against the issue's acceptance criteria), or 'provision' (no agent at all — clone and
+    # install a repo into its own golden snapshot). All three are runs on a VM restored from a
+    # golden, which is why they share this table rather than getting one each: they want the
+    # same streamed log, the same cancel, the same reaper.
     "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'build'",
     # Review runs only: the verdict JSON the reviewing agent produced.
     "ALTER TABLE runs ADD COLUMN verdict TEXT",
@@ -96,6 +130,13 @@ MIGRATIONS = (
     # checkout, so every column of it became unanswerable at once — dropped rather than left
     # to be read by something that has forgotten it stopped being filled in.
     "DROP TABLE IF EXISTS goldens",
+    # Its replacement, and the same reasoning one design later. The `agents` table was keyed
+    # on snapshot name with an `agent` column filled in *from that name* — so it recorded the
+    # naming convention rather than anything observed. Goldens are named for the repo now and
+    # the agent comes from the image's own manifest; `snapshots` above holds both. Dropped
+    # rather than migrated because every row is a cache of the last fleet listing, rebuilt on
+    # the next refresh.
+    "DROP TABLE IF EXISTS agents",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -170,27 +211,27 @@ async def list_runs(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def record_agent(name: str, **fields: Any) -> None:
+async def record_snapshot(name: str, **fields: Any) -> None:
     """Store what the refresh saw. One row per golden snapshot, replaced each time."""
     fields = {"name": name, **fields}
     cols = ", ".join(fields)
     marks = ", ".join("?" for _ in fields)
     async with connect() as conn:
         await conn.execute(
-            f"INSERT OR REPLACE INTO agents ({cols}) VALUES ({marks})", tuple(fields.values())
+            f"INSERT OR REPLACE INTO snapshots ({cols}) VALUES ({marks})", tuple(fields.values())
         )
         await conn.commit()
 
 
-async def agents() -> dict[str, dict]:
+async def snapshots() -> dict[str, dict]:
     """The last refresh's findings, keyed by snapshot name."""
     async with connect() as conn:
-        async with conn.execute("SELECT * FROM agents") as cur:
+        async with conn.execute("SELECT * FROM snapshots") as cur:
             rows = await cur.fetchall()
     return {r["name"]: dict(r) for r in rows}
 
 
-async def agent_evidence() -> dict[str, dict]:
+async def snapshot_evidence() -> dict[str, dict]:
     """What the runs already prove about each golden, keyed by snapshot name.
 
     This is the whole grading strategy: a golden is not asked how it is, it is judged by
@@ -224,6 +265,59 @@ async def agent_evidence() -> dict[str, dict]:
         if "verified_at" not in seen and ((r["tokens_out"] or 0) > 0 or r["cost_usd"] is not None):
             seen["verified_at"] = r["finished_at"]
     return out
+
+
+# --------------------------------------------------------------------------- repos
+
+
+async def add_repo(repo: str, agent: str | None = None) -> None:
+    """Register a repo, or leave an already-registered one exactly as it is.
+
+    `INSERT OR IGNORE` rather than `OR REPLACE`: re-adding a repo must not reset the golden it
+    has already been provisioned, and the seed from `FACTORY_REPOS` runs on every boot.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT OR IGNORE INTO repos (repo, added_at, agent) VALUES (?, ?, ?)",
+            (repo, utcnow(), agent),
+        )
+        await conn.commit()
+
+
+async def remove_repo(repo: str) -> bool:
+    """Stop watching `repo`. Returns whether there was anything to remove.
+
+    The runs stay. They are the ledger of what this deployment spent and shipped, and a repo
+    being disconnected does not make its history untrue — `stats_by_repo` simply stops being
+    asked about it.
+    """
+    async with connect() as conn:
+        cur = await conn.execute("DELETE FROM repos WHERE repo = ?", (repo,))
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+async def list_repos() -> list[dict]:
+    """Every watched repo, oldest first, so the poller works them in the order they arrived."""
+    async with connect() as conn:
+        async with conn.execute("SELECT * FROM repos ORDER BY added_at, repo") as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def set_repo_golden(repo: str, golden: str | None, status: str) -> None:
+    """Record what provisioning a golden for `repo` did.
+
+    Separate from `add_repo` because it happens much later and from a different task: a repo is
+    watched the moment it is connected, and its golden arrives whenever the provisioning run
+    finishes — or does not arrive at all, which is a slower repo and not a broken one.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE repos SET golden = ?, provision_status = ? WHERE repo = ?",
+            (golden, status, repo),
+        )
+        await conn.commit()
 
 
 async def has_active_run(repo: str) -> bool:

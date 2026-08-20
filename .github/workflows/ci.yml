@@ -42,3 +42,8 @@ jobs:
             echo "== $m"
             python -m "$m"
           done
+
+      # This repo's own .mem/ is checked-in context for future runs; a malformed or
+      # unscoped record in it must fail the same way it would in any other repo.
+      - name: Repository memory
+        run: python -m control.memory validate .

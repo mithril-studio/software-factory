@@ -1,10 +1,11 @@
-"""Which agents this deployment can run, and how far any of them can be trusted.
+"""Which goldens this deployment can boot, and how far any of them can be trusted.
 
 This used to be a freshness sweep: hourly, it forked nothing but `exec`d into every golden
 *machine* and asked how far behind its checkout was, whether the tree was dirty, whether a
-dependency manifest had moved. A golden is a repo-agnostic snapshot now. It has no checkout,
-so every one of those questions stopped having an answer at the same moment — and the one
-that killed goldens was never on the list.
+dependency manifest had moved. A golden is a snapshot now, so there is no machine to ask —
+and staleness stopped being the interesting question anyway, because a warm checkout is only
+a speed-up and a stale one is re-provisioned rather than diagnosed. The failure that actually
+kills goldens was never on that list.
 
 What kills a golden is credential expiry. The only real test of a credential is using it,
 and the runs are already doing that, on the exact machine the question is about, for free.
@@ -13,8 +14,9 @@ produced usage, which is proof that its `claude` login and its `gh` token both s
 Nothing here boots a VM, and nothing here repairs anything.
 
 What is left costs one list call, which is why it runs every five minutes rather than every
-hour: discovering an agent late is the cost that replaced discovering staleness late, and a
-snapshot built by hand should be dispatchable within a poll or two of existing.
+hour: noticing a new golden late is the cost that replaced discovering staleness late, and a
+snapshot — built by hand, or by the provisioning run for a repo somebody just connected —
+should be dispatchable within a poll or two of existing.
 """
 
 from __future__ import annotations
@@ -60,15 +62,18 @@ async def refresh() -> dict[str, dict]:
     finally:
         await boxd.close()
 
-    evidence = await db.agent_evidence()
+    evidence = await db.snapshot_evidence()
     checked_at = db.utcnow()
     rows: dict[str, dict] = {}
     for name in names:
-        parsed = agents.parse_golden(name)
         seen = evidence.get(name, {})
         manifest = _manifest(seen.get("manifest"))
         rows[name] = {
-            "agent": parsed[0] if parsed else None,
+            # The repo this golden was warmed for, straight off the name; NULL for the base.
+            "repo": agents.parse_golden(name) or None,
+            # Which agent the image launches — what it announced about itself, not what its
+            # name implies. The name stopped implying anything when goldens became per-repo.
+            "agent": manifest.get("agent"),
             "version": agents.version(name),
             # What the golden announced on the way into its last run. Read back from the
             # run rather than from the machine, because asking the machine means booting it.
@@ -83,14 +88,10 @@ async def refresh() -> dict[str, dict]:
             "verified_at": seen.get("verified_at"),
             "checked_at": checked_at,
         }
-        await db.record_agent(name, **rows[name])
+        await db.record_snapshot(name, **rows[name])
 
     unproven = [n for n, r in rows.items() if not r["verified_at"]]
-    log.info(
-        "%s golden snapshot(s): %s",
-        len(rows),
-        ", ".join(sorted(agents.discover(rows))) or "none",
-    )
+    log.info("%s golden snapshot(s): %s", len(rows), ", ".join(sorted(rows)) or "none")
     if unproven:
         log.warning("no run has yet proved: %s", ", ".join(sorted(unproven)))
     return rows
@@ -106,7 +107,7 @@ async def _loop() -> None:
 def start() -> None:
     """Launch the refresh loop, unless it is switched off.
 
-    No longer conditional on a repo being watched: which agents exist is a fact about the
+    No longer conditional on a repo being watched: which goldens exist is a fact about the
     fleet, and the UI asks it of a deployment that watches nothing yet.
     """
     global _task

@@ -16,12 +16,47 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from boxd import AsyncBoxd
+from boxd import AsyncBoxd, _mappers as _boxd_mappers
 
 from telemetry.recorder import Recorder
 
 from . import agents, db, github
 from .config import settings
+
+# boxd reports a snapshot's timestamps in **milliseconds**, but the SDK's snapshot mapper reads
+# them as seconds (`_epoch`, where the machine mapper alongside it correctly uses `_epoch_ms`),
+# so `snapshots.list()` dies in `datetime.fromtimestamp` with "year 58577 is out of range".
+# That takes golden discovery with it, and with it every dispatch: `agents.available` cannot
+# name a single `golden-*`, so preflight's `fleet readable` check fails fatally and no issue
+# can be picked up. Verified against SDK 0.2.2, 0.2.4 and 0.2.5 — all three fail
+# identically, so there is no version to pin `boxd>=0.2.2` back to.
+#
+# Nothing in this repo reads a snapshot's timestamp, so the narrowest fix is to stop the
+# mapper crashing rather than to reimplement the listing: an epoch beyond any date boxd could
+# plausibly report is milliseconds, and is scaled back down. Delete this once the SDK maps
+# snapshot timestamps with `_epoch_ms`; the patch is idempotent and self-identifying so that
+# removing it is a one-line change and leaving it in is harmless.
+_EPOCH_SECONDS_CEILING = 32_503_680_000  # 3000-01-01, far past anything boxd will report.
+
+
+def _tolerate_millisecond_epochs() -> None:
+    """Make the boxd SDK's epoch mappers accept milliseconds as well as seconds."""
+    for name in ("_epoch", "_epoch_always"):
+        original = getattr(_boxd_mappers, name, None)
+        if original is None or getattr(original, "_factory_patched", False):
+            continue
+
+        def scaled(value, _original=original):
+            if value and abs(value) > _EPOCH_SECONDS_CEILING:
+                value = value // 1000
+            return _original(value)
+
+        scaled._factory_patched = True
+        setattr(_boxd_mappers, name, scaled)
+
+
+_tolerate_millisecond_epochs()
+
 
 # `log` is the per-run RunLog throughout this file, so the module logger takes another name.
 _log = logging.getLogger("factory.runner")
@@ -40,21 +75,22 @@ def semaphore() -> asyncio.Semaphore:
 
 
 # Every VM a run creates is named from its run id with one of these prefixes: `run-` for a
-# build, `rev-` for a review. Reconcile and the fleet view both key off them, so they live
-# here rather than being spelled out at each site — a prefix known to one and not the other
-# is a VM nobody reaps and nobody recognises.
+# build, `rev-` for a review, `prov-` for warming a repo's golden. Reconcile and the fleet view
+# both key off them, so they live here rather than being spelled out at each site — a prefix
+# known to one and not the other is a VM nobody reaps and nobody recognises.
 RUN_PREFIX = "run-"
 REVIEW_PREFIX = "rev-"
-VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX)
+PROVISION_PREFIX = "prov-"
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX)
 
 
 def is_run_vm(name: str) -> bool:
-    """True for a machine this factory forked for a run, build or review."""
+    """True for a machine this factory created for a run: build, review or provisioning."""
     return name.startswith(VM_PREFIXES)
 
 
 def vm_role(name: str) -> str:
-    """What a machine in the fleet is: `run`, `review`, or `other`.
+    """What a machine in the fleet is: `run`, `review`, `provision`, or `other`.
 
     Read off the same prefixes `is_run_vm` sweeps on, so the fleet view and the reaper can
     never disagree about what belongs to the factory. `other` covers everything the factory
@@ -64,6 +100,8 @@ def vm_role(name: str) -> str:
     """
     if name.startswith(REVIEW_PREFIX):
         return "review"
+    if name.startswith(PROVISION_PREFIX):
+        return "provision"
     if name.startswith(RUN_PREFIX):
         return "run"
     return "other"
@@ -90,8 +128,7 @@ async def _is_snapshot(boxd: AsyncBoxd, source: str) -> bool:
     """Does `source` name a snapshot in this account?
 
     Asked of the fleet rather than of the name, because both kinds of source are named the
-    same way: the golden `golden-claude` is a snapshot on the new path and was a machine on
-    the old one. A name alone cannot tell them apart, and guessing wrong picks the wrong API.
+    same way: `golden-copy` is a snapshot on the new path and was a machine on the old one. A name alone cannot tell them apart, and guessing wrong picks the wrong API.
     """
     return any(s.id == source or s.name == source for s in await boxd.snapshots.list())
 
@@ -127,37 +164,81 @@ async def _provision(boxd: AsyncBoxd, source: str, vm_name: str):
     )
 
 
-async def source_for(
-    boxd: AsyncBoxd, repo: str, agent: str = "", log: RunLog | None = None
-) -> str:
-    """Which golden this run boots from: the agent's snapshot, warmed for this repo if there is one.
+async def reap(boxd: AsyncBoxd, machine, log: RunLog, *, keep: bool = False) -> None:
+    """Destroy a run's VM. Idempotent, and it never raises.
 
-    Public because a run is not the only thing that needs the answer — the golden sweep and
-    preflight both report on the machine a repo's runs would actually boot, and a second
-    derivation of that would be a second thing to keep in step. Without a `log` the two
-    fallbacks are noted on the module logger instead of in a run's own log.
-
-    `runs.agent` records what was asked for and this records what answered, so a run says both
-    which agent took the issue and which tier of its image served it.
-
-    Two fallbacks, both deliberate. An agent no snapshot provides falls back to the default
-    agent and says so, because a poller that halts a repo over one stale config value is worse
-    than one that keeps building — a typo is rejected at the API instead, where somebody is
-    watching (`config.unknown_agent`). And when the snapshot fleet answers to nothing at all,
-    the conventional name is handed to `_provision` anyway: on the rollback path `golden-<agent>`
-    is still a *machine*, and forking it is exactly what should happen.
+    Every path that creates a machine ends here, including the ones that got there by
+    crashing. A machine that outlives its run holds one of the account's 20 slots until the
+    `auto_destroy` timer fires two hours later, and three of those is a factory that cannot
+    dispatch — so a failure to reap is logged and handed to the reconciler rather than raised
+    into a `finally` that is already handling something else.
     """
-    agent = agent or settings.agent_for(repo)
+    if machine is None:
+        return
+    if keep:
+        log.write(f"[factory] keeping {machine.name} for inspection (FACTORY_KEEP_FAILED=1)")
+        return
+    try:
+        await boxd.machines.delete(machine.id)
+        log.write(f"[factory] destroyed {machine.name}")
+    except Exception as exc:  # noqa: BLE001 - already gone is fine, and a leak is the reaper's
+        log.write(f"[factory] could not destroy {machine.name}: {exc!r}; reconcile will sweep it")
+
+
+async def headroom(boxd: AsyncBoxd, log: RunLog) -> None:
+    """Refuse to provision when the fleet is at its cap, after trying to make room.
+
+    Nothing counted machines against the quota before this: concurrency was bounded by
+    `FACTORY_MAX_CONCURRENT`, which says nothing about the goldens, the control plane, or a
+    machine somebody left running by hand. Past the cap boxd refuses the create, and the run
+    that finds out is the one that dies.
+
+    So ask first, and sweep before giving up — an orphaned run VM is exactly the thing
+    `reconcile` exists to reclaim, and a factory that reaps and then proceeds is better than
+    one that stops at a limit it could have cleared itself.
+    """
+    if settings.max_machines <= 0:
+        return
+    count = len(await boxd.machines.list())
+    if count < settings.max_machines:
+        return
+    log.write(f"[factory] fleet at {count}/{settings.max_machines}; sweeping for orphans")
+    swept = await reconcile()
+    count = len(await boxd.machines.list())
+    if count >= settings.max_machines:
+        raise RuntimeError(
+            f"the boxd fleet is at {count}/{settings.max_machines} machines and sweeping "
+            f"reclaimed {len(swept.get('destroyed') or [])}; nothing can be provisioned until "
+            "something is destroyed"
+        )
+    log.write(f"[factory] reclaimed to {count}/{settings.max_machines}")
+
+
+async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> str:
+    """Which golden this run boots from: this repo's own, or the base image behind it.
+
+    Public because a run is not the only thing that needs the answer — the projects page and
+    preflight both report on the snapshot a repo's runs would actually boot, and a second
+    derivation of that would be a second thing to keep in step. Without a `log` the fallback
+    is noted on the module logger instead of in a run's own log.
+
+    One fallback, and it is the ordinary case rather than an error path: a repo nobody has
+    provisioned a golden for yet boots `golden-copy` and installs for itself. That is what
+    lets a repo be connected and dispatched in the same minute, with provisioning catching up
+    afterwards.
+
+    When the snapshot fleet answers to nothing at all, the base name is handed to `_provision`
+    anyway. On the rollback path `golden-copy` is still a *machine*, and forking it is exactly
+    what should happen.
+    """
     note = log.write if log is not None else _log.info
     names = await agents.available(boxd)
-    source = agents.resolve_snapshot(agent, repo, names)
+    source = agents.resolve_snapshot(repo, names)
     if not source:
-        source = agents.resolve_snapshot(settings.agent_default, repo, names)
-        if source:
-            note(f"[factory] no snapshot for agent {agent!r}; falling back to {source}")
-    if not source:
-        source = agents.golden_name(agent)
-        note(f"[factory] no golden snapshot for agent {agent!r}; trying machine {source}")
+        source = agents.BASE_SNAPSHOT
+        note(f"[factory] no golden snapshot in the fleet; trying machine {source}")
+    elif source == agents.BASE_SNAPSHOT:
+        note(f"[factory] no warm golden for {repo}; booting {source} and installing for itself")
     return source
 
 
@@ -489,11 +570,11 @@ anything on GitHub — writing that file is the entirety of your output.
 # resolves the branch differently from the build VM that wrote it reviews something nobody
 # built.
 #
-# The run brings its own repo now. A golden used to carry exactly one checkout, which is why a
-# second watched repo needed a second golden; a golden is an *agent* image, and which repo it
-# works on is a property of the run. So this clones — and the warm tier is the same script
-# taking the other branch: a snapshot with the repo already in place skips the clone, which is
-# all "warm" has ever meant.
+# The run brings its own repo. `golden-copy` carries tooling and auth and no checkout at all,
+# so this clones — and the warm tier is the same script taking the other branch: a
+# `golden-<repo-slug>` with the repo already in place skips the clone, which is all "warm" has
+# ever meant. Writing it as one script rather than two is what lets a repo be dispatched before
+# it has been provisioned.
 #
 # `--filter=blob:none` rather than `--depth 1`: reviews need real ancestry (they diff against
 # a merge base) and agents run `git log`, but the file contents of history nobody reads can be
@@ -541,10 +622,9 @@ git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
 # before the checkout and you assert against whatever commit the machine happened to be sitting
 # on, which is exactly the stale answer this guard exists to catch.
 #
-# It repairs before it refuses. A golden pre-matched to one repo's pin was possible while a
-# golden carried one repo; an agent image serves every repo the deployment watches, and they do
-# not agree on a Node version. So the mismatch is now ordinary and the fix is to install what
-# the repo asks for. Only a mismatch that survives the install is fatal — and the old advice,
+# It repairs before it refuses. A warm golden is pre-matched to its own repo's pin, but the
+# base image serves every repo the deployment watches and they do not agree on a Node version.
+# So on the base a mismatch is ordinary and the fix is to install what the repo asks for. Only a mismatch that survives the install is fatal — and the old advice,
 # "the golden needs rebuilding", is no longer the right sentence for it.
 NODE_GUARD = r"""
 if [ -f .nvmrc ] && command -v node > /dev/null 2>&1; then
@@ -649,6 +729,37 @@ def dispatch_env(
     if settings.claude_code_oauth_token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.claude_code_oauth_token
     return env
+
+
+# A shell name, so a key that could not be one is never pasted into a command.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def export_prelude(env: dict) -> str:
+    """Shell that turns the assignments `stream_exec(env=...)` makes into a real environment.
+
+    boxd's wire protocol has no env field. Its SDK says so and works around it by prefixing
+    the command with `K=v` assignments (`boxd.resources.machines._exec_init`), which is
+    correct for the one-line command that comment has in mind and quietly wrong for a script.
+    In front of a *multi-line* command the prefix lands on a line of its own, and a line of
+    bare assignments sets shell variables rather than exporting them. The script itself then
+    reads `$FACTORY_REPO` perfectly well while every process it starts inherits none of them.
+
+    That is not a theoretical gap. It is what stopped the factory on 2026-08-19: `gh repo
+    clone` could not see `GH_TOKEN`, failed with "please run gh auth login", and the prelude
+    exited 90 before the agent ever started — while the same log line printed the repo name
+    it had just read from the very variable `gh` could not see, which is what made it look
+    like the environment had arrived.
+
+    Names come from the dict, so a variable added to `dispatch_env` cannot be forgotten here.
+    """
+    names = [k for k in env if _ENV_NAME.fullmatch(k)]
+    if not names:
+        return ""
+    # Leading newline so the SDK's prefix stays a line of pure assignments; without it the
+    # assignments would attach to this `export` as a command prefix and the fix would depend
+    # on how the shell scopes assignments to a special builtin.
+    return "\nexport " + " ".join(names) + "\n"
 
 
 # --------------------------------------------------------------------------- manifest
@@ -953,7 +1064,6 @@ async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt
 async def _fix_cycle(
     repo: str,
     number: int,
-    agent: str,
     cycle: int,
     log: RunLog,
     *,
@@ -976,7 +1086,6 @@ async def _fix_cycle(
         await create(
             repo,
             number,
-            agent=agent,
             attempt=cycle + 1,
             prior_error=reason,
             prior_log=detail,
@@ -998,7 +1107,6 @@ async def _fail_run(
     run_id: str,
     repo: str,
     issue: dict,
-    agent: str,
     attempt: int,
     reason: str,
     log: RunLog,
@@ -1017,7 +1125,6 @@ async def _fail_run(
             await create(
                 repo,
                 number,
-                agent=agent,
                 attempt=attempt + 1,
                 prior_error=reason,
                 prior_log=_log_tail(run_id),
@@ -1056,7 +1163,6 @@ async def _fail_run(
 async def create(
     repo: str,
     issue_number: int,
-    agent: str | None = None,
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
@@ -1064,15 +1170,17 @@ async def create(
 ) -> str:
     """Register a run and schedule it. Returns the run id immediately.
 
-    `agent` names which agent takes the issue; without one the repo's configured agent does.
-    Which snapshot that agent boots is resolved when the run actually starts, so a golden
-    built while the run sat in the queue is still picked up.
+    Which snapshot the run boots is resolved when it actually starts, not now, so a golden
+    provisioned while the run sat in the queue is still picked up.
+
+    The `agent` column is seeded with the one agent this deployment runs and then overwritten
+    by whatever the golden announces in its manifest on the way in. It is a record of what did
+    the work, not an instruction — nothing about dispatch reads it, and no caller chooses it.
 
     `attempt` > 1 marks a retry: the previous attempt's error and log tail are woven into
     the prompt so the agent diagnoses the failure instead of repeating it. Retries reuse the
     same branch, so the whole chain resolves into one pull request.
     """
-    agent = (agent or "").strip() or settings.agent_for(repo)
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     branch = f"factory/issue-{issue_number}"
@@ -1087,14 +1195,14 @@ async def create(
         branch=branch,
         status="queued",
         attempt=attempt,
-        agent=agent,
+        agent=agents.DEFAULT_AGENT,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
     task = asyncio.create_task(
         _guarded(
-            run_id, repo, issue, branch, agent,
+            run_id, repo, issue, branch,
             attempt, prior_error, prior_log, review_cycle,
         )
     )
@@ -1108,11 +1216,9 @@ async def create_review(
     issue_number: int,
     pr_url: str,
     branch: str,
-    agent: str | None = None,
     cycle: int = 1,
 ) -> str:
     """Register and schedule a review of the pull request a build run opened."""
-    agent = (agent or "").strip() or settings.agent_for(repo)
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"
@@ -1127,14 +1233,14 @@ async def create_review(
         status="queued",
         kind="review",
         attempt=cycle,
-        agent=agent,
+        agent=agents.DEFAULT_AGENT,
         pr_url=pr_url,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
 
     task = asyncio.create_task(
-        _guarded_review(run_id, repo, issue, branch, pr_url, agent, cycle)
+        _guarded_review(run_id, repo, issue, branch, pr_url, cycle)
     )
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
@@ -1181,13 +1287,12 @@ async def _guarded_review(
     issue: dict,
     branch: str,
     pr_url: str,
-    agent: str,
     cycle: int,
 ) -> None:
     log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
     try:
         async with semaphore():
-            await _execute_review(run_id, repo, issue, branch, pr_url, agent, log, cycle)
+            await _execute_review(run_id, repo, issue, branch, pr_url, log, cycle)
     except asyncio.CancelledError:
         log.write("[factory] review cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
@@ -1222,7 +1327,6 @@ async def _guarded(
     repo: str,
     issue: dict,
     branch: str,
-    agent: str,
     attempt: int,
     prior_error: str | None,
     prior_log: str | None,
@@ -1232,7 +1336,7 @@ async def _guarded(
     try:
         async with semaphore():
             await _execute(
-                run_id, repo, issue, branch, agent, log,
+                run_id, repo, issue, branch, log,
                 attempt, prior_error, prior_log, review_cycle,
             )
     except asyncio.CancelledError:
@@ -1249,7 +1353,7 @@ async def _guarded(
             reason = f"timed out after {settings.run_timeout}s"
         else:
             reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        await _fail_run(run_id, repo, issue, agent, attempt, reason, log)
+        await _fail_run(run_id, repo, issue, attempt, reason, log)
     finally:
         await _salvage_usage(run_id, log)
         log.close()
@@ -1260,7 +1364,6 @@ async def _execute(
     repo: str,
     issue: dict,
     branch: str,
-    agent: str,
     log: RunLog,
     attempt: int = 1,
     prior_error: str | None = None,
@@ -1269,6 +1372,7 @@ async def _execute(
 ) -> None:
     boxd = client()
     machine = None
+    reaped = False
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
@@ -1290,9 +1394,10 @@ async def _execute(
         # ---- provision
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{RUN_PREFIX}{run_id[:8]}"
-        source = await source_for(boxd, repo, agent, log)
+        await headroom(boxd, log)
+        source = await source_for(boxd, repo, log)
         await db.update_run(run_id, golden=source)
-        log.write(f"[factory] provisioning {vm_name} from {source} (agent {agent})")
+        log.write(f"[factory] provisioning {vm_name} from {source}")
         machine = await _provision(boxd, source, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
@@ -1365,24 +1470,30 @@ async def _execute(
             )
         else:
             reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
-            await _fail_run(run_id, repo, issue, agent, attempt, reason, log, pr_url=pr_url)
+            await _fail_run(run_id, repo, issue, attempt, reason, log, pr_url=pr_url)
 
         # ---- reap
-        if ok or not settings.keep_failed:
+        keep = not ok and settings.keep_failed
+        if not keep:
             # Brief drain so any buffered telemetry flushes before the VM disappears.
             await asyncio.sleep(3)
-            await boxd.machines.delete(machine.id)
-            log.write(f"[factory] destroyed {machine.name}")
-        else:
-            log.write(f"[factory] keeping {machine.name} for inspection (FACTORY_KEEP_FAILED=1)")
+        await reap(boxd, machine, log, keep=keep)
+        reaped = True
 
         # ---- hand off to review, once this run's VM is gone and its slot is free
         if ok and review_next:
             try:
-                await create_review(repo, number, pr_url, branch, agent, cycle=review_cycle)
+                await create_review(repo, number, pr_url, branch, cycle=review_cycle)
             except Exception as exc:  # noqa: BLE001 - an unreviewed PR beats a lost one
                 log.write(f"[factory] could not queue review: {exc!r}")
     finally:
+        # Everything above can raise: `wait_until_ready` times out, the stream drops, the run
+        # hits `FACTORY_RUN_TIMEOUT`, a GitHub call fails after the agent finished. Each of
+        # those used to leave a machine running until its two-hour self-destruct. The reap in
+        # the body is the ordinary path and this is the one that catches the rest; `reaped`
+        # keeps it from running twice.
+        if not reaped:
+            await reap(boxd, machine, log, keep=settings.keep_failed)
         await boxd.close()
 
 
@@ -1392,7 +1503,6 @@ async def _execute_review(
     issue: dict,
     branch: str,
     pr_url: str,
-    agent: str,
     log: RunLog,
     cycle: int,
 ) -> None:
@@ -1401,13 +1511,16 @@ async def _execute_review(
     base = await github.default_branch(repo)
     criteria = parse_criteria(issue.get("body") or "")
     boxd = client()
+    machine = None
+    reaped = False
     try:
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{REVIEW_PREFIX}{run_id[:8]}"
         log.write(f"[factory] review {cycle}/{settings.max_review_cycles} of {pr_url}")
-        source = await source_for(boxd, repo, agent, log)
+        await headroom(boxd, log)
+        source = await source_for(boxd, repo, log)
         await db.update_run(run_id, golden=source)
-        log.write(f"[factory] provisioning {vm_name} from {source} (agent {agent})")
+        log.write(f"[factory] provisioning {vm_name} from {source}")
         machine = await _provision(boxd, source, vm_name)
         await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
@@ -1466,8 +1579,8 @@ async def _execute_review(
             log.write(f"[factory]   finding: {finding}")
 
         await asyncio.sleep(3)
-        await boxd.machines.delete(machine.id)
-        log.write(f"[factory] destroyed {machine.name}")
+        await reap(boxd, machine, log)
+        reaped = True
 
         # ---- act on the verdict
         #
@@ -1520,7 +1633,6 @@ async def _execute_review(
             await _fix_cycle(
                 repo,
                 number,
-                agent,
                 cycle,
                 log,
                 reason=f"CI failed after an approved review: {merge_attempt.ci_failure}",
@@ -1559,7 +1671,6 @@ async def _execute_review(
         await _fix_cycle(
             repo,
             number,
-            agent,
             cycle,
             log,
             reason=f"review requested changes: {why}",
@@ -1571,6 +1682,10 @@ async def _execute_review(
             ),
         )
     finally:
+        # The review path leaks a VM the same way the build path does, and for the same
+        # reasons — see the note there.
+        if not reaped:
+            await reap(boxd, machine, log, keep=settings.keep_failed)
         await boxd.close()
 
 
@@ -1624,7 +1739,7 @@ async def _stream(
     manifest: dict = {}
     recorder = Recorder(run_id)
     async with boxd.machines.stream_exec(
-        machine_id, command=script, env=env, close_stdin=True
+        machine_id, command=export_prelude(env) + script, env=env, close_stdin=True
     ) as stream:
         async for chunk in stream.iter_chunks():
             text = chunk.data.decode("utf-8", errors="replace")
@@ -1660,8 +1775,9 @@ async def _stream(
                     await db.update_run(
                         run_id,
                         manifest=json.dumps(manifest),
-                        # What actually ran, overwriting what was asked for. They differ
-                        # when a golden was rebuilt onto another agent under the same name.
+                        # What actually ran, overwriting the default the row was seeded
+                        # with. This is the registry: the image says which agent it launches,
+                        # and nothing else in the system claims to know.
                         **({"agent": named} if named else {}),
                     )
                     continue
@@ -1718,6 +1834,17 @@ async def _salvage_transcript(
         log.write(f"[factory] transcript salvage skipped: {exc!r}")
 
 
+def track(run_id: str, task: asyncio.Task) -> None:
+    """Register a run's task so `cancel()` can reach it, and forget it when it ends.
+
+    Public because provisioning a golden is a run this module does not start — it is an
+    agentless one, so it lives in `control/provision.py` — but it is still a task holding a VM,
+    and a task the UI cannot cancel is a VM nobody can stop.
+    """
+    _tasks[run_id] = task
+    task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
+
+
 async def cancel(run_id: str) -> bool:
     """Cancel an in-flight run and destroy its VM."""
     run = await db.get_run(run_id)
@@ -1738,11 +1865,60 @@ async def cancel(run_id: str) -> bool:
     return True
 
 
+_reconciler: asyncio.Task | None = None
+
+
+async def _reconcile_loop() -> None:
+    _log.info("reconciling the fleet every %ss", settings.reconcile_interval)
+    while True:
+        await asyncio.sleep(settings.reconcile_interval)
+        try:
+            found = await reconcile()
+        except Exception:  # noqa: BLE001 - a boxd outage is a sweep that did nothing
+            _log.exception("reconcile failed")
+            continue
+        if found["destroyed"] or found["stranded"] or found["stuck"]:
+            _log.info(
+                "reconciled: destroyed %s, stranded %s, stuck %s",
+                found["destroyed"], found["stranded"], found["stuck"],
+            )
+
+
+def start_reconciler() -> None:
+    """Run the sweep on a timer.
+
+    `control/README.md` §4 has described "a periodic reconciler" since the layer was designed.
+    Until now the function existed and nothing scheduled it: the only way a leaked VM was ever
+    reclaimed was somebody noticing and pressing a button in the fleet view. Sleeps first, so a
+    control plane in a restart loop cannot turn into a sweep loop.
+    """
+    global _reconciler
+    if _reconciler is not None or settings.reconcile_interval <= 0:
+        return
+    _reconciler = asyncio.create_task(_reconcile_loop())
+
+
+async def stop_reconciler() -> None:
+    global _reconciler
+    if _reconciler is None:
+        return
+    _reconciler.cancel()
+    try:
+        await _reconciler
+    except asyncio.CancelledError:
+        pass
+    _reconciler = None
+
+
 async def reconcile() -> dict:
     """Compare the boxd fleet against the runs table and resolve the difference.
 
     Fleet state belongs in the database, not in anybody's head. Without this, a crashed
     dispatch silently leaks machines against the quota.
+
+    Safe to call at any time and from anywhere: it reads both sides fresh, and a run whose task
+    is still in flight is never touched (`_tasks`). `headroom` calls it before giving up on a
+    full fleet, and `_reconcile_loop` calls it on a timer.
     """
     boxd = client()
     try:
@@ -1753,8 +1929,17 @@ async def reconcile() -> dict:
         orphans = [
             m for m in machines if is_run_vm(m.name) and m.name not in active_vms
         ]
+        # Per machine, because one that refuses to die used to abort the whole sweep — and the
+        # sweep is what reclaims the quota, so a single stuck VM could keep every other orphan
+        # alive behind it. Reported rather than raised: the next sweep tries again.
+        destroyed, stuck = [], []
         for machine in orphans:
-            await boxd.machines.delete(machine.id)
+            try:
+                await boxd.machines.delete(machine.id)
+                destroyed.append(machine.name)
+            except Exception as exc:  # noqa: BLE001 - the message is the finding
+                _log.warning("could not destroy orphan %s: %r", machine.name, exc)
+                stuck.append(machine.name)
 
         # Runs we think are live whose VM no longer exists.
         names = {m.name for m in machines}
@@ -1768,6 +1953,6 @@ async def reconcile() -> dict:
                     finished_at=db.utcnow(),
                 )
                 stranded.append(run["id"])
-        return {"destroyed": [m.name for m in orphans], "stranded": stranded}
+        return {"destroyed": destroyed, "stuck": stuck, "stranded": stranded}
     finally:
         await boxd.close()

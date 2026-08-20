@@ -7,10 +7,10 @@ ask now, expensive to learn later.
 
 It used to ask half its questions of the golden, over an `exec`: is the checkout the right
 repo, is it clean, is it on the base branch, how far behind, does node match `.nvmrc`. A
-golden is a repo-agnostic snapshot now and carries no checkout, so five of those were about
-a thing that no longer exists and the sixth — the toolchain — is what a run's own setup step
-installs. What is left of the machine half is one question that costs no VM at all: does a
-golden snapshot exist for the agent this repo's runs would use.
+golden is a snapshot now and there is no machine to `exec` into, so five of those were about
+a thing that cannot be asked and the sixth — the toolchain — is what a run's own setup step
+installs. What is left of the machine half is one question that costs no VM at all: is there
+a golden for this repo's runs to boot, its own or the base image behind it.
 
 It inspects, it does not repair — what it reports is what a human then fixes, because a
 preflight that quietly repairs things is one nobody can trust the verdict of. The single
@@ -51,9 +51,40 @@ class Check:
 
 
 # A `## Setup` heading in the profile, at any level. What follows it is the command the
-# prompt now tells the agent to run before it touches any code; nothing here reads that
-# command, only whether the repo bothered to name one.
+# prompt tells the agent to run before it touches any code; `profile_checks` reads only
+# whether the repo bothered to name one, and `setup_command` reads the command itself.
 SETUP_SECTION = re.compile(r"^#{1,6}\s*set[ -]?up\b", re.I | re.M)
+
+# The last backtick-quoted span on a line. Greedy `.*` is what makes it the last one, and it
+# has to be, because `scripts/refresh-golden.sh` extracts the command with
+# `sed -n 's/.*`\([^`]*\)`.*/\1/p'`, which behaves the same way. The two are pinned against
+# each other in `control/golden_scripts_test.py`; a disagreement here means the control plane
+# and the by-hand script install a repo differently, which is exactly the sort of divergence
+# nothing would report.
+_BACKTICKED = re.compile(r"^.*`([^`]*)`")
+
+
+def setup_command(profile: str | None) -> str:
+    """The install command a repo names in its `.factory.md`, or `""` if it names none.
+
+    Never guessed. A control plane with opinions about how projects install is how one
+    project's install command became every project's, and the caller is expected to refuse
+    rather than invent one — `scripts/refresh-golden.sh` records why at length.
+
+    Reads the first backticked command under the `## Setup` heading and stops at the next
+    heading, which is the same walk the shell script does in `awk`.
+    """
+    started = False
+    for line in (profile or "").splitlines():
+        if not started:
+            started = bool(SETUP_SECTION.match(line))
+            continue
+        if line.startswith("#"):
+            break
+        found = _BACKTICKED.match(line)
+        if found:
+            return found.group(1).strip()
+    return ""
 
 
 def profile_checks(profile: str | None) -> list[Check]:
@@ -85,26 +116,51 @@ def profile_checks(profile: str | None) -> list[Check]:
     ]
 
 
-def agent_check(repo: str, agent: str, available: Iterable[str] = ()) -> Check:
-    """Is there a golden snapshot for the agent this repo's runs would boot?
+def push_check(ok: bool, detail: str) -> Check:
+    """Read `github.can_push`'s answer as a check.
 
-    The cheapest question the old VM probe was standing in for, and the only one of them
-    still worth asking: a repo whose agent resolves to nothing does not fail slowly, it fails
-    at the first dispatch, having spent nothing. Blocking, therefore — unlike the profile
-    warnings, this is not a run that goes worse, it is a run that cannot start.
+    Split from the request so the verdict is testable without credentials, the same way
+    `golden_check` takes the fleet rather than fetching it. Blocking either way: a token that
+    cannot write is not a run that goes worse, it is a run that cannot finish — it clones,
+    spends an agent's whole context, and dies at the push with a branch that never existed.
+
+    "Could not tell" is also blocking, and deliberately. The failure this replaces was a check
+    that answered `ok` without ever asking the question; anything less than a yes should read
+    as a no.
+    """
+    return Check("token can push", ok, detail)
+
+
+def golden_check(repo: str, available: Iterable[str] = ()) -> Check:
+    """Is there a golden snapshot for this repo's runs to boot?
+
+    The cheapest question the old VM probe was standing in for, and the only one of them still
+    worth asking: a repo that resolves to nothing does not fail slowly, it fails at the first
+    dispatch, having spent nothing.
+
+    Which is a narrower failure than it used to be. A repo with no warm golden of its own is
+    fine and says so — it boots `golden-copy` and installs for itself, so connecting a repo
+    never waits on provisioning. The only blocking answer is a deployment with no base image
+    at all, which is not this repo's problem to fix and would stop every other repo too.
 
     `available` is passed in rather than fetched so the decision is testable without
     credentials; `run()` is the one place that talks to the fleet.
     """
-    snapshot = agents.resolve_snapshot(agent, repo, available)
+    snapshot = agents.resolve_snapshot(repo, available)
+    if snapshot == agents.golden_name(repo):
+        return Check("a golden is resolvable", True, f"{snapshot}, warmed for this repo")
     if snapshot:
-        return Check("an agent is resolvable", True, f"{agent} boots {snapshot}")
+        return Check(
+            "a golden is resolvable",
+            True,
+            f"{snapshot} — no warm golden for {repo} yet, so its runs clone and install for "
+            "themselves. A speed-up to provision, not a blocker.",
+        )
     fleet = ", ".join(sorted(available)) or "no golden snapshots at all"
     return Check(
-        "an agent is resolvable",
+        "a golden is resolvable",
         False,
-        f"{repo} resolves to agent {agent!r}, which has no {agents.golden_name(agent)}; "
-        f"the fleet holds {fleet}",
+        f"no {agents.BASE_SNAPSHOT} to fall back on; the fleet holds {fleet}",
     )
 
 
@@ -113,11 +169,12 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
     info = await github.repo_info(repo)
     if info is None:
         return [Check("repo readable", False, f"the token cannot read {repo}")]
-    permissions = info.get("permissions", {})
     checks = [
         Check("repo readable", True, f"default branch {base}"),
-        # The agent pushes its branch and opens the pull request as this token.
-        Check("token can push", bool(permissions.get("push")), f"permissions: {permissions}"),
+        # The agent pushes its branch and opens the pull request as this token. Asked of git
+        # rather than of `info["permissions"]`, which answers for the account and not the
+        # token — see `github.can_push`.
+        push_check(*await github.can_push(repo)),
     ]
     # With no workflows, every pull request the factory opens waits out
     # FACTORY_MERGE_CHECK_TIMEOUT for a check run that never comes, and then stops for a
@@ -143,8 +200,8 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
 async def _fleet() -> tuple[tuple[str, ...], Check | None]:
     """The golden snapshot names, plus a failing check when the fleet could not be read.
 
-    Kept apart from `agent_check` on purpose: "boxd is unreachable" and "this agent has no
-    snapshot" are different repairs, and an outage reported as a missing agent sends whoever
+    Kept apart from `golden_check` on purpose: "boxd is unreachable" and "there is no base
+    image" are different repairs, and an outage reported as a missing golden sends whoever
     reads it to build a snapshot that is already there.
     """
     boxd = runner.client()
@@ -157,7 +214,7 @@ async def _fleet() -> tuple[tuple[str, ...], Check | None]:
 
 
 async def run(repo: str) -> list[Check]:
-    """Every check for `repo`, and for the agent its runs would boot."""
+    """Every check for `repo`, and for the golden its runs would boot."""
     base, (available, outage) = await asyncio.gather(
         github.default_branch(repo), _fleet()
     )
@@ -165,7 +222,7 @@ async def run(repo: str) -> list[Check]:
     if outage:
         checks.append(outage)
     else:
-        checks.append(agent_check(repo, settings.agent_for(repo), available))
+        checks.append(golden_check(repo, available))
     return checks
 
 

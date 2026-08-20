@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import agents, auth, config, db, github, goldens, poller, preflight, runner
+from . import agents, auth, db, github, goldens, poller, preflight, provision, repos, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -30,13 +30,18 @@ DIST = ROOT / "web" / "dist"
 async def lifespan(app: FastAPI):
     await db.init()
     await telemetry.init()
+    # Before the poller, and before the first request: everything that asks which repos are
+    # watched reads a cache, and the cache is empty until this has run.
+    await repos.seed()
     poller.start()
     goldens.start()
+    runner.start_reconciler()
     try:
         yield
     finally:
         await poller.stop()
         await goldens.stop()
+        await runner.stop_reconciler()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
@@ -106,21 +111,16 @@ async def _available() -> tuple[str, ...]:
 
 @app.get("/api/config")
 async def api_config():
-    """What the shell needs: watched repos and their agents, limits, and what is wrong.
+    """What the shell needs: the repos being watched, limits, and what is wrong.
 
     Two kinds of wrong, kept apart. `missing` is a setting nobody filled in; `problems` is a
-    configuration that is complete but has nothing to run on — an agent with no snapshot yet.
-    The second question needs the fleet, which is why it lives here (async) and not in
+    configuration that is complete but has nothing to run on — no base image yet. The second
+    question needs the fleet, which is why it lives here (async) and not in
     `settings.missing()`, which is synchronous and gates starting a run.
     """
     available = await _available()
     return {
-        "repos": list(settings.repos),
-        "watched": [
-            {"repo": repo, "agent": settings.agent_for(repo)} for repo, _ in settings.watched
-        ],
-        "agents": list(agents.discover(available)),
-        "agent_default": settings.agent_default,
+        "repos": list(repos.watched()),
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
@@ -172,9 +172,9 @@ async def api_telemetry():
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    agent: str | None = None
-    # A review of a pull request a build already opened, rather than a build. Both are runs
-    # on a fork, which is why one endpoint starts either.
+    # 'build', 'review' (of a pull request a build already opened), or 'provision' (warm this
+    # repo's golden). All three are runs on a restored VM, which is why one endpoint starts any
+    # of them. A provision ignores `issue_number`; there is no issue behind it.
     kind: str = "build"
     pr_url: str | None = None
     branch: str | None = None
@@ -197,29 +197,17 @@ async def api_start_run(body: StartRun):
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
     repo = body.repo.strip()
-    if body.agent:
-        # Validated against the snapshots that exist, because this is the one place a typo
-        # should be loud: quietly running somebody's issue on a different agent than they
-        # asked for is worse than refusing to start.
-        wrong = config.unknown_agent(body.agent, await _available())
-        if wrong:
-            raise HTTPException(400, wrong)
     try:
         if body.kind == "review":
             if not body.pr_url or not body.branch:
                 raise ValueError("a review needs pr_url and branch")
             run_id = await runner.create_review(
-                repo,
-                body.issue_number,
-                body.pr_url,
-                body.branch,
-                agent=body.agent,
-                cycle=body.attempt,
+                repo, body.issue_number, body.pr_url, body.branch, cycle=body.attempt
             )
         elif body.kind == "build":
-            run_id = await runner.create(
-                repo, body.issue_number, agent=body.agent, attempt=body.attempt
-            )
+            run_id = await runner.create(repo, body.issue_number, attempt=body.attempt)
+        elif body.kind == "provision":
+            run_id = await provision.create(repo)
         else:
             raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001
@@ -286,9 +274,9 @@ async def api_plan(repo: str | None = None):
 
     One repo if `repo` is given, otherwise every watched repo, concatenated.
     """
-    repos = [repo] if repo else list(settings.repos)
+    targets = [repo] if repo else list(repos.watched())
     out: list[dict] = []
-    for r in repos:
+    for r in targets:
         try:
             out.extend(await github.plan(r))
         except Exception as exc:  # noqa: BLE001 - one bad repo shouldn't blank the page
@@ -305,15 +293,15 @@ async def api_plan(repo: str | None = None):
     return out
 
 
-@app.post("/api/agents/refresh")
-async def api_agent_refresh():
+@app.post("/api/goldens/refresh")
+async def api_goldens_refresh():
     """Re-list the golden snapshots now, rather than waiting for the next refresh."""
     return await goldens.refresh()
 
 
 @app.get("/api/preflight")
 async def api_preflight(repo: str):
-    """Whether `repo` is ready to be dispatched to, and an agent exists to take it.
+    """Whether `repo` is ready to be dispatched to, and a golden exists to boot for it.
 
     Read-only: it reports, it never repairs. Answers here cost a second; the same answers
     found during a run cost a VM and forty minutes.
@@ -328,33 +316,139 @@ async def api_preflight(repo: str):
     }
 
 
+class ConnectRepo(BaseModel):
+    repo: str
+
+
+def _checks_json(checks) -> list[dict]:
+    return [{"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks]
+
+
+@app.post("/api/repos")
+async def api_connect_repo(body: ConnectRepo):
+    """Watch a repo from now on. The only supported way to connect one.
+
+    Preflight runs first and a blocking failure refuses the connection, with its checks in the
+    response so the caller can say *which* one. That is stricter than it looks: warnings do not
+    block, and "no warm golden yet" is not a failure at all — a repo dispatches onto
+    `golden-copy` and installs for itself, so connecting one never waits on provisioning.
+    What does block is a repo the token cannot read or push to, which would spend a VM and an
+    agent's whole context to discover the same thing.
+
+    Preflight also creates the lifecycle labels on its way through, which makes this the whole
+    of connecting a repo: no restart, no `.env` edit, no shell on the box.
+    """
+    repo = body.repo.strip()
+    if not repos.valid(repo):
+        raise HTTPException(400, f"{repo!r} is not owner/repo")
+    if repo in repos.watched():
+        raise HTTPException(409, f"{repo} is already watched")
+    try:
+        checks = await preflight.run(repo)
+    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
+        raise HTTPException(400, f"could not check {repo}: {exc}") from exc
+    blocking = [c for c in checks if not c.ok and c.fatal]
+    if blocking:
+        raise HTTPException(
+            400,
+            {
+                "message": f"{repo} is not ready: " + ", ".join(c.name for c in blocking),
+                "checks": _checks_json(checks),
+            },
+        )
+    await repos.add(repo)
+    # Warm a golden for it, if it says how to install itself. Best-effort and reported rather
+    # than awaited: the repo is dispatchable the moment it is registered, so provisioning that
+    # cannot start is a slower repo and not a failed connection. `provision` refuses when the
+    # repo names no `## Setup` command, which is the ordinary reason this returns no run.
+    provision_run, why = None, None
+    try:
+        provision_run = await provision.create(repo)
+    except Exception as exc:  # noqa: BLE001 - the message is what the caller shows
+        why = str(exc)
+    return {
+        "repo": repo,
+        "checks": _checks_json(checks),
+        "provision_run": provision_run,
+        "provision_skipped": why,
+    }
+
+
+@app.post("/api/repos/{owner}/{name}/golden")
+async def api_provision_golden(owner: str, name: str):
+    """Warm this repo's golden now: restore the base, clone, install, capture, destroy.
+
+    Also how a stale one is refreshed — provisioning always builds from `golden-copy` rather
+    than updating the repo's existing snapshot in place, so re-running this is the repair for a
+    golden that has gone wrong as well as the way to make one.
+    """
+    repo = f"{owner}/{name}"
+    if repo not in repos.watched():
+        raise HTTPException(404, f"{repo} is not watched")
+    try:
+        return {"run_id": await provision.create(repo)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/repos/{owner}/{name}/golden")
+async def api_delete_golden(owner: str, name: str):
+    """Delete this repo's golden. Its runs fall back to the base and install for themselves."""
+    repo = f"{owner}/{name}"
+    if repo not in repos.watched():
+        raise HTTPException(404, f"{repo} is not watched")
+    try:
+        return {"repo": repo, "deleted": await provision.unprovision(repo)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/repos/{owner}/{name}")
+async def api_disconnect_repo(owner: str, name: str):
+    """Stop watching a repo. Its runs stay — they are the ledger, not the configuration.
+
+    Two path segments rather than one encoded parameter, because `owner/repo` carries a slash
+    and a client that forgets to encode it would otherwise hit a route that does not exist and
+    read the 404 as "already gone".
+    """
+    repo = f"{owner}/{name}"
+    if not await repos.remove(repo):
+        raise HTTPException(404, f"{repo} is not watched")
+    return {"repo": repo, "removed": True}
+
+
 @app.get("/api/projects")
 async def api_projects():
     """Watched repos with their run tallies and the snapshot their runs boot."""
+    watched = repos.rows()
     stats = await db.stats_by_repo()
-    # `watched` names an agent, not a machine, so the golden is derived the same way a
-    # dispatch derives it — otherwise this column would report an agent where the fleet
-    # views report a snapshot name.
+    # Derived the same way a dispatch derives it, rather than by reading a name off a config
+    # value — otherwise this column would say what the repo was configured with where the
+    # fleet views say what would actually boot.
     boxd = runner.client()
     try:
-        sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
+        sources = {r["repo"]: await runner.source_for(boxd, r["repo"]) for r in watched}
     except Exception:  # noqa: BLE001 - a boxd outage costs a column, not the page
         sources = {}
     finally:
         await boxd.close()
     out = []
-    for repo, _ in settings.watched:
+    for row in watched:
+        repo = row["repo"]
         golden = sources.get(repo, "")
         s = stats.get(repo, {})
-        agent = settings.agent_for(repo)
         out.append(
             {
                 "repo": repo,
-                "agent": agent,
+                "added_at": row.get("added_at"),
+                # What provisioning a warm golden for this repo did, which is not the same
+                # question as what its runs boot: a repo whose provisioning failed still
+                # dispatches onto the base, so this is a report and never a gate.
+                "provision_status": row.get("provision_status") or "none",
                 "golden": golden,
                 # Whether the snapshot that boots is this repo's own warm tier rather than
-                # the bare agent image. Decided here, where the naming contract lives.
-                "warm": bool(golden) and golden == agents.golden_name(agent, repo),
+                # the base image. Decided here, where the naming contract lives.
+                "warm": bool(golden) and golden == agents.golden_name(repo),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
@@ -365,23 +459,23 @@ async def api_projects():
     return out
 
 
-# --------------------------------------------------------------------------- agents / fleet
+# --------------------------------------------------------------------------- goldens / fleet
 
 # Two different questions, and they stopped having the same answer when goldens became
-# snapshots. What the factory *can run* is a list of snapshots (`/api/agents`); what is
+# snapshots. What the factory *can boot* is a list of snapshots (`/api/goldens`); what is
 # *running* is a list of machines (`/api/machines`). The old endpoint answered the second and
-# was named for the first, which is why nothing in the fleet view could tell you an agent
+# was named for the first, which is why nothing in the fleet view could tell you a golden
 # existed until a run had already failed to find it.
 
 
-@app.get("/api/agents")
-async def api_agents():
+@app.get("/api/goldens")
+async def api_goldens():
     """The golden snapshots this deployment can dispatch onto, as the refresh loop last saw them.
 
     Served from the table rather than from boxd, so this stays cheap enough to poll and says
     the same thing a dispatch would: `goldens.refresh()` is the one place that reads the fleet.
     """
-    return agents.api_rows(await db.agents(), settings.agent_default)
+    return agents.api_rows(await db.snapshots())
 
 
 @app.get("/api/machines")

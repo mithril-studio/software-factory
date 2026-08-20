@@ -8,7 +8,7 @@ const NAV = [
   { to: "/", label: "Runs", icon: Activity, end: true },
   { to: "/plan", label: "Plan", icon: ListChecks },
   { to: "/projects", label: "Projects", icon: FolderGit2 },
-  { to: "/agents", label: "Agents", icon: Bot },
+  { to: "/goldens", label: "Goldens", icon: Bot },
   { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
 ]
 
@@ -68,7 +68,7 @@ export function Layout() {
           </button>
         </div>
       </aside>
-      <main className="ml-60 flex-1 px-8 py-9 lg:px-10">
+      <main className="ml-60 min-w-0 flex-1 px-8 py-9 lg:px-10">
         <Outlet />
       </main>
     </div>

@@ -14,9 +14,13 @@ Run it directly, no framework needed:
 
     .venv/bin/python -m control.preflight_test
 """
+import asyncio
 import sys
 
-from control.preflight import Check, agent_check, profile_checks, report
+import httpx
+
+import control.github as gh
+from control.preflight import Check, golden_check, profile_checks, push_check, report
 from control.probe import parse
 
 fails: list[str] = []
@@ -101,35 +105,120 @@ check("setup warning: a whitespace-only profile is no profile",
 check("setup warning: a missing profile is not also blamed for the setup line",
       any("setup" in c.name for c in profile_checks(None)), False)
 
-# ---------- no agent  (AC3)
+# ---------- is there a golden to boot?
 # The one machine-side question left, and the cheapest of the six the VM probe used to ask.
-# Blocking, unlike the profile warnings: a repo whose agent resolves to no snapshot does not
-# build worse, it cannot be dispatched at all — the fork has nothing to fork from.
+#
+# It got narrower when the agent left the snapshot name. It used to fail for a repo whose
+# *agent* had no image — a state a deployment could reach by typo. Now a repo with no golden
+# of its own boots the base and installs for itself, so the only blocking answer is a fleet
+# with no base image at all: not this repo's problem to fix, and one that stops every other
+# repo too. Reporting an unprovisioned repo as not-ready would make connecting one wait on
+# provisioning, which is exactly what the two-tier fallback exists to avoid.
 REPO = "acme/api"
-WARM = "golden-claude--acme-api"
+BASE = "golden-copy"
+WARM = "golden-acme-api"
 
-check("no agent: a fleet with the agent's image is ready",
-      agent_check(REPO, "claude", ["golden-claude"]).ok, True)
-check("no agent: a warm snapshot answers for it too",
-      agent_check(REPO, "claude", [WARM]).ok, True)
-check("no agent: the detail names the snapshot that would boot",
-      agent_check(REPO, "claude", [WARM]).detail, f"claude boots {WARM}")
+warm = golden_check(REPO, [BASE, WARM])
+check("golden: a repo with its own warm snapshot is ready", warm.ok, True)
+check("golden: and the detail names the snapshot that would boot", BASE in warm.detail, False)
+check("golden: which is the warm one", WARM in warm.detail, True)
 
-missing = agent_check(REPO, "pi", ["golden-claude", WARM])
-check("no agent: an agent no snapshot provides is not ready", missing.ok, False)
-check("no agent: and it blocks, rather than warning", missing.fatal, True)
-check("no agent: so the repo is reported not ready", report(REPO, [missing]), False)
-check("no agent: the detail names the snapshot somebody has to build",
-      "golden-pi" in missing.detail, True)
-check("no agent: and what the fleet does hold, so the fix is obvious",
+cold = golden_check(REPO, [BASE])
+check("golden: a repo with no golden of its own is ready anyway", cold.ok, True)
+check("golden: and it does not block", cold.fatal, True)
+check("golden: so the repo is reported ready", report(REPO, [cold]), True)
+check("golden: the detail says which tier answered", BASE in cold.detail, True)
+check("golden: and says provisioning is a speed-up rather than a repair",
+      "not a blocker" in cold.detail, True)
+
+check("golden: another repo's warm golden is never borrowed, the base answers instead",
+      golden_check("acme/other", [BASE, WARM]).detail.startswith(BASE), True)
+
+# The one thing that really stops a dispatch. Asked of a repo with no warm golden of its own,
+# because a repo that has one is the case where the base is not needed.
+missing = golden_check("acme/other", [WARM])
+check("golden: a fleet with no base image is not ready", missing.ok, False)
+check("golden: and it blocks, rather than warning", missing.fatal, True)
+check("golden: so the repo is reported not ready", report("acme/other", [missing]), False)
+check("golden: the detail names the snapshot somebody has to build",
+      BASE in missing.detail, True)
+check("golden: and what the fleet does hold, so the fix is obvious",
       WARM in missing.detail, True)
 
-empty = agent_check(REPO, "claude", [])
-check("no agent: an empty fleet is not ready either", empty.ok, False)
-check("no agent: and says so rather than listing nothing",
+empty = golden_check(REPO, [])
+check("golden: an empty fleet is not ready either", empty.ok, False)
+check("golden: and says so rather than listing nothing",
       "no golden snapshots at all" in empty.detail, True)
-check("no agent: another repo's warm golden is never borrowed",
-      agent_check("acme/other", "claude", [WARM]).ok, False)
+
+
+# ---------- can this token push?  (the check that used to answer without asking)
+#
+# `preflight` read `push` out of `GET /repos`'s permissions block, which describes the
+# *account* and not the token. On a repo its owner's token was scoped read-only it printed
+# `ok  token can push` — the same line, byte for byte, before and after the credential was
+# replaced with one that could. It measured nothing. What replaces it asks git the question
+# git will be asked at push time.
+
+
+class _Advert:
+    """The smart-HTTP advertisement `git push` opens with."""
+
+    def __init__(self, status):
+        self.status_code = status
+
+
+def can_push(status, token="ghp_stub"):
+    """Run `github.can_push` against a stubbed git host. `status` may be an exception."""
+    seen: list = []
+
+    async def get(self, url, **kw):
+        seen.append((url, (kw.get("params") or {}).get("service")))
+        if isinstance(status, Exception):
+            raise status
+        return _Advert(status)
+
+    original_get, httpx.AsyncClient.get = httpx.AsyncClient.get, get
+    original_settings, gh.settings = gh.settings, type("S", (), {"github_token": token})()
+    try:
+        return asyncio.run(gh.can_push("o/r")), seen
+    finally:
+        httpx.AsyncClient.get = original_get
+        gh.settings = original_settings
+
+
+(ok, detail), seen = can_push(200)
+check("push: 200 from git-receive-pack means yes", ok, True)
+check("push: it asks the git host, not the API host", seen[0][0], "https://github.com/o/r.git/info/refs")
+check("push: and asks about receive-pack, the service a push uses", seen[0][1], "git-receive-pack")
+
+(ok, detail), _ = can_push(403)
+check("push: 403 means no", ok, False)
+check("push: and says which way round it failed", "read" in detail and "not write" in detail, True)
+
+(ok, _), _ = can_push(401)
+check("push: 401 means no as well", ok, False)
+
+# Anything else is neither a yes nor a no, and must not be read as a yes. The bug being
+# fixed here is a check that reported ok without having established anything.
+(ok, detail), _ = can_push(500)
+check("push: an unexpected status is not a yes", ok, False)
+check("push: and says so plainly", "neither yes nor no" in detail, True)
+
+(ok, detail), calls = can_push(httpx.ConnectError("boom"))
+check("push: an unreachable host is a finding, not a crash", ok, False)
+check("push: which names the network as the cause", "could not reach" in detail, True)
+
+(ok, detail), calls = can_push(200, token="")
+check("push: no token configured is a no", ok, False)
+check("push: asked without spending a request", calls, [])
+
+# ---------- and how that answer reads as a check
+check("push check: a yes is not blocking", push_check(True, "fine").ok, True)
+check("push check: a no is blocking, not a warning", push_check(False, "nope").fatal, True)
+check("push check: a no keeps the detail it was given", push_check(False, "nope").detail, "nope")
+check("push check: a repo whose token cannot push is not ready",
+      report("r", [push_check(False, "nope")]), False)
+
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

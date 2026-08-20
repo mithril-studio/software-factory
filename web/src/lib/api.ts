@@ -46,11 +46,14 @@ export type PlanIssue = {
 
 export type Project = {
   repo: string
-  /** The agent that takes this repo's issues. */
-  agent: string
-  /** The snapshot that agent actually boots for this repo. */
+  /** When it was connected. */
+  added_at: string | null
+  /** What provisioning a warm golden for this repo did — `none`, `running`, `ready`,
+   *  `failed`. A report, never a gate: a repo dispatches onto `golden-copy` either way. */
+  provision_status: string
+  /** The snapshot this repo's runs actually boot. */
   golden: string
-  /** True when that snapshot is this repo's own warm tier rather than the bare agent image.
+  /** True when that snapshot is this repo's own warm tier rather than the `golden-copy` base.
    *  A speed-up only — every run installs the repo for itself either way. */
   warm: boolean
   runs: number
@@ -60,14 +63,48 @@ export type Project = {
   last_run: string | null
 }
 
+/** One preflight question and its answer.
+ *
+ *  `ok: false` with `fatal: false` is a warning, not a failure — a repo with no `.factory.md`
+ *  still builds, it just builds with less context. Only a fatal one blocks connecting. */
+export type Check = {
+  name: string
+  ok: boolean
+  detail: string
+  fatal: boolean
+}
+
+export type Preflight = {
+  repo: string
+  ready: boolean
+  checks: Check[]
+}
+
+/** What `POST /api/repos` answers with.
+ *
+ *  `provision_run` is the golden-warming run it started, if it could start one.
+ *  `provision_skipped` is why it could not — almost always "this repo names no setup command".
+ *  Neither is a failure: the repo is watched and dispatchable either way, on `golden-copy`. */
+export type Connected = {
+  repo: string
+  checks: Check[]
+  provision_run: string | null
+  provision_skipped: string | null
+}
+
 /** A golden snapshot the factory can dispatch onto, as the refresh loop last saw it.
  *
  *  Not a machine. Goldens stopped being machines when they became snapshots, which is why
  *  this and `Machine` are two types served from two endpoints instead of one list that could
  *  answer neither question fully. */
-export type Agent = {
-  agent: string
+export type Golden = {
   snapshot: string
+  /** The repo slug the name carries, null for the base image every run falls back to. */
+  repo: string | null
+  base: boolean
+  /** Which agent the image launches, from the manifest it announced into its last run — not
+   *  from its name, which says nothing about the agent any more. Null until a run has read one. */
+  agent: string | null
   version: string | null
   /** The telemetry adapter this golden's stream is read with, from its manifest. */
   events: string | null
@@ -78,8 +115,6 @@ export type Agent = {
   /** When a run last finished on it having produced usage — the only proof its credentials
    *  still work. Null means unproven, not broken. */
   verified_at: string | null
-  /** True when this is the agent a repo that names none of its own gets. */
-  default: boolean
 }
 
 /** A boxd machine in the fleet. */
@@ -88,25 +123,20 @@ export type Machine = {
   status: string | null
   /** From the VM name prefixes the reaper sweeps on. `other` is anything the factory did not
    *  create — including a golden still held as a machine, which is now a rollback artefact. */
-  role: "run" | "review" | "other"
+  role: "run" | "review" | "provision" | "other"
   /** A run VM with no run behind it any more. What Reconcile reaps. */
   orphan: boolean
 }
 
 export type Config = {
   repos: string[]
-  /** Each watched repo with the agent that takes its issues. */
-  watched: { repo: string; agent: string }[]
-  /** Every agent the snapshot fleet can name. */
-  agents: string[]
-  agent_default: string
   max_concurrent: number
   max_attempts: number
   poll_enabled: boolean
   poll_interval: number
   /** A setting nobody filled in. Blocks starting a run. */
   missing: string[]
-  /** A complete configuration with nothing to run on — an agent with no snapshot yet. */
+  /** A complete configuration with nothing to run on — no `golden-copy` to fall back to. */
   problems: string[]
 }
 
@@ -169,9 +199,17 @@ function onUnauthorized() {
   }
 }
 
+/** The server's explanation of a refusal.
+ *
+ *  `POST /api/repos` answers a blocking preflight with `{detail: {message, checks}}` rather
+ *  than a sentence, because the caller wants to render which check failed. Reading `.detail`
+ *  blindly would put `[object Object]` in front of the user at exactly that moment. */
 async function detail(resp: Response): Promise<string> {
   try {
-    return (await resp.json()).detail ?? resp.statusText
+    const body = (await resp.json()).detail
+    if (typeof body === "string") return body
+    if (body && typeof body === "object" && typeof body.message === "string") return body.message
+    return resp.statusText
   } catch {
     return resp.statusText
   }
@@ -197,6 +235,42 @@ export async function post<T>(url: string, body?: unknown): Promise<T> {
     throw new Error(await detail(resp))
   }
   return resp.json()
+}
+
+export async function del<T>(url: string): Promise<T> {
+  const resp = await fetch(url, { method: "DELETE" })
+  if (!resp.ok) {
+    if (resp.status === 401) onUnauthorized()
+    throw new Error(await detail(resp))
+  }
+  return resp.json()
+}
+
+// ---- repos ----
+
+/** Ask whether a repo could be dispatched to. Read-only; safe to call on anything. */
+export function preflight(repo: string): Promise<Preflight> {
+  return get<Preflight>(`/api/preflight?repo=${encodeURIComponent(repo)}`)
+}
+
+/** Watch a repo from now on. Throws with the failing check when preflight blocks it. */
+export function connectRepo(repo: string): Promise<Connected> {
+  return post<Connected>("/api/repos", { repo })
+}
+
+export function disconnectRepo(repo: string): Promise<{ removed: boolean }> {
+  return del<{ removed: boolean }>(`/api/repos/${repo}`)
+}
+
+/** Warm this repo's golden now. Also how a stale one is refreshed — provisioning always
+ *  rebuilds from the base rather than updating a snapshot in place. */
+export function warmGolden(repo: string): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>(`/api/repos/${repo}/golden`)
+}
+
+/** Drop this repo's golden. Its runs fall back to the base and install for themselves. */
+export function dropGolden(repo: string): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/api/repos/${repo}/golden`)
 }
 
 // ---- auth ----
