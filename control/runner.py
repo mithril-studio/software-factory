@@ -242,6 +242,58 @@ async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> s
     return source
 
 
+# --------------------------------------------------------------------------- memory receipt
+
+# The line an agent prints right after priming from `.mem/`, so retrieval is observable from
+# the run log alone — no scraping a transcript, no coupling this to any one runtime's event
+# shapes. Kept to counts, ids, and domain names; a memory *body* must never be echoed back
+# into a log.
+MEMORY_RECEIPT_MARKER = "FACTORY_MEMORY"
+
+# What a repo with no `.mem/` reports — an explicit empty receipt rather than silence, so
+# "nothing to prime" and "the agent never got to step 1" don't look the same downstream.
+EMPTY_MEMORY_RECEIPT = {"indexed": 0, "opened": [], "domains": []}
+
+
+def parse_memory_receipt(text: str) -> dict | None:
+    """Pull the `FACTORY_MEMORY` priming receipt out of a run's output.
+
+    Pure and read-only: scans `text` line by line for one that starts with the marker,
+    parses the JSON after it, and returns the first line that validates as
+    `{"indexed": int, "opened": [str, ...], "domains": [str, ...]}`. Everything else — a
+    line that only looks like the marker, JSON that doesn't parse, a shape that's missing or
+    mistypes a field, ordinary agent chatter with no receipt at all — yields `None`. Never
+    raises: a malformed receipt must cost nothing, not crash the caller that's asking whether
+    one was printed.
+    """
+    if not text:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith(MEMORY_RECEIPT_MARKER):
+            continue
+        payload = line[len(MEMORY_RECEIPT_MARKER):]
+        if not payload or not payload[0].isspace():
+            continue
+        try:
+            obj = json.loads(payload.strip())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        indexed = obj.get("indexed")
+        opened = obj.get("opened")
+        domains = obj.get("domains")
+        if not isinstance(indexed, int) or isinstance(indexed, bool) or indexed < 0:
+            continue
+        if not isinstance(opened, list) or not all(isinstance(x, str) for x in opened):
+            continue
+        if not isinstance(domains, list) or not all(isinstance(x, str) for x in domains):
+            continue
+        return {"indexed": indexed, "opened": opened, "domains": domains}
+    return None
+
+
 # --------------------------------------------------------------------------- prompt
 
 
@@ -257,7 +309,14 @@ Issue #{number}: {title}
 
 How to work:
 1. Load the `memory` skill first and prime yourself from `.mem/` if it exists. What past
-   runs learned about this repo is the most valuable context you have.
+   runs learned about this repo is the most valuable context you have. Immediately after
+   priming — even when `.mem/` does not exist — print one machine-readable receipt line, so
+   what you actually loaded is observable without anyone scraping this transcript:
+   `{memory_receipt_marker} {{"indexed": <n>, "opened": ["mem_...", ...], "domains": ["..."]}}`
+   `indexed` is how many records `.mem/index.jsonl` listed, `opened` is exactly the record
+   ids whose full body you read, and `domains` is the domains they came from — never the
+   record bodies themselves. When `.mem/` does not exist, print the explicit empty receipt
+   instead of staying silent: `{memory_receipt_marker} {empty_memory_receipt}`.
 2. Install this project's dependencies, before you touch any code. Run the setup command
    named under "This project" below, in the foreground, with an explicit timeout — e.g.
    `timeout 900 <the setup command>`. Run it **once**: if it worked, a second install spends
@@ -441,6 +500,8 @@ def build_prompt(
         branch=branch,
         base=base,
         project_notes=notes,
+        memory_receipt_marker=MEMORY_RECEIPT_MARKER,
+        empty_memory_receipt=json.dumps(EMPTY_MEMORY_RECEIPT),
     )
     if attempt > 1:
         prompt += RETRY_TEMPLATE.format(
