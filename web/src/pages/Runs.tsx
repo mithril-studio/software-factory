@@ -174,7 +174,11 @@ export function Runs() {
                     <div className="flex items-center gap-1.5">
                       <Link to={`/runs/${r.id}`} className="hover:underline">
                         <span className="font-mono">{r.repo}</span>
-                        <span className="text-muted-foreground"> #{r.issue_number}</span>
+                        {/* A provisioning run has no issue behind it — it warms this repo's
+                            golden — so `#0` would be a reference to nothing. */}
+                        {r.issue_number > 0 && (
+                          <span className="text-muted-foreground"> #{r.issue_number}</span>
+                        )}
                       </Link>
                       <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
                         {r.kind}
