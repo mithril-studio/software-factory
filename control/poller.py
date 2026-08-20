@@ -30,13 +30,20 @@ async def _poll_repo(repo: str) -> None:
     # #2 does not start until #1 has reached a terminal state (its retries included).
     if await db.has_active_run(repo):
         return
-    # A permanently-failed issue (out of retries, labelled agent:failed) blocks the ones
-    # after it in a sequential project. Stop dispatching this repo until a human clears it.
+    # An issue that stopped for a human blocks the ones after it in a sequential project.
+    # Both states mean that: agent:failed is out of retries, agent:blocked is a review that
+    # would not pass. Either way the work is not on the base branch, so the next issue would
+    # branch from a base that is missing it — #48 did exactly that, building on a main without
+    # #47's memory store, and had to reconstruct it by hand to have anything to validate.
+    # Stop dispatching this repo until a human clears whichever it is.
     if settings.halt_on_failure:
-        failed = await github.list_issues_with_label(repo, github.LABEL_FAILED)
-        if failed:
-            log.info("%s halted: issue #%s failed, needs a human", repo, failed[0]["number"])
-            return
+        for label in (github.LABEL_FAILED, github.LABEL_BLOCKED):
+            stuck = await github.list_issues_with_label(repo, label)
+            if stuck:
+                log.info(
+                    "%s halted: issue #%s is %s, needs a human", repo, stuck[0]["number"], label
+                )
+                return
     issues = await github.list_issues_with_label(repo, github.LABEL_QUEUED)
     if not issues:
         return

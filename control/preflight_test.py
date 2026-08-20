@@ -14,9 +14,13 @@ Run it directly, no framework needed:
 
     .venv/bin/python -m control.preflight_test
 """
+import asyncio
 import sys
 
-from control.preflight import Check, agent_check, profile_checks, report
+import httpx
+
+import control.github as gh
+from control.preflight import Check, agent_check, profile_checks, push_check, report
 from control.probe import parse
 
 fails: list[str] = []
@@ -130,6 +134,76 @@ check("no agent: and says so rather than listing nothing",
       "no golden snapshots at all" in empty.detail, True)
 check("no agent: another repo's warm golden is never borrowed",
       agent_check("acme/other", "claude", [WARM]).ok, False)
+
+
+# ---------- can this token push?  (the check that used to answer without asking)
+#
+# `preflight` read `push` out of `GET /repos`'s permissions block, which describes the
+# *account* and not the token. On a repo its owner's token was scoped read-only it printed
+# `ok  token can push` — the same line, byte for byte, before and after the credential was
+# replaced with one that could. It measured nothing. What replaces it asks git the question
+# git will be asked at push time.
+
+
+class _Advert:
+    """The smart-HTTP advertisement `git push` opens with."""
+
+    def __init__(self, status):
+        self.status_code = status
+
+
+def can_push(status, token="ghp_stub"):
+    """Run `github.can_push` against a stubbed git host. `status` may be an exception."""
+    seen: list = []
+
+    async def get(self, url, **kw):
+        seen.append((url, (kw.get("params") or {}).get("service")))
+        if isinstance(status, Exception):
+            raise status
+        return _Advert(status)
+
+    original_get, httpx.AsyncClient.get = httpx.AsyncClient.get, get
+    original_settings, gh.settings = gh.settings, type("S", (), {"github_token": token})()
+    try:
+        return asyncio.run(gh.can_push("o/r")), seen
+    finally:
+        httpx.AsyncClient.get = original_get
+        gh.settings = original_settings
+
+
+(ok, detail), seen = can_push(200)
+check("push: 200 from git-receive-pack means yes", ok, True)
+check("push: it asks the git host, not the API host", seen[0][0], "https://github.com/o/r.git/info/refs")
+check("push: and asks about receive-pack, the service a push uses", seen[0][1], "git-receive-pack")
+
+(ok, detail), _ = can_push(403)
+check("push: 403 means no", ok, False)
+check("push: and says which way round it failed", "read" in detail and "not write" in detail, True)
+
+(ok, _), _ = can_push(401)
+check("push: 401 means no as well", ok, False)
+
+# Anything else is neither a yes nor a no, and must not be read as a yes. The bug being
+# fixed here is a check that reported ok without having established anything.
+(ok, detail), _ = can_push(500)
+check("push: an unexpected status is not a yes", ok, False)
+check("push: and says so plainly", "neither yes nor no" in detail, True)
+
+(ok, detail), calls = can_push(httpx.ConnectError("boom"))
+check("push: an unreachable host is a finding, not a crash", ok, False)
+check("push: which names the network as the cause", "could not reach" in detail, True)
+
+(ok, detail), calls = can_push(200, token="")
+check("push: no token configured is a no", ok, False)
+check("push: asked without spending a request", calls, [])
+
+# ---------- and how that answer reads as a check
+check("push check: a yes is not blocking", push_check(True, "fine").ok, True)
+check("push check: a no is blocking, not a warning", push_check(False, "nope").fatal, True)
+check("push check: a no keeps the detail it was given", push_check(False, "nope").detail, "nope")
+check("push check: a repo whose token cannot push is not ready",
+      report("r", [push_check(False, "nope")]), False)
+
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
