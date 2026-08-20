@@ -112,9 +112,11 @@ MIGRATIONS = (
     "ALTER TABLE runs ADD COLUMN tokens_in INTEGER",
     "ALTER TABLE runs ADD COLUMN tokens_out INTEGER",
     "ALTER TABLE runs ADD COLUMN cost_usd REAL",
-    # 'build' (an agent resolving an issue) or 'review' (an agent checking the resulting PR
-    # against the issue's acceptance criteria). Both are runs on a forked VM, which is why
-    # they share this table rather than getting one of their own.
+    # 'build' (an agent resolving an issue), 'review' (an agent checking the resulting PR
+    # against the issue's acceptance criteria), or 'provision' (no agent at all — clone and
+    # install a repo into its own golden snapshot). All three are runs on a VM restored from a
+    # golden, which is why they share this table rather than getting one each: they want the
+    # same streamed log, the same cancel, the same reaper.
     "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'build'",
     # Review runs only: the verdict JSON the reviewing agent produced.
     "ALTER TABLE runs ADD COLUMN verdict TEXT",

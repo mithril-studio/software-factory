@@ -51,9 +51,40 @@ class Check:
 
 
 # A `## Setup` heading in the profile, at any level. What follows it is the command the
-# prompt now tells the agent to run before it touches any code; nothing here reads that
-# command, only whether the repo bothered to name one.
+# prompt tells the agent to run before it touches any code; `profile_checks` reads only
+# whether the repo bothered to name one, and `setup_command` reads the command itself.
 SETUP_SECTION = re.compile(r"^#{1,6}\s*set[ -]?up\b", re.I | re.M)
+
+# The last backtick-quoted span on a line. Greedy `.*` is what makes it the last one, and it
+# has to be, because `scripts/refresh-golden.sh` extracts the command with
+# `sed -n 's/.*`\([^`]*\)`.*/\1/p'`, which behaves the same way. The two are pinned against
+# each other in `control/golden_scripts_test.py`; a disagreement here means the control plane
+# and the by-hand script install a repo differently, which is exactly the sort of divergence
+# nothing would report.
+_BACKTICKED = re.compile(r"^.*`([^`]*)`")
+
+
+def setup_command(profile: str | None) -> str:
+    """The install command a repo names in its `.factory.md`, or `""` if it names none.
+
+    Never guessed. A control plane with opinions about how projects install is how one
+    project's install command became every project's, and the caller is expected to refuse
+    rather than invent one — `scripts/refresh-golden.sh` records why at length.
+
+    Reads the first backticked command under the `## Setup` heading and stops at the next
+    heading, which is the same walk the shell script does in `awk`.
+    """
+    started = False
+    for line in (profile or "").splitlines():
+        if not started:
+            started = bool(SETUP_SECTION.match(line))
+            continue
+        if line.startswith("#"):
+            break
+        found = _BACKTICKED.match(line)
+        if found:
+            return found.group(1).strip()
+    return ""
 
 
 def profile_checks(profile: str | None) -> list[Check]:

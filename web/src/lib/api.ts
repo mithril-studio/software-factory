@@ -94,7 +94,7 @@ export type Machine = {
   status: string | null
   /** From the VM name prefixes the reaper sweeps on. `other` is anything the factory did not
    *  create — including a golden still held as a machine, which is now a rollback artefact. */
-  role: "run" | "review" | "other"
+  role: "run" | "review" | "provision" | "other"
   /** A run VM with no run behind it any more. What Reconcile reaps. */
   orphan: boolean
 }

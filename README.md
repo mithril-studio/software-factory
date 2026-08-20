@@ -172,7 +172,25 @@ An agent the script has never seen needs `--cli-install`, `--launch` and `--mani
 `--name` to keep it off `golden-copy`. It refuses rather than guessing: a wrong launch line
 produces a golden that looks built and dies at the first dispatch.
 
-### Refreshing a warm one: `scripts/refresh-golden.sh <owner/repo>`
+### Warming one from the control plane: `POST /api/repos/<owner>/<name>/golden`
+
+Connecting a repo starts this automatically when the repo names a setup command. It is a run
+like any other — `kind: provision`, a streamed log you can tail, a cancel button, a VM the
+reconciler recognises — and it restores `golden-copy`, clones, installs, captures
+`golden-<slug>`, and destroys the machine.
+
+Always from the base, even when the repo already has a golden. Updating one in place is
+faster and is what the shell script below does, but it also carries forward whatever the last
+capture got wrong: building from `golden-copy` every time makes re-provisioning the *repair*
+for a bad snapshot rather than another way to inherit it. `DELETE` the same path to drop a
+repo's golden and send its runs back to the base.
+
+The install command is the one the repo names in its own `## Setup` section, never a guess —
+a repo that names none is refused before a VM is created. `control/preflight.py`'s reader and
+`refresh-golden.sh`'s `awk`/`sed` pipeline are pinned against each other in
+`control/golden_scripts_test.py`, so the two cannot install the same repo differently.
+
+### Refreshing a warm one by hand: `scripts/refresh-golden.sh <owner/repo>`
 
 ```bash
 scripts/refresh-golden.sh mithril-studio/software-factory
