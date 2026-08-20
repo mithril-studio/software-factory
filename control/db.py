@@ -66,6 +66,27 @@ CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 -- `verified_at` is when a run last finished on it having produced usage — the only evidence
 -- that its credentials still work, and unlike a probe it is free, because the runs were
 -- happening anyway.
+-- The repos this deployment watches. Connecting one used to mean editing FACTORY_REPOS in
+-- `.env` on the box and restarting systemd, which is not a thing a web interface can do — so
+-- the register moved into the database and `FACTORY_REPOS` became the seed for it.
+--
+-- `golden` and `provision_status` are about the *warm tier* only, and nothing gates on them.
+-- A repo with no golden of its own dispatches onto `golden-copy` and installs for itself, so
+-- provisioning may still be running, may have failed, or may never have been started, and the
+-- repo works either way. These columns say what happened, not whether it may run.
+--
+-- `agent` is nullable and always NULL today. Kept because a second agent needs somewhere to
+-- record which one a repo uses, and adding the column later is a migration for something that
+-- costs nothing now — but nothing reads it, and nothing should until a second base image
+-- exists to choose between.
+CREATE TABLE IF NOT EXISTS repos (
+    repo             TEXT PRIMARY KEY,
+    added_at         TEXT NOT NULL,
+    golden           TEXT,
+    provision_status TEXT NOT NULL DEFAULT 'none',
+    agent            TEXT
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     name          TEXT PRIMARY KEY,
     repo          TEXT,
@@ -242,6 +263,59 @@ async def snapshot_evidence() -> dict[str, dict]:
         if "verified_at" not in seen and ((r["tokens_out"] or 0) > 0 or r["cost_usd"] is not None):
             seen["verified_at"] = r["finished_at"]
     return out
+
+
+# --------------------------------------------------------------------------- repos
+
+
+async def add_repo(repo: str, agent: str | None = None) -> None:
+    """Register a repo, or leave an already-registered one exactly as it is.
+
+    `INSERT OR IGNORE` rather than `OR REPLACE`: re-adding a repo must not reset the golden it
+    has already been provisioned, and the seed from `FACTORY_REPOS` runs on every boot.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "INSERT OR IGNORE INTO repos (repo, added_at, agent) VALUES (?, ?, ?)",
+            (repo, utcnow(), agent),
+        )
+        await conn.commit()
+
+
+async def remove_repo(repo: str) -> bool:
+    """Stop watching `repo`. Returns whether there was anything to remove.
+
+    The runs stay. They are the ledger of what this deployment spent and shipped, and a repo
+    being disconnected does not make its history untrue — `stats_by_repo` simply stops being
+    asked about it.
+    """
+    async with connect() as conn:
+        cur = await conn.execute("DELETE FROM repos WHERE repo = ?", (repo,))
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+async def list_repos() -> list[dict]:
+    """Every watched repo, oldest first, so the poller works them in the order they arrived."""
+    async with connect() as conn:
+        async with conn.execute("SELECT * FROM repos ORDER BY added_at, repo") as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def set_repo_golden(repo: str, golden: str | None, status: str) -> None:
+    """Record what provisioning a golden for `repo` did.
+
+    Separate from `add_repo` because it happens much later and from a different task: a repo is
+    watched the moment it is connected, and its golden arrives whenever the provisioning run
+    finishes — or does not arrive at all, which is a slower repo and not a broken one.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE repos SET golden = ?, provision_status = ? WHERE repo = ?",
+            (golden, status, repo),
+        )
+        await conn.commit()
 
 
 async def has_active_run(repo: str) -> bool:
