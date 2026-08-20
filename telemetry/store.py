@@ -211,6 +211,42 @@ async def memory_reads_for_run(run_id: str) -> list[dict]:
     )
 
 
+async def memory_metrics_by_repo() -> list[dict]:
+    """Retrieval rolled up per repository: how many runs used memory, how many distinct
+    records, and what those runs cost on average.
+
+    `repo` comes from `runs`, the same table `unit_economics` already joins — a run's
+    repository has exactly one source of truth in this system, so this reads it rather
+    than inventing a second place memory rows could disagree with it. This proves
+    retrieval happened alongside a run's outcome; it says nothing about whether a
+    retrieved record was actually useful.
+    """
+    return await _rows(
+        f"""
+        WITH run_cost AS (
+            SELECT c.run_id, SUM({COST_SQL}) AS cost
+            {PRICE_JOIN}
+            GROUP BY c.run_id
+        ),
+        repo_runs AS (
+            SELECT DISTINCT mr.run_id, r.repo
+            FROM memory_reads mr
+            JOIN runs r ON r.id = mr.run_id
+        )
+        SELECT rr.repo,
+               COUNT(DISTINCT rr.run_id) AS runs_with_memory,
+               (SELECT COUNT(DISTINCT mr2.memory_id)
+                  FROM memory_reads mr2
+                  JOIN runs r2 ON r2.id = mr2.run_id
+                 WHERE r2.repo = rr.repo)  AS distinct_records,
+               COALESCE(AVG(rc.cost), 0)   AS avg_derived_cost_usd
+        FROM repo_runs rr
+        LEFT JOIN run_cost rc ON rc.run_id = rr.run_id
+        GROUP BY rr.repo ORDER BY rr.repo
+        """
+    )
+
+
 # --------------------------------------------------------------------------- reads
 
 # Cost is derived here and nowhere else: every token column joined to the price that was
@@ -283,7 +319,13 @@ async def usage_for_run(run_id: str) -> dict:
         """,
         (run_id,),
     )
-    return {"totals": totals[0] if totals else {}, "by_model": by_model, "tools": tools}
+    memory = await memory_reads_for_run(run_id)
+    return {
+        "totals": totals[0] if totals else {},
+        "by_model": by_model,
+        "tools": tools,
+        "memory": memory,
+    }
 
 
 async def spend_by_day(days: int = 30) -> list[dict]:

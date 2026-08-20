@@ -18,6 +18,7 @@ from pathlib import Path
 import yaml
 from boxd import AsyncBoxd, _mappers as _boxd_mappers
 
+from telemetry import store as telemetry_store
 from telemetry.recorder import Recorder
 
 from . import agents, db, github
@@ -292,6 +293,63 @@ def parse_memory_receipt(text: str) -> dict | None:
             continue
         return {"indexed": indexed, "opened": opened, "domains": domains}
     return None
+
+
+def _receipt_candidates(event: dict) -> list[str]:
+    """Text blocks inside one stream event that might carry a `FACTORY_MEMORY` receipt.
+
+    The agent can satisfy the prompt's "print one line" instruction either as its own
+    turn text or by running a shell command that echoes it — the first shows up in an
+    assistant `text` block, the second in a `tool_result`'s content. Both come back with
+    real newlines once the JSON envelope is decoded, which a raw scan of the wire line
+    (still carrying `\\n` as two characters) cannot find.
+    """
+    texts: list[str] = []
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return texts
+    for block in message.get("content", []) or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            texts.append(str(block.get("text") or ""))
+        elif block.get("type") == "tool_result":
+            content = block.get("content")
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        texts.append(str(item.get("text") or ""))
+    return texts
+
+
+async def _persist_memory_receipt(run_id: str, receipt: dict, log: RunLog) -> None:
+    """Turn one parsed `FACTORY_MEMORY` receipt into telemetry rows, one per opened record.
+
+    Best-effort by design (AC4): the receipt is an observability signal riding along on an
+    otherwise-successful run, so a telemetry write that fails here — a locked database, a
+    schema that has not migrated — is logged and swallowed rather than allowed to fail or
+    stop the agent stream that produced it.
+
+    A receipt with nothing `opened` (including the explicit empty receipt) writes nothing:
+    there is no record to attribute a row to.
+    """
+    opened = receipt.get("opened") or []
+    if not opened:
+        return
+    try:
+        ts = db.utcnow()
+        # The receipt names the domains it drew from as a set, not a per-record mapping,
+        # so a row can only be attributed to *a* domain the run touched, not to a
+        # specific one it does not name; the first is close enough to be useful and
+        # honest about what it is not.
+        domain = next(iter(receipt.get("domains") or []), None)
+        await telemetry_store.write_memory_reads(
+            run_id, [(memory_id, domain, ts) for memory_id in opened]
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry must never fail an otherwise good run
+        log.write(f"[factory] memory receipt not recorded: {exc!r}")
 
 
 # --------------------------------------------------------------------------- prompt
@@ -1798,6 +1856,7 @@ async def _stream(
     buffer = ""
     usage: dict = {}
     manifest: dict = {}
+    receipt: dict | None = None
     recorder = Recorder(run_id)
     async with boxd.machines.stream_exec(
         machine_id, command=export_prelude(env) + script, env=env, close_stdin=True
@@ -1857,7 +1916,19 @@ async def _stream(
                     await recorder.feed(event)
                     for formatted in stream_lines(event, line):
                         log.write(formatted)
+                    if receipt is None:
+                        for text in _receipt_candidates(event):
+                            candidate = parse_memory_receipt(text)
+                            if candidate is not None:
+                                receipt = candidate
+                                await _persist_memory_receipt(run_id, receipt, log)
+                                break
                     continue
+                if receipt is None:
+                    candidate = parse_memory_receipt(line)
+                    if candidate is not None:
+                        receipt = candidate
+                        await _persist_memory_receipt(run_id, receipt, log)
                 log.write(line)
         code = stream.exit_code
         if inspect.isawaitable(code):

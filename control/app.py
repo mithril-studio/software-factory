@@ -183,6 +183,7 @@ async def api_telemetry():
         "spend_by_day": await telemetry.spend_by_day(),
         "tools": await telemetry.tool_leaderboard(),
         "economics": await telemetry.unit_economics(),
+        "memory": await telemetry.memory_metrics_by_repo(),
     }
 
 
