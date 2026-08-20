@@ -1,10 +1,15 @@
 """Warm a golden for one repo: restore the base, clone, install, capture, destroy.
 
-A repo's golden is `golden-<repo-slug>` — the base image with that repo already cloned and its
-dependencies installed. It is a **speed-up and nothing else**: a repo without one dispatches
-onto `golden-copy` and installs for itself, which is what lets a repo be connected and
-dispatched in the same minute. So everything here is allowed to be slow, allowed to fail, and
-never allowed to block a run.
+A repo's golden is `golden-<repo-slug>` — the base image with that repo already cloned and, if
+the repo says how, its dependencies installed. It is a **speed-up and nothing else**: a repo
+without one dispatches onto `golden-copy` and installs for itself, which is what lets a repo be
+connected and dispatched in the same minute. So everything here is allowed to be slow, allowed
+to fail, and never allowed to block a run.
+
+The install is the optional half. A repo that names no `## Setup` command still gets a golden
+with the clone in it, because the clone is the part that can be done without guessing and it
+is worth minutes on its own. What is never done is inferring an install command from a lock
+file — see `create`.
 
 `scripts/refresh-golden.sh` does the same four steps by hand and is not what runs here.
 `control/README.md` §2 forbids shelling out to the `boxd` binary from the control plane — the
@@ -22,6 +27,16 @@ for a bad snapshot rather than another way to inherit it.
 
 Re-saving under an existing name is safe: boxd captures a new version and the previous one
 stays restorable, so a run dispatched mid-provision keeps working.
+
+## Waiting for the capture
+
+`snapshots.create` returns once boxd has *queued* the capture, and destroying the machine
+underneath a queued capture aborts it for good — the name is left `pending` with no version,
+which `agents.available()` correctly refuses to dispatch onto and which nothing can ever
+repair. That is how `golden-mithril-studio-software-factory` came to sit in the fleet at
+`v0 / pending / 0B` while the register said the repo was warm. So the reap now happens after
+`agents.wait_until_captured` says a new version has landed, and a capture that never lands is
+deleted rather than left to look like progress.
 
 ## Modelled as a run
 
@@ -61,9 +76,15 @@ echo "FACTORY: checking out $FACTORY_BASE"
 git checkout -B "$FACTORY_BASE" "origin/$FACTORY_BASE" \
   || { echo "FACTORY: checkout failed" >&2; exit 92; }
 """ + runner.NODE_GUARD + r"""
-echo "FACTORY: installing with: $FACTORY_SETUP"
-eval "$FACTORY_SETUP" || { echo "FACTORY: setup command failed" >&2; exit 94; }
-echo "FACTORY: install finished"
+if [ -n "$FACTORY_SETUP" ]; then
+  echo "FACTORY: installing with: $FACTORY_SETUP"
+  eval "$FACTORY_SETUP" || { echo "FACTORY: setup command failed" >&2; exit 94; }
+  echo "FACTORY: install finished"
+else
+  echo "FACTORY: no setup command in .factory.md; capturing the clone without installing."
+  echo "FACTORY: runs on this golden still install for themselves. Add a ## Setup section"
+  echo "FACTORY: naming the command in backticks, then rebuild, to bake the install in too."
+fi
 """
 
 
@@ -118,18 +139,19 @@ async def setup_command(repo: str, base: str) -> str:
 async def create(repo: str) -> str:
     """Register a provisioning run for `repo` and schedule it. Returns the run id.
 
-    Refuses before spending anything when the repo names no setup command — there is nothing
-    to install, and guessing is the failure mode this whole path is built to avoid.
+    A repo that names no setup command still gets a golden — the clone, without the install.
+    That is worth having on its own: every run of a repo with no warm snapshot clones it
+    afresh, and the clone is the part the control plane can always do without guessing. What
+    it is *not* allowed to do is invent an install command; a control plane with opinions
+    about how projects install is how one project's command became every project's. So the
+    install is skipped and the run log says so, rather than being inferred from a lock file.
+
+    A command that spans more than one line is still refused. That is a malformed profile,
+    not an absent one, and running it would be running something nobody wrote.
     """
     repo = repo.strip()
     base = await github.default_branch(repo)
     command = await setup_command(repo, base)
-    if not command:
-        raise ValueError(
-            f"{repo} names no setup command in {runner.PROFILE_PATH}, so there is nothing to "
-            "install into a golden. Add a `## Setup` section naming it in backticks. Until "
-            f"then its runs boot {agents.BASE_SNAPSHOT} and install for themselves."
-        )
     if "\n" in command:
         raise ValueError(f"{repo}'s setup command spans more than one line: {command!r}")
 
@@ -153,23 +175,79 @@ async def create(repo: str) -> str:
     return run_id
 
 
+async def _surviving_golden(repo: str) -> str | None:
+    """`repo`'s golden if one is still restorable, else `None`. Never raises.
+
+    Asked on the failure paths because provisioning always rebuilds from the base, so a
+    failed *re*-provision leaves the previous snapshot untouched and still bootable —
+    `resolve_snapshot` will keep resolving onto it. Blanking the register in that case makes
+    the Projects page report "no golden" for a repo whose runs are booting one, which sends
+    whoever reads it to rebuild a snapshot that is fine.
+    """
+    snapshot = agents.golden_name(repo)
+    if snapshot == agents.BASE_SNAPSHOT:
+        return None
+    boxd = runner.client()
+    try:
+        agents.forget()
+        return snapshot if snapshot in await agents.available(boxd) else None
+    except Exception:  # noqa: BLE001 - a fleet nobody can list answers nothing, not "gone"
+        log.exception("could not check whether %s survived", snapshot)
+        return None
+    finally:
+        await boxd.close()
+
+
 async def _guarded(run_id: str, repo: str, base: str, command: str) -> None:
     run_log = runner.RunLog(Path(settings.log_dir / f"{run_id}.log"))
     try:
-        async with runner.semaphore():
+        # Its own semaphore, not the runs' one: a warm-up is allowed to be slow, and three of
+        # them taking every build slot is a factory that has stopped.
+        async with runner.provision_semaphore():
             await _execute(run_id, repo, base, command, run_log)
     except asyncio.CancelledError:
         run_log.write("[factory] provisioning cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
-        await repos.record_golden(repo, None, NONE)
+        survivor = await _surviving_golden(repo)
+        await repos.record_golden(repo, survivor, READY if survivor else NONE)
         raise
     except Exception as exc:  # noqa: BLE001 - a failed warm-up is a slower repo, not an outage
         reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
         run_log.write(f"[factory] provisioning failed: {exc!r}")
         await db.update_run(run_id, status="failed", error=reason, finished_at=db.utcnow())
-        await repos.record_golden(repo, None, FAILED)
+        survivor = await _surviving_golden(repo)
+        if survivor:
+            run_log.write(f"[factory] {survivor} from the previous build is still bootable")
+        await repos.record_golden(repo, survivor, READY if survivor else FAILED)
     finally:
         run_log.close()
+
+
+async def _await_capture(boxd, snapshot: str, before: str, run_log: runner.RunLog) -> str:
+    """Block until `snapshot` is restorable, and clean up after itself if it never is.
+
+    `boxd.snapshots.create` returns once the capture is *queued*. Reaping the machine at that
+    point aborts the capture, and the name is left in the fleet at `pending` with no version
+    behind it — permanently unrestorable, and invisible to `agents.available()` so every run
+    silently keeps booting the base while the register claims the repo is warm. That is not a
+    hypothesis; it is what `golden-mithril-studio-software-factory` was found in.
+
+    A capture that times out is deleted rather than left there, because a name with no version
+    is worse than no name at all: it is the one shape `resolve_snapshot` cannot see and a
+    person reading `snapshots list` cannot distinguish from progress.
+    """
+    try:
+        return await agents.wait_until_captured(
+            boxd, snapshot, before, settings.capture_timeout, settings.capture_poll
+        )
+    except TimeoutError:
+        run_log.write(f"[factory] {snapshot} never finished capturing; deleting the fragment")
+        try:
+            await boxd.snapshots.delete(snapshot)
+        except Exception as exc:  # noqa: BLE001 - best effort; the run has already failed
+            run_log.write(f"[factory] could not delete {snapshot}: {exc!r}")
+        agents.forget()
+        raise
 
 
 async def _execute(run_id: str, repo: str, base: str, command: str, run_log: runner.RunLog) -> None:
@@ -208,15 +286,21 @@ async def _execute(run_id: str, repo: str, base: str, command: str, run_log: run
 
         # Capture before the machine is destroyed, obviously — but also before anything else
         # can go wrong: everything the snapshot is for is on disk by now.
+        #
+        # What the version is *before* the capture is the thing that makes the wait below
+        # correct on a rebuild, and it has to be read before `create` rather than after.
+        before = await agents.captured_version(boxd, snapshot)
         run_log.write(f"[factory] capturing {snapshot}")
         await boxd.snapshots.create(machine.id, snapshot)
+        run_log.write("[factory] waiting for boxd to finish writing the capture")
+        version = await _await_capture(boxd, snapshot, before, run_log)
         # The fleet listing is memoised for CACHE_TTL, and the next dispatch should resolve
         # onto what was just built rather than onto the base for another ten seconds.
         agents.forget()
 
         await repos.record_golden(repo, snapshot, READY)
         await db.update_run(run_id, status="succeeded", finished_at=db.utcnow())
-        run_log.write(f"[factory] {snapshot} saved; {repo}'s runs now boot it")
+        run_log.write(f"[factory] {snapshot} {version} saved; {repo}'s runs now boot it")
     finally:
         # Never kept for inspection, whatever FACTORY_KEEP_FAILED says: this machine exists
         # only to be photographed, and a failed warm-up leaves nothing on it worth an SSH.

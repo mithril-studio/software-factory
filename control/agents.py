@@ -24,13 +24,15 @@ Two tiers, not one, and the fallback is what makes connecting a repo cheap: a re
 golden of its own still dispatches onto `golden-copy` and installs for itself. Provisioning is
 a speed-up that can finish later, never a gate on the first run.
 
-Everything here is a pure function over strings apart from `available()` and `listed()`, which
-share the one place that talks to boxd. That is deliberate: dispatch decisions can then be
-tested without credentials, a VM, a database or a clock.
+Everything here is a pure function over strings apart from the four that talk to boxd —
+`available()`, `listed()`, `captured_version()` and `wait_until_captured()` — which all go
+through the one listing. That is deliberate: dispatch decisions can then be tested without
+credentials, a VM, a database or a clock.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections.abc import Iterable
@@ -262,3 +264,49 @@ def forget() -> None:
     _cache = None
     _versions = {}
     _statuses = {}
+
+
+async def captured_version(boxd, name: str) -> str:
+    """The restorable version `name` carries right now, re-read from the fleet.
+
+    Forces a fresh listing rather than trusting the memoised one, because every caller is
+    asking about a moment they are about to change: what was there *before* a capture, and
+    whether the capture has landed since.
+    """
+    forget()
+    await listed(boxd)
+    return version(name)
+
+
+async def wait_until_captured(
+    boxd, name: str, was: str, timeout: float, poll: float = 5.0
+) -> str:
+    """Block until `name` carries a restorable version newer than `was`. Returns that version.
+
+    `boxd.snapshots.create` returns when the capture has been *queued*, not when it has been
+    written — and destroying the machine underneath a queued capture aborts it for good. That
+    is not a hypothesis: `golden-mithril-studio-software-factory` sat at `v0 / pending / 0B`
+    with no machine behind it, unrestorable and unfixable, because `provision._execute`
+    reaped the VM the instant `create` returned. `scripts/build-golden.sh` never hit it
+    because the `boxd snapshots save` CLI blocks until the capture lands.
+
+    Compared against `was` rather than merely tested for existence, because a *rebuild*
+    re-saves a name that already has a ready version from last time: "has a version" is true
+    before the new capture starts, and waiting on it would return immediately and reap the
+    machine exactly as before. The question is whether the version moved.
+
+    `TimeoutError` is the caller's cue to delete the half-written snapshot — a name with no
+    version behind it is one no dispatch can ever resolve onto, and leaving it in the fleet
+    turns a slow provision into a permanent one.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        found = await captured_version(boxd, name)
+        if found and found != was:
+            return found
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"{name} was still {status(name) or 'unlisted'} after {timeout:.0f}s"
+                + (f" (version {was!r} unchanged)" if was else " with no version behind it")
+            )
+        await asyncio.sleep(poll)

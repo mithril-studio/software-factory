@@ -174,10 +174,22 @@ produces a golden that looks built and dies at the first dispatch.
 
 ### Warming one from the control plane: `POST /api/repos/<owner>/<name>/golden`
 
-Connecting a repo starts this automatically when the repo names a setup command. It is a run
-like any other — `kind: provision`, a streamed log you can tail, a cancel button, a VM the
-reconciler recognises — and it restores `golden-copy`, clones, installs, captures
-`golden-<slug>`, and destroys the machine.
+Connecting a repo starts this automatically. It is a run like any other — `kind: provision`, a
+streamed log you can tail, a cancel button, a VM the reconciler recognises — and it restores
+`golden-copy`, clones, installs, captures `golden-<slug>`, **waits for the capture to be
+written**, and only then destroys the machine.
+
+That wait is load-bearing, and it cost a golden to learn. The SDK's `snapshots.create` returns
+once boxd has *queued* the capture; destroying the machine at that point aborts it, and the
+name is left in the fleet at `pending` with no version behind it — which `agents.available()`
+correctly refuses to dispatch onto and which nothing can repair. The symptom is a repo the
+Projects page calls warm whose every run still boots the base. `scripts/build-golden.sh` never
+hit it because the `boxd snapshots save` CLI blocks until the capture lands. A capture that
+never lands (`FACTORY_CAPTURE_TIMEOUT`, 20 minutes) is deleted rather than left looking like
+progress.
+
+It never blocks the repo it was started for: warm-ups have their own concurrency budget
+(`FACTORY_MAX_PROVISION`), and the poller does not count one as work in flight.
 
 Always from the base, even when the repo already has a golden. Updating one in place is
 faster and is what the shell script below does, but it also carries forward whatever the last
@@ -185,8 +197,11 @@ capture got wrong: building from `golden-copy` every time makes re-provisioning 
 for a bad snapshot rather than another way to inherit it. `DELETE` the same path to drop a
 repo's golden and send its runs back to the base.
 
-The install command is the one the repo names in its own `## Setup` section, never a guess —
-a repo that names none is refused before a VM is created. `control/preflight.py`'s reader and
+The install command is the one the repo names in its own `## Setup` section, never a guess. A
+repo that names none still gets a golden — the clone, captured without an install, because the
+clone is the half that can be done without inventing anything and it is worth minutes on its
+own. What the control plane will not do is infer an install command from a lock file: that is
+how one project's command becomes every project's. `control/preflight.py`'s reader and
 `refresh-golden.sh`'s `awk`/`sed` pipeline are pinned against each other in
 `control/golden_scripts_test.py`, so the two cannot install the same repo differently.
 
@@ -249,12 +264,21 @@ re-snapshot it under the same name.
    serves every repo that has none. A warm `golden-<owner-repo>` is optional and only makes
    runs faster.
 2. Connect it — **Projects → Connect repo**, or `POST /api/repos {"repo": "owner/name"}`.
-   The form names the repo, shows what preflight says about it, and connects on a second
-   click; a blocking check refuses the connection and says which one. On success the repo is
-   in the register, its lifecycle labels exist, a golden starts warming if the repo names a
-   setup command, and the poller picks it up on its next tick — **no restart and no `.env`
-   edit.** Disconnecting keeps the repo's runs, because they are the ledger of what was spent
-   and shipped rather than configuration.
+   The field is a picker over the repos the deployment's token can see (`GET
+   /api/github/repos`), and it is still free text: a repo created a minute ago, or any repo at
+   all when GitHub is unreachable, is connected by typing its slug. Check shows what preflight
+   says, Connect commits it; a blocking check refuses the connection and says which one. On
+   success the repo is in the register, its lifecycle labels exist, **a golden starts warming**,
+   and the poller picks it up on its next tick — **no restart and no `.env` edit.**
+   Disconnecting keeps the repo's runs, because they are the ledger of what was spent and
+   shipped rather than configuration.
+
+   The warm-up does not hold the repo up. It runs under its own concurrency budget
+   (`FACTORY_MAX_PROVISION`), the poller does not count it as work in flight, and the repo
+   dispatches onto `golden-copy` from the moment it is registered. A repo that names no `##
+   Setup` command still gets a golden — the clone, without the install, which is the half that
+   can be done without guessing how the project installs. Adding a `## Setup` section and
+   rebuilding bakes the install in too.
 
    `FACTORY_REPOS` is now the *seed* for that register: entries are added on boot if they are
    not already there, and removing one does not unwatch the repo.
@@ -269,8 +293,8 @@ re-snapshot it under the same name.
 
    It reports on the repo — readable, pushable, has CI, has a `.factory.md`, has a `##
    Setup` section, labels — and on one thing outside it: whether a golden snapshot exists
-   for the agent this repo would resolve to. Exit status 0 means ready. Same answers over
-   HTTP at `/api/preflight?repo=owner/repo`.
+   for this repo to resolve onto. Exit status 0 means ready. Same answers over HTTP at
+   `/api/preflight?repo=owner/repo`, which is what the Check button calls.
 
    It boots nothing. Every check is a GitHub call or a snapshot listing, which is the whole
    point: these are the questions a run otherwise answers the expensive way, after forking a
@@ -304,8 +328,8 @@ discovering it needs one, guessing a command, and re-reading its whole context b
 guess.
 
 It is also what warming this repo's own golden runs, so a repo that names one gets that install
-done once into a snapshot instead of once per run. A repo that names none is not provisioned at
-all rather than provisioned with a guess.
+done once into a snapshot instead of once per run. A repo that names none still gets a golden,
+with the clone in it and no install — never one provisioned with a guess.
 
 Name the command, and say roughly how long it takes so the agent picks a sane timeout. Put it
 above the verify commands: it runs first, and a file is read in the order it is written.

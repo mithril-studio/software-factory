@@ -254,6 +254,28 @@ export async function del<T>(url: string): Promise<T> {
 
 // ---- repos ----
 
+/** One repo the control plane's GitHub token can see. For the connect picker only — what a
+ *  repo may actually do is what preflight asks, not what this says. */
+export type GithubRepo = {
+  full_name: string
+  private: boolean
+  archived: boolean
+  default_branch: string
+  pushed_at: string | null
+  /** What the *account* may do, which is not what the token may do. Enough to grey a row. */
+  can_push: boolean
+  /** Already in the register, so connecting it again would 409. */
+  connected: boolean
+}
+
+/** The repos this deployment's token can see, most recently pushed first.
+ *
+ *  `error` rather than a throw: the picker is a convenience over a field that still accepts
+ *  free text, so a GitHub outage should cost the dropdown and nothing else. */
+export function githubRepos(): Promise<{ repos: GithubRepo[]; error: string | null }> {
+  return get<{ repos: GithubRepo[]; error: string | null }>("/api/github/repos")
+}
+
 /** Ask whether a repo could be dispatched to. Read-only; safe to call on anything. */
 export function preflight(repo: string): Promise<Preflight> {
   return get<Preflight>(`/api/preflight?repo=${encodeURIComponent(repo)}`)
