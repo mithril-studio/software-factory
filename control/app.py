@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import agents, auth, db, github, goldens, poller, preflight, repos, runner
+from . import agents, auth, db, github, goldens, poller, preflight, provision, repos, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -170,8 +170,9 @@ async def api_telemetry():
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    # A review of a pull request a build already opened, rather than a build. Both are runs
-    # on a fork, which is why one endpoint starts either.
+    # 'build', 'review' (of a pull request a build already opened), or 'provision' (warm this
+    # repo's golden). All three are runs on a restored VM, which is why one endpoint starts any
+    # of them. A provision ignores `issue_number`; there is no issue behind it.
     kind: str = "build"
     pr_url: str | None = None
     branch: str | None = None
@@ -203,6 +204,8 @@ async def api_start_run(body: StartRun):
             )
         elif body.kind == "build":
             run_id = await runner.create(repo, body.issue_number, attempt=body.attempt)
+        elif body.kind == "provision":
+            run_id = await provision.create(repo)
         else:
             raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001
@@ -352,7 +355,50 @@ async def api_connect_repo(body: ConnectRepo):
             },
         )
     await repos.add(repo)
-    return {"repo": repo, "checks": _checks_json(checks)}
+    # Warm a golden for it, if it says how to install itself. Best-effort and reported rather
+    # than awaited: the repo is dispatchable the moment it is registered, so provisioning that
+    # cannot start is a slower repo and not a failed connection. `provision` refuses when the
+    # repo names no `## Setup` command, which is the ordinary reason this returns no run.
+    provision_run, why = None, None
+    try:
+        provision_run = await provision.create(repo)
+    except Exception as exc:  # noqa: BLE001 - the message is what the caller shows
+        why = str(exc)
+    return {
+        "repo": repo,
+        "checks": _checks_json(checks),
+        "provision_run": provision_run,
+        "provision_skipped": why,
+    }
+
+
+@app.post("/api/repos/{owner}/{name}/golden")
+async def api_provision_golden(owner: str, name: str):
+    """Warm this repo's golden now: restore the base, clone, install, capture, destroy.
+
+    Also how a stale one is refreshed — provisioning always builds from `golden-copy` rather
+    than updating the repo's existing snapshot in place, so re-running this is the repair for a
+    golden that has gone wrong as well as the way to make one.
+    """
+    repo = f"{owner}/{name}"
+    if repo not in repos.watched():
+        raise HTTPException(404, f"{repo} is not watched")
+    try:
+        return {"run_id": await provision.create(repo)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/repos/{owner}/{name}/golden")
+async def api_delete_golden(owner: str, name: str):
+    """Delete this repo's golden. Its runs fall back to the base and install for themselves."""
+    repo = f"{owner}/{name}"
+    if repo not in repos.watched():
+        raise HTTPException(404, f"{repo} is not watched")
+    try:
+        return {"repo": repo, "deleted": await provision.unprovision(repo)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.delete("/api/repos/{owner}/{name}")

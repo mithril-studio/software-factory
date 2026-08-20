@@ -75,21 +75,22 @@ def semaphore() -> asyncio.Semaphore:
 
 
 # Every VM a run creates is named from its run id with one of these prefixes: `run-` for a
-# build, `rev-` for a review. Reconcile and the fleet view both key off them, so they live
-# here rather than being spelled out at each site — a prefix known to one and not the other
-# is a VM nobody reaps and nobody recognises.
+# build, `rev-` for a review, `prov-` for warming a repo's golden. Reconcile and the fleet view
+# both key off them, so they live here rather than being spelled out at each site — a prefix
+# known to one and not the other is a VM nobody reaps and nobody recognises.
 RUN_PREFIX = "run-"
 REVIEW_PREFIX = "rev-"
-VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX)
+PROVISION_PREFIX = "prov-"
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX)
 
 
 def is_run_vm(name: str) -> bool:
-    """True for a machine this factory forked for a run, build or review."""
+    """True for a machine this factory created for a run: build, review or provisioning."""
     return name.startswith(VM_PREFIXES)
 
 
 def vm_role(name: str) -> str:
-    """What a machine in the fleet is: `run`, `review`, or `other`.
+    """What a machine in the fleet is: `run`, `review`, `provision`, or `other`.
 
     Read off the same prefixes `is_run_vm` sweeps on, so the fleet view and the reaper can
     never disagree about what belongs to the factory. `other` covers everything the factory
@@ -99,6 +100,8 @@ def vm_role(name: str) -> str:
     """
     if name.startswith(REVIEW_PREFIX):
         return "review"
+    if name.startswith(PROVISION_PREFIX):
+        return "provision"
     if name.startswith(RUN_PREFIX):
         return "run"
     return "other"
@@ -1764,6 +1767,17 @@ async def _salvage_transcript(
             log.write(f"[factory] transcript saved ({len(result.stdout)} bytes)")
     except Exception as exc:  # noqa: BLE001
         log.write(f"[factory] transcript salvage skipped: {exc!r}")
+
+
+def track(run_id: str, task: asyncio.Task) -> None:
+    """Register a run's task so `cancel()` can reach it, and forget it when it ends.
+
+    Public because provisioning a golden is a run this module does not start — it is an
+    agentless one, so it lives in `control/provision.py` — but it is still a task holding a VM,
+    and a task the UI cannot cancel is a VM nobody can stop.
+    """
+    _tasks[run_id] = task
+    task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
 
 
 async def cancel(run_id: str) -> bool:
