@@ -52,6 +52,15 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE INDEX IF NOT EXISTS tool_calls_run_idx  ON tool_calls (run_id);
 CREATE INDEX IF NOT EXISTS tool_calls_tool_idx ON tool_calls (tool);
 
+CREATE TABLE IF NOT EXISTS memory_reads (
+    run_id      TEXT NOT NULL,
+    memory_id   TEXT NOT NULL,
+    domain      TEXT,
+    ts          TEXT,
+    PRIMARY KEY (run_id, memory_id)
+);
+CREATE INDEX IF NOT EXISTS memory_reads_run_idx ON memory_reads (run_id);
+
 CREATE TABLE IF NOT EXISTS model_prices (
     model                   TEXT NOT NULL,
     valid_from              TEXT NOT NULL,
@@ -173,6 +182,33 @@ async def clear_run(run_id: str) -> None:
         await conn.execute("DELETE FROM llm_calls WHERE run_id = ?", (run_id,))
         await conn.execute("DELETE FROM tool_calls WHERE run_id = ?", (run_id,))
         await conn.commit()
+
+
+async def write_memory_reads(run_id: str, reads: Sequence[tuple[str, str | None, str | None]]) -> None:
+    """Record which memory records a run pulled into context.
+
+    Each item is `(memory_id, domain, ts)`. Keyed on `(run_id, memory_id)`, so retrieving
+    the same record twice in one run — the recorder replaying a transcript, or two turns
+    reaching for the same fact — leaves one row rather than accumulating duplicates.
+    """
+    if not reads:
+        return
+    async with connect() as conn:
+        await conn.executemany(
+            """INSERT OR IGNORE INTO memory_reads (run_id, memory_id, domain, ts)
+               VALUES (?, ?, ?, ?)""",
+            [(run_id, memory_id, domain, ts) for memory_id, domain, ts in reads],
+        )
+        await conn.commit()
+
+
+async def memory_reads_for_run(run_id: str) -> list[dict]:
+    """Every memory record a run retrieved. The per-run read endpoint for AC1."""
+    return await _rows(
+        """SELECT memory_id, domain, ts FROM memory_reads
+           WHERE run_id = ? ORDER BY ts, memory_id""",
+        (run_id,),
+    )
 
 
 # --------------------------------------------------------------------------- reads
