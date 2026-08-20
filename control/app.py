@@ -458,8 +458,13 @@ async def api_projects():
     # value — otherwise this column would say what the repo was configured with where the
     # fleet views say what would actually boot.
     boxd = runner.client()
+    # Read once for the whole page rather than per repo: it is the same ledger every row asks
+    # the same question of, and a watched-repo list is exactly where one query per row hides.
+    proof = await runner.evidence()
     try:
-        sources = {r["repo"]: await runner.source_for(boxd, r["repo"]) for r in watched}
+        sources = {
+            r["repo"]: await runner.source_for(boxd, r["repo"], proof=proof) for r in watched
+        }
     except Exception:  # noqa: BLE001 - a boxd outage costs a column, not the page
         sources = {}
     finally:

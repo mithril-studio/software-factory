@@ -214,7 +214,27 @@ async def headroom(boxd: AsyncBoxd, log: RunLog) -> None:
     log.write(f"[factory] reclaimed to {count}/{settings.max_machines}")
 
 
-async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> str:
+async def evidence() -> dict[str, dict]:
+    """What the runs prove about each snapshot, or `{}` when the question could not be asked.
+
+    `{}` is not "nothing is proved" — `resolve_snapshot` reads a missing entry as *unknown*
+    and boots the warm golden anyway, which is exactly what should happen when the database
+    did not answer. A hiccup here must never demote a golden; that would be the same error as
+    reading an unreachable box as a stalled one.
+    """
+    try:
+        return await db.snapshot_evidence()
+    except Exception:  # noqa: BLE001 - an unreadable ledger is an unknown, not a verdict
+        _log.exception("could not read snapshot evidence; treating every golden as unproven")
+        return {}
+
+
+async def source_for(
+    boxd: AsyncBoxd,
+    repo: str,
+    log: RunLog | None = None,
+    proof: dict[str, dict] | None = None,
+) -> str:
     """Which golden this run boots from: this repo's own, or the base image behind it.
 
     Public because a run is not the only thing that needs the answer — the projects page and
@@ -222,10 +242,19 @@ async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> s
     derivation of that would be a second thing to keep in step. Without a `log` the fallback
     is noted on the module logger instead of in a run's own log.
 
-    One fallback, and it is the ordinary case rather than an error path: a repo nobody has
-    provisioned a golden for yet boots `golden-copy` and installs for itself. That is what
-    lets a repo be connected and dispatched in the same minute, with provisioning catching up
-    afterwards.
+    Two fallbacks now, and neither is an error path.
+
+    The ordinary one: a repo nobody has provisioned a golden for yet boots `golden-copy` and
+    installs for itself. That is what lets a repo be connected and dispatched in the same
+    minute, with provisioning catching up afterwards.
+
+    The second is a warm golden `agents.quarantined` reports on — one whose only verdict so
+    far is a failure. It costs the same as the first (an install), and it says so in the run's
+    own log, because a run that quietly boots something other than the repo's golden is how
+    two of these went unexplained for hours.
+
+    `proof` is `evidence()`, passed in by callers that answer for several repos at once so the
+    ledger is read once rather than per repo.
 
     When the snapshot fleet answers to nothing at all, the base name is handed to `_provision`
     anyway. On the rollback path `golden-copy` is still a *machine*, and forking it is exactly
@@ -233,12 +262,25 @@ async def source_for(boxd: AsyncBoxd, repo: str, log: RunLog | None = None) -> s
     """
     note = log.write if log is not None else _log.info
     names = await agents.available(boxd)
-    source = agents.resolve_snapshot(repo, names)
+    proof = await evidence() if proof is None else proof
+    warm = agents.golden_name(repo) if repo else ""
+    source = agents.resolve_snapshot(repo, names, proof)
     if not source:
         source = agents.BASE_SNAPSHOT
         note(f"[factory] no golden snapshot in the fleet; trying machine {source}")
     elif source == agents.BASE_SNAPSHOT:
-        note(f"[factory] no warm golden for {repo}; booting {source} and installing for itself")
+        # Only ever asked about the warm tier. A repo with no nameable slug has `golden_name`
+        # answer the base image, and reporting *that* as skipped would print a line saying the
+        # base was skipped in favour of the base.
+        skippable = warm and warm != agents.BASE_SNAPSHOT and warm in set(names)
+        why = agents.quarantined(warm, proof) if skippable else ""
+        if why:
+            note(f"[factory] {warm} skipped: {why}; booting {source} instead")
+        else:
+            note(
+                f"[factory] no warm golden for {repo}; booting {source} and installing for "
+                "itself"
+            )
     return source
 
 
@@ -948,10 +990,16 @@ class RunLog:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        # How far the run got before it stopped saying anything. Counted here because this is
+        # the one place every line goes through, and because "frozen at 14 lines" is the shape
+        # a stall actually has — a number the stall message can carry rather than a human
+        # counting the file by hand.
+        self.lines = 0
         self._fh = path.open("a", encoding="utf-8", buffering=1)
 
     def write(self, line: str) -> None:
         self._fh.write(line.rstrip("\n") + "\n")
+        self.lines += 1
 
     def close(self) -> None:
         try:
@@ -1342,6 +1390,28 @@ async def _salvage_usage(run_id: str, log: RunLog) -> None:
         log.write(f"[factory] usage salvage skipped: {exc!r}")
 
 
+def failure_reason(exc: BaseException) -> str:
+    """How a run's ending gets written down, from the exception that ended it.
+
+    One function because both guards below record the same three endings and they had drifted
+    into two copies of two of them. Each name is load-bearing in the runs table, which is what
+    `db.snapshot_evidence` grades goldens from:
+
+    - `stalled` — the stream went quiet for longer than any command may take. Named separately
+      from a timeout because it is the one ending that points at the image the run booted.
+    - `timed out` — the run's own 90-minute ceiling. `str()` on an `asyncio.TimeoutError` is
+      empty, which used to record the least useful error possible ("crashed: ") for the one
+      failure mode that says exactly what happened.
+    - `crashed` — everything else, including a stream that died. Falling back to the exception
+      class keeps a silent exception from recording a blank reason.
+    """
+    if isinstance(exc, Stalled):
+        return f"stalled: {exc}"
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"timed out after {settings.run_timeout}s"
+    return f"crashed: {str(exc)[:200] or type(exc).__name__}"
+
+
 async def _guarded_review(
     run_id: str,
     repo: str,
@@ -1362,11 +1432,7 @@ async def _guarded_review(
         # A review that crashes must not merge anything, and must not silently strand the PR
         # either. Leave it open, labelled, for a human.
         log.write(f"[factory] review failed: {exc!r}")
-        reason = (
-            f"timed out after {settings.run_timeout}s"
-            if isinstance(exc, asyncio.TimeoutError)
-            else f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        )
+        reason = failure_reason(exc)
         await db.update_run(
             run_id, status="failed", error=reason, finished_at=db.utcnow()
         )
@@ -1407,14 +1473,7 @@ async def _guarded(
         raise
     except Exception as exc:  # noqa: BLE001 - the UI is where failures get reported
         log.write(f"[factory] run failed: {exc!r}")
-        # str() on an asyncio.TimeoutError is empty, which used to record the least useful
-        # error in the table ("crashed: ") for the one failure mode that says exactly what
-        # happened. Name it, and fall back to the exception class for anything else silent.
-        if isinstance(exc, asyncio.TimeoutError):
-            reason = f"timed out after {settings.run_timeout}s"
-        else:
-            reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        await _fail_run(run_id, repo, issue, attempt, reason, log)
+        await _fail_run(run_id, repo, issue, attempt, failure_reason(exc), log)
     finally:
         await _salvage_usage(run_id, log)
         log.close()
@@ -1785,6 +1844,53 @@ async def _read_verdict(boxd: AsyncBoxd, machine_id: str, log: RunLog) -> dict |
         return None
 
 
+class Stalled(RuntimeError):
+    """A run that stopped emitting anything, for longer than any command is allowed to take.
+
+    Its own class, and not an `asyncio.TimeoutError`, because the two say different things and
+    the difference is the finding: `TimeoutError` is the run's 90-minute ceiling, this is
+    silence long enough that the run cannot be working. Both end the run; only one of them
+    means "look at the golden it booted".
+
+    What it is emphatically *not* is a stream that died. An iteration that raises is a crash
+    and keeps saying so — an unreachable thing reported as a frozen one is the error this
+    whole change exists to stop making.
+    """
+
+    def __init__(self, idle: float, lines: int) -> None:
+        super().__init__(f"no output for {idle}s after {lines} lines")
+        self.idle = idle
+        self.lines = lines
+
+
+async def bounded(chunks, idle: float, log: RunLog):
+    """Yield from `chunks`, raising `Stalled` when nothing arrives for `idle` seconds.
+
+    The measurement is taken on the control plane's own stream — the same channel the log is
+    built from — so there is no second connection that can fail and be mistaken for silence.
+    Either a chunk arrives, or the stream ends, or it raises; each is a different answer and
+    none of them is invented.
+
+    `idle=0` switches the watchdog off entirely, which is what makes it safe to inject a tiny
+    timeout in a test and leave production deriving its own.
+    """
+    it = chunks.__aiter__()
+    while True:
+        if not idle:
+            try:
+                yield await it.__anext__()
+            except StopAsyncIteration:
+                return
+            continue
+        try:
+            chunk = await asyncio.wait_for(it.__anext__(), timeout=idle)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise Stalled(idle, log.lines) from None
+        yield chunk
+
+
 async def _stream(
     boxd: AsyncBoxd,
     machine_id: str,
@@ -1792,8 +1898,15 @@ async def _stream(
     log: RunLog,
     run_id: str,
     script: str = VM_SCRIPT,
+    idle: int | None = None,
 ) -> tuple[int, dict, dict]:
     """Run the agent, formatting its event stream into the log as it arrives.
+
+    Raises `Stalled` when the stream goes quiet for `idle` seconds — `settings.idle_timeout()`
+    unless a caller (a test) says otherwise. Only agent runs are watched this way. A
+    provisioning run has its own `_stream` in `control/provision.py` and is left alone: an
+    install is legitimately silent for minutes and has no agent emitting events to be silent
+    *between*.
 
     Returns the exit code, the usage captured from the final `result` event
     (input/output tokens and cost), which is what the Runs UI shows as the run's cost,
@@ -1810,10 +1923,11 @@ async def _stream(
     usage: dict = {}
     manifest: dict = {}
     recorder = Recorder(run_id)
+    idle = settings.idle_timeout() if idle is None else idle
     async with boxd.machines.stream_exec(
         machine_id, command=export_prelude(env) + script, env=env, close_stdin=True
     ) as stream:
-        async for chunk in stream.iter_chunks():
+        async for chunk in bounded(stream.iter_chunks(), idle, log):
             text = chunk.data.decode("utf-8", errors="replace")
             if chunk.is_stderr:
                 for line in text.splitlines():

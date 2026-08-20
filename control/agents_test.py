@@ -33,6 +33,7 @@ from control.agents import (
     is_golden,
     listed,
     parse_golden,
+    quarantined,
     resolve_snapshot,
     slug,
     status,
@@ -133,6 +134,49 @@ check("resolve_snapshot: an empty fleet resolves to nothing", resolve_snapshot(R
 # unprovisioned repo is not an error state, it is the ordinary first run.
 check("resolve_snapshot: an unprovisioned repo still dispatches",
       bool(resolve_snapshot("brand/new", (BASE_SNAPSHOT,))), True)
+
+# ---------- quarantine: what the runs prove, and what they emphatically do not
+#
+# Two runs stalled on a warm golden that no run had ever proved, while the control plane went
+# on handing it to every dispatch and logging `no run has yet proved` into a void. These pin
+# the rule that closes that loop — and, just as hard, the three ways of knowing nothing, none
+# of which may read as a verdict. `resolve_snapshot` demoting on an absent measurement would
+# be the same error as reading an unreachable box as a frozen one.
+
+FAILED = {"last_verdict": "failed", "verdict_run": "r-d136841b"}
+PROVED = {"last_verdict": "failed", "verdict_run": "r-d136841b", "verified_at": "2026-08-20T09:00:00Z"}
+PASSED = {"last_verdict": "succeeded", "verdict_run": "r-6fa230d0"}
+
+check("quarantined: a golden whose only verdict is a failure is skipped",
+      bool(quarantined(WARM, {WARM: FAILED})), True)
+check("quarantined: a golden a run has proved is kept, whatever its last run did",
+      quarantined(WARM, {WARM: PROVED}), "")
+check("quarantined: a passing verdict is not a reason to skip anything",
+      quarantined(WARM, {WARM: PASSED}), "")
+check("quarantined: a cancelled run is no verdict at all, so it demotes nothing",
+      quarantined(WARM, {WARM: {"last_run": "r-cancelled", "ok": 0}}), "")
+check("quarantined: no entry for this golden is unproven, which is not bad",
+      quarantined(WARM, {"golden-acme-api": FAILED}), "")
+check("quarantined: no evidence at all is unknown, and unknown is never a demotion",
+      quarantined(WARM, None), "")
+check("quarantined: the reason names the run, because a skip nobody can trace is a rumour",
+      "r-d136841b" in quarantined(WARM, {WARM: FAILED}), True)
+
+check("resolve_snapshot: a warm golden with only a failure behind it falls back to the base",
+      resolve_snapshot(REPO, FLEET, {WARM: FAILED}), BASE_SNAPSHOT)
+check("resolve_snapshot: one run proving it is enough to keep booting it",
+      resolve_snapshot(REPO, FLEET, {WARM: PROVED}), WARM)
+check("resolve_snapshot: and a succeeding run un-quarantines it",
+      resolve_snapshot(REPO, FLEET, {WARM: PASSED}), WARM)
+check("resolve_snapshot: evidence that says nothing about this golden still boots it",
+      resolve_snapshot(REPO, FLEET, {}), WARM)
+check("resolve_snapshot: no evidence passed at all is today's behaviour, unchanged",
+      resolve_snapshot(REPO, FLEET, None), WARM)
+# The base image is never quarantined by this path: `resolve_snapshot` only ever asks about
+# the warm tier, because demoting the thing there is no fallback from would leave a repo with
+# nothing to boot at all.
+check("resolve_snapshot: a failed base image is still the fallback, since there is no other",
+      resolve_snapshot("brand/new", FLEET, {BASE_SNAPSHOT: FAILED}), BASE_SNAPSHOT)
 
 # ---------- api rows
 # What the fleet page is handed. The rows come from the refresh loop's table, which is the

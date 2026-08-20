@@ -134,6 +134,40 @@ check("golden: and says provisioning is a speed-up rather than a repair",
 check("golden: another repo's warm golden is never borrowed, the base answers instead",
       golden_check("acme/other", [BASE, WARM]).detail.startswith(BASE), True)
 
+# ---------- the four states behind one `ok`
+#
+# `scripts/factory-health.sh` renders every check here into a GitHub Actions report, so this
+# detail line is where the control plane's own `no run has yet proved` warning finally reaches
+# a human. It warned every five minutes for three hours; nothing read it, and two runs stalled
+# on the golden it was about. None of these blocks: the warm tier is a speed-up, and a run
+# that boots the base still builds.
+
+FAILED = {WARM: {"last_verdict": "failed", "verdict_run": "r-d136841b"}}
+PROVED = {WARM: {"last_verdict": "succeeded", "verified_at": "2026-08-20T09:00:00Z"}}
+
+unproven = golden_check(REPO, [BASE, WARM], {})
+check("golden: an unproven warm golden still boots", WARM in unproven.detail, True)
+check("golden: and the detail says nothing has ever proved it",
+      "no run has produced usage on it yet" in unproven.detail, True)
+
+proved = golden_check(REPO, [BASE, WARM], PROVED)
+check("golden: a proved one says when", "last proved 2026-08-20" in proved.detail, True)
+
+skipped = golden_check(REPO, [BASE, WARM], FAILED)
+check("golden: a warm golden with only a failure behind it is reported as skipped",
+      skipped.detail.startswith(BASE), True)
+check("golden: the detail names the run that did it, so the claim is checkable",
+      "r-d136841b" in skipped.detail, True)
+check("golden: and says the repo still builds, because it does", skipped.ok, True)
+check("golden: which means the repo is still ready", report(REPO, [skipped]), True)
+check("golden: with the repair being a re-warm, not an emergency",
+      "re-warm" in skipped.detail, True)
+
+# The difference this whole path exists to preserve: a golden nobody has run on and a ledger
+# nobody could read are both "unknown", and neither may read as a bad image.
+check("golden: no evidence at all reads the same as an unproven golden",
+      golden_check(REPO, [BASE, WARM]).detail, unproven.detail)
+
 # The one thing that really stops a dispatch. Asked of a repo with no warm golden of its own,
 # because a repo that has one is the case where the base is not needed.
 missing = golden_check("acme/other", [WARM])

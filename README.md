@@ -124,10 +124,26 @@ The name is the whole registry. There is no list of goldens anywhere else:
 
 A run resolves in that order, most specific first (`agents.resolve_snapshot`):
 
-1. `golden-<owner-repo>` for the repo it was assigned, if that snapshot exists;
+1. `golden-<owner-repo>` for the repo it was assigned, if that snapshot exists **and the runs
+   have not already condemned it** — see below;
 2. otherwise `golden-copy`;
 3. otherwise nothing — the dispatch fails rather than borrowing somebody else's golden, and
    `preflight` says so before you spend a run finding out.
+
+**A warm golden that has only ever failed is skipped.** The name used to be the whole
+decision, so a snapshot that no run had ever completed on kept being handed to every dispatch
+while the refresh loop logged `no run has yet proved: <name>` every five minutes into a void.
+Now the runs table decides: a warm golden is skipped when the last run on it that reached a
+verdict *failed* and no run has ever produced usage on it. The run drops to `golden-copy`,
+installs for itself, and says which golden it skipped and why in its own log.
+
+Three things it deliberately does **not** do. It never deletes the snapshot or touches the
+repo's register — the first run that succeeds on it un-quarantines it, so re-warming is a
+speed-up you can take your time over. A `cancelled` run is not a verdict; a human stopping a
+run says nothing about the image. And a golden nothing has run on yet, or a ledger that could
+not be read at all, is **unknown**, which boots the warm golden exactly as before. An absent
+measurement is never a negative observation — the run that went looking for these stalls first
+reported a vanished VM that had never been visible to the tool asking.
 
 `<owner-repo>` is the repo slugged: lowercase, every run of non-alphanumerics collapsed to one
 hyphen. The owner half is kept, so two owners with a repo of the same name cannot collide —
@@ -239,8 +255,31 @@ produced usage.** A golden that emitted tokens authenticated, so its `claude` lo
 were happening anyway. A golden with no `verified_at` is unproven, not broken — nothing has
 used it yet.
 
+`verified_at` is also what stops a bad warm golden being re-used: a warm snapshot whose only
+verdict is a failure, and which nothing has ever proved, is skipped at dispatch in favour of
+`golden-copy` — see *Two tiers, and which one a run picks*. It comes back on its own the
+moment a run succeeds on it.
+
 Repairing one is still manual and still project-specific: re-authenticate on a fork and
 re-snapshot it under the same name.
+
+### A run that stops saying anything
+
+`FACTORY_RUN_TIMEOUT` is a ceiling on how long a run may take; it says nothing about a run
+that has frozen. Two of them did, at 14 and 53 log lines, and burned most of the 90 minutes
+before anything noticed.
+
+So the control plane also watches the *gap* between chunks on the stream it is already
+reading — no second connection, so nothing here can fail and be mistaken for silence. Nothing
+at all for `FACTORY_RUN_IDLE` seconds (0 derives it as `FACTORY_BASH_MAX_TIMEOUT + 900`, which
+is the only safe way to pick it) ends the run as `stalled: no output for Ns after N lines`.
+That is a distinct ending from `timed out` and from `crashed`, and the distinction is the
+point: a stream that *dies* is a crash, not a stall, and only a stall points at the image the
+run booted. Being an ordinary failed run, it lands in the ledger above and the golden it
+booted is graded on it.
+
+Provisioning runs are not watched. An install is legitimately silent for minutes and has no
+agent emitting events to be silent between.
 
 ## Adding a repo
 

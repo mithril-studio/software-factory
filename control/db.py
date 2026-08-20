@@ -265,10 +265,22 @@ async def snapshot_evidence() -> dict[str, dict]:
     the only real test of a credential is using one — which every run does anyway, for free,
     on the machine the question is about.
 
-    Two different facts, and the difference matters. `ok`/`error`/`last_run` come from the
-    most recent run that reached an end on it, so a golden whose last run failed says so.
-    `verified_at` is the most recent run that also *produced usage* — an agent that emitted
-    tokens authenticated, whatever the run then did with the code.
+    Three different facts, and the differences matter.
+
+    `ok`/`error`/`last_run` come from the most recent run that reached an end on it, so a
+    golden whose last run failed says so. `verified_at` is the most recent run that also
+    *produced usage* — an agent that emitted tokens authenticated, whatever the run then did
+    with the code.
+
+    `last_verdict`/`verdict_run` skip `cancelled` and report the newest run that actually
+    reached a verdict — `succeeded` or `failed`. This is the pair `agents.resolve_snapshot`
+    demotes on, and the distinction is the whole reason it exists: a human stopping a run is a
+    decision about the work, not an accusation against the image, and a cancellation landing in
+    `last_run` would otherwise mask the failure behind it and route dispatch off a golden that
+    nothing had actually judged.
+
+    A snapshot with no key here at all is one no finished run has ever touched. That is
+    *unproven*, which is not the same as bad, and every caller is expected to treat it that way.
     """
     async with connect() as conn:
         async with conn.execute(
@@ -288,6 +300,8 @@ async def snapshot_evidence() -> dict[str, dict]:
                 error=r["error"] if r["status"] != "succeeded" else None,
                 manifest=r["manifest"],
             )
+        if "last_verdict" not in seen and r["status"] in ("succeeded", "failed"):
+            seen.update(last_verdict=r["status"], verdict_run=r["id"])
         if "verified_at" not in seen and ((r["tokens_out"] or 0) > 0 or r["cost_usd"] is not None):
             seen["verified_at"] = r["finished_at"]
     return out

@@ -308,6 +308,73 @@ except ValueError as exc:
           agents.BASE_SNAPSHOT in str(exc), True)
 
 
+# ---------- what the runs prove about the golden they booted
+#
+# The warm tier's other failure, and the one that went unread for three hours: a golden that
+# exists, is restorable, resolves fine — and has never once worked. `goldens._loop` warned
+# `no run has yet proved: <name>` every five minutes while `resolve_snapshot` went on handing
+# it to every dispatch, because dispatch asked the *name* and the evidence sat in the runs
+# table with nothing reading it.
+#
+# Against the real database, because the whole feature is "the ledger decides", and stubbing
+# the ledger would assert that a function gets called rather than that a repo boots the right
+# image. Timestamps are explicit and far in the future so these rows sort after the
+# provisioning runs above rather than racing them.
+
+FLEET = (agents.BASE_SNAPSHOT, SNAPSHOT)
+
+
+def finished(run_id, status, at, **fields):
+    """One finished run on the warm golden, straight into the table."""
+    asyncio.run(db.create_run(
+        id=run_id, repo=REPO, issue_number=0, golden=SNAPSHOT, status=status,
+        created_at=at, finished_at=at, **fields,
+    ))
+    return asyncio.run(db.snapshot_evidence())
+
+
+# A stall is a failure like any other as far as the ledger is concerned — the point of naming
+# it in `runs.error` is that a human reading the row learns which of the four endings it was.
+seen = finished("r-stall", "failed", "2099-01-01T00:00:00Z",
+                error="stalled: no output for 2700s after 14 lines")
+check("evidence: a failed run is the golden's last verdict",
+      seen[SNAPSHOT]["last_verdict"], "failed")
+check("evidence: and the run is named, so a skip can be traced back to it",
+      seen[SNAPSHOT]["verdict_run"], "r-stall")
+check("evidence: nothing has produced usage on it, so nothing has proved it",
+      seen[SNAPSHOT].get("verified_at"), None)
+check("dispatch: so the repo falls back to the base and installs for itself",
+      agents.resolve_snapshot(REPO, FLEET, seen), agents.BASE_SNAPSHOT)
+
+# A human stopping a run is a decision about the work, not a finding about the image. It lands
+# in `last_run` — which is what the fleet page shows — but it must not become the verdict the
+# demotion reads, or a cancel would hide the failure behind it and change where runs boot.
+seen = finished("r-cancelled", "cancelled", "2099-01-02T00:00:00Z")
+check("evidence: a cancellation is the most recent run",
+      seen[SNAPSHOT]["last_run"], "r-cancelled")
+check("evidence: but it is not a verdict, so the failure behind it still stands",
+      (seen[SNAPSHOT]["last_verdict"], seen[SNAPSHOT]["verdict_run"]), ("failed", "r-stall"))
+check("dispatch: and it changes nothing about where the run boots",
+      agents.resolve_snapshot(REPO, FLEET, seen), agents.BASE_SNAPSHOT)
+
+# The quarantine reverses itself. Nothing was deleted and no register was rewritten, so one
+# run that authenticates on the snapshot is enough to start booting it again — which is also
+# what makes the rule safe to apply on a single failure.
+seen = finished("r-good", "succeeded", "2099-01-03T00:00:00Z", tokens_out=1200, cost_usd=0.42)
+check("evidence: a run that produced usage proves the image's credentials still work",
+      bool(seen[SNAPSHOT]["verified_at"]), True)
+check("dispatch: so the warm golden is booted again, with nothing to re-warm",
+      agents.resolve_snapshot(REPO, FLEET, seen), SNAPSHOT)
+
+# The two ways of knowing nothing, at the level a dispatch actually asks the question. An
+# unreadable ledger answers `{}` and a first-ever golden has no row; both must boot the warm
+# golden. Demoting on a measurement that was never taken is the mistake this all came from.
+check("dispatch: an evidence read that failed is unknown, and unknown boots the golden",
+      agents.resolve_snapshot(REPO, FLEET, {}), SNAPSHOT)
+check("dispatch: and a caller that passes none gets today's behaviour",
+      agents.resolve_snapshot(REPO, FLEET), SNAPSHOT)
+
+
 tmp.cleanup()
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

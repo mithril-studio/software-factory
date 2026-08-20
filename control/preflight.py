@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from . import agents, github, runner
@@ -131,8 +131,12 @@ def push_check(ok: bool, detail: str) -> Check:
     return Check("token can push", ok, detail)
 
 
-def golden_check(repo: str, available: Iterable[str] = ()) -> Check:
-    """Is there a golden snapshot for this repo's runs to boot?
+def golden_check(
+    repo: str,
+    available: Iterable[str] = (),
+    evidence: Mapping[str, Mapping] | None = None,
+) -> Check:
+    """Is there a golden snapshot for this repo's runs to boot, and is it worth booting?
 
     The cheapest question the old VM probe was standing in for, and the only one of them still
     worth asking: a repo that resolves to nothing does not fail slowly, it fails at the first
@@ -143,13 +147,36 @@ def golden_check(repo: str, available: Iterable[str] = ()) -> Check:
     never waits on provisioning. The only blocking answer is a deployment with no base image
     at all, which is not this repo's problem to fix and would stop every other repo too.
 
-    `available` is passed in rather than fetched so the decision is testable without
-    credentials; `run()` is the one place that talks to the fleet.
+    The detail is where the reporting happens, because there are four different states behind
+    one `ok`, and the control plane knew all of them while saying none of them out loud:
+    proved, unproven, quarantined, and no warm golden at all. `goldens._loop` warned about the
+    second of those every five minutes for three hours and nothing read it — this is the line
+    that reaches a human, since `scripts/factory-health.sh` renders every check here into the
+    GitHub Actions health report.
+
+    `available` and `evidence` are passed in rather than fetched so the decision is testable
+    without credentials or a database; `run()` is the one place that talks to either.
     """
-    snapshot = agents.resolve_snapshot(repo, available)
-    if snapshot == agents.golden_name(repo):
-        return Check("a golden is resolvable", True, f"{snapshot}, warmed for this repo")
+    warm = agents.golden_name(repo)
+    snapshot = agents.resolve_snapshot(repo, available, evidence)
+    if snapshot == warm:
+        seen = (evidence or {}).get(warm) or {}
+        proved = seen.get("verified_at")
+        note = (
+            f"last proved {str(proved)[:10]}"
+            if proved
+            else "no run has produced usage on it yet, so the next run is its trial"
+        )
+        return Check("a golden is resolvable", True, f"{snapshot}, warmed for this repo — {note}")
     if snapshot:
+        why = agents.quarantined(warm, evidence) if warm in set(available or ()) else ""
+        if why:
+            return Check(
+                "a golden is resolvable",
+                True,
+                f"{snapshot} — {warm} is being skipped because {why}. Runs still dispatch and "
+                "install for themselves; re-warm the golden to get the speed-up back.",
+            )
         return Check(
             "a golden is resolvable",
             True,
@@ -215,14 +242,14 @@ async def _fleet() -> tuple[tuple[str, ...], Check | None]:
 
 async def run(repo: str) -> list[Check]:
     """Every check for `repo`, and for the golden its runs would boot."""
-    base, (available, outage) = await asyncio.gather(
-        github.default_branch(repo), _fleet()
+    base, (available, outage), evidence = await asyncio.gather(
+        github.default_branch(repo), _fleet(), runner.evidence()
     )
     checks = await _repo_checks(repo, base)
     if outage:
         checks.append(outage)
     else:
-        checks.append(golden_check(repo, available))
+        checks.append(golden_check(repo, available, evidence))
     return checks
 
 

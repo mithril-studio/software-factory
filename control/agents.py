@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 GOLDEN_PREFIX = "golden-"
 
@@ -111,16 +111,64 @@ def is_golden(name: str) -> bool:
     return parse_golden(name) is not None
 
 
-def resolve_snapshot(repo: str | None, available: Iterable[str] = ()) -> str | None:
+def quarantined(name: str, evidence: Mapping[str, Mapping] | None) -> str:
+    """Why `name` should not be booted, given what the runs prove — `""` when it should.
+
+    The demotion rule, in one place, because two callers read it and a second copy would be a
+    second rule. A warm golden is skipped when **both** of these hold:
+
+    - the last run on it that reached a verdict `failed` — `cancelled` is not a verdict, see
+      `db.snapshot_evidence`; and
+    - no run has ever produced usage on it, so nothing has ever proved the image works.
+
+    One failure is enough because the thing being protected against is a snapshot that has
+    *only* ever failed, and the cost of being wrong is one slower run rather than a lost
+    golden: nothing is deleted, and the first run that succeeds on it un-quarantines it.
+
+    `evidence is None`, or no entry for this name, is **unknown** and never a demotion. That
+    distinction is the point of this function existing: a warm golden nothing has run on yet
+    is unproven, a database that could not be read has said nothing at all, and neither is
+    evidence of a bad image. Reading an absent measurement as a negative one is the exact
+    mistake this whole path was built to stop.
+    """
+    if evidence is None:
+        return ""
+    seen = evidence.get(name)
+    if not seen:
+        return ""
+    if seen.get("verified_at"):
+        return ""
+    if seen.get("last_verdict") != "failed":
+        return ""
+    run = seen.get("verdict_run") or seen.get("last_run") or "an earlier run"
+    return (
+        f"run {run} failed on it and no run has ever produced usage there"
+    )
+
+
+def resolve_snapshot(
+    repo: str | None,
+    available: Iterable[str] = (),
+    evidence: Mapping[str, Mapping] | None = None,
+) -> str | None:
     """Which snapshot a run for `repo` boots: its own warm golden, else the base image.
 
     `None` means this deployment has no base image, which is a configuration error the caller
     must surface rather than paper over with somebody else's snapshot. A repo that simply has
     not been provisioned yet is *not* that case — it gets the base and installs for itself.
+
+    `evidence` is `db.snapshot_evidence()`: what the runs prove about each snapshot. A warm
+    golden `quarantined` reports on is skipped and the run falls back to the base, which is
+    the same fallback an unprovisioned repo gets and costs the same — an install the warm tier
+    would have saved.
+
+    It defaults to `None`, and that default *is* the unknown case: every existing caller keeps
+    today's behaviour, and one that forgets to pass evidence gets a warm golden rather than a
+    silent demotion. Nothing here should ever demote on a measurement it did not take.
     """
     names = set(available or ())
     warm = golden_name(repo) if repo else ""
-    if warm and warm != BASE_SNAPSHOT and warm in names:
+    if warm and warm != BASE_SNAPSHOT and warm in names and not quarantined(warm, evidence):
         return warm
     return BASE_SNAPSHOT if BASE_SNAPSHOT in names else None
 

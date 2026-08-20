@@ -94,6 +94,14 @@ class Settings:
     # then waits on forever. A truly stuck command is caught by run_timeout instead.
     bash_default_timeout: int = int(os.environ.get("FACTORY_BASH_TIMEOUT", "600"))
     bash_max_timeout: int = int(os.environ.get("FACTORY_BASH_MAX_TIMEOUT", "1800"))
+    # How long an agent run may emit nothing at all before it is called stalled. 0 derives it
+    # from `bash_max_timeout` — see `run_idle`.
+    #
+    # This is a second, tighter ceiling than `run_timeout`, and it exists because a run that
+    # freezes silently is indistinguishable from one that is working until the 90-minute
+    # timeout finally fires. Two runs did exactly that, at 14 and 53 log lines, and the first
+    # thing anyone learned about either was an hour later.
+    run_idle: int = int(os.environ.get("FACTORY_RUN_IDLE", "0"))
     auto_destroy: int = int(os.environ.get("FACTORY_AUTO_DESTROY", "7200"))
     # The boxd account's concurrent-machine cap. Checked before provisioning, because past it
     # boxd refuses the create and the run that finds out is the one that dies. It counts the
@@ -174,23 +182,47 @@ class Settings:
             gaps.append("GITHUB_TOKEN (or `gh auth login`)")
         return gaps
 
+    def idle_timeout(self) -> int:
+        """Seconds of total silence that make a run stalled.
+
+        Derived rather than a flat default, because the only number it can safely sit above is
+        another setting. An agent may hold a single `Bash` call open for `bash_max_timeout`
+        without emitting one event, so anything at or below that reports a working build as a
+        stall — which is the failure this watchdog exists to avoid producing, not to commit.
+        The extra 900s is headroom for the tool call plus the turn that follows it.
+        """
+        return self.run_idle or self.bash_max_timeout + 900
+
     def problems(self, available: Iterable[str] = ()) -> list[str]:
         """What this configuration cannot run, given the golden snapshots that exist.
 
-        One question now, because there is one image to be missing. A repo with no golden of
-        its own is not a problem — it boots `golden-copy` and installs for itself, which is
-        the whole point of the fallback and is why connecting a repo never waits on
-        provisioning. A deployment with no `golden-copy` has nothing to boot at all.
+        Two questions now, and only the first stops every repo. A repo with no golden of its
+        own is not a problem — it boots `golden-copy` and installs for itself, which is the
+        whole point of the fallback and is why connecting a repo never waits on provisioning.
+        A deployment with no `golden-copy` has nothing to boot at all.
+
+        The second is a stall watchdog set below the longest command an agent is allowed to
+        run. It is reported rather than clamped: a threshold that quietly moves is one nobody
+        can reason about from the log line it produces, and this one's whole job is to say
+        something true about silence.
 
         Reported rather than raised: a missing snapshot is a thing to go build, not a broken
         setting, and the answer changes the moment somebody builds one.
         """
-        if agents.BASE_SNAPSHOT in tuple(available or ()):
-            return []
-        return [
-            f"no {agents.BASE_SNAPSHOT} snapshot — every run boots it unless the repo has a "
-            "warm golden of its own, so nothing can dispatch without it"
-        ]
+        found = []
+        if agents.BASE_SNAPSHOT not in tuple(available or ()):
+            found.append(
+                f"no {agents.BASE_SNAPSHOT} snapshot — every run boots it unless the repo has "
+                "a warm golden of its own, so nothing can dispatch without it"
+            )
+        if self.run_idle and self.run_idle <= self.bash_max_timeout:
+            found.append(
+                f"FACTORY_RUN_IDLE={self.run_idle}s is not above "
+                f"FACTORY_BASH_MAX_TIMEOUT={self.bash_max_timeout}s — one legitimate command "
+                "can be silent for longer than that, so runs will be failed as stalled while "
+                "they are still working"
+            )
+        return found
 
 
 settings = Settings()

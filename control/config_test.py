@@ -103,6 +103,35 @@ check("problems: and it is never reported as a missing setting",
       Settings(boxd_api_key="k", github_token="t", repos=repos("acme/api")).missing(), [])
 
 
+# ---------- the stall watchdog's threshold
+#
+# The one number in the system that can turn a working run into a false finding. An agent may
+# hold a single Bash call open for `bash_max_timeout` while emitting nothing, so a watchdog at
+# or below that reports a build in progress as a stall — the same class of error as a watch
+# script reading a failed ssh as a frozen log. So the default is derived from that setting
+# rather than written down beside it, and an override that undercuts it is *reported* rather
+# than clamped: a threshold that silently moves cannot be reasoned about from the line it
+# eventually prints.
+
+check("idle: the default sits a turn's headroom above the longest allowed command",
+      Settings(run_idle=0, bash_max_timeout=1800).idle_timeout(), 2700)
+check("idle: it follows bash_max_timeout rather than a number of its own",
+      Settings(run_idle=0, bash_max_timeout=600).idle_timeout(), 1500)
+check("idle: an explicit setting is honoured",
+      Settings(run_idle=3000, bash_max_timeout=1800).idle_timeout(), 3000)
+check("idle: a watchdog below the command ceiling is a problem, not a clamp",
+      Settings(run_idle=1200, bash_max_timeout=1800, repos=()).problems([BASE_SNAPSHOT]),
+      ["FACTORY_RUN_IDLE=1200s is not above FACTORY_BASH_MAX_TIMEOUT=1800s — one legitimate "
+       "command can be silent for longer than that, so runs will be failed as stalled while "
+       "they are still working"])
+check("idle: exactly equal is still too low — the ceiling is reachable",
+      len(Settings(run_idle=1800, bash_max_timeout=1800, repos=()).problems([BASE_SNAPSHOT])), 1)
+check("idle: above it, there is nothing to report",
+      Settings(run_idle=2400, bash_max_timeout=1800, repos=()).problems([BASE_SNAPSHOT]), [])
+check("idle: and the derived default never reports itself",
+      Settings(run_idle=0, bash_max_timeout=1800, repos=()).problems([BASE_SNAPSHOT]), [])
+
+
 print()
 if fails:
     print(f"{len(fails)} failed: " + ", ".join(fails))
