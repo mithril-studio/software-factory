@@ -24,9 +24,9 @@ Two tiers, not one, and the fallback is what makes connecting a repo cheap: a re
 golden of its own still dispatches onto `golden-copy` and installs for itself. Provisioning is
 a speed-up that can finish later, never a gate on the first run.
 
-Everything here is a pure function over strings apart from `available()`, which is the one
-place that talks to boxd. That is deliberate: dispatch decisions can then be tested without
-credentials, a VM, a database or a clock.
+Everything here is a pure function over strings apart from `available()` and `listed()`, which
+share the one place that talks to boxd. That is deliberate: dispatch decisions can then be
+tested without credentials, a VM, a database or a clock.
 """
 
 from __future__ import annotations
@@ -153,6 +153,12 @@ def api_rows(known: dict[str, dict]) -> list[dict]:
                 # machine, because asking the machine means booting it.
                 "agent": row.get("agent") or None,
                 "version": row.get("version") or None,
+                # `pending` with no version is a capture still being written; `pending` with
+                # one is a re-save, and the older version is still bootable. Only the first
+                # is a golden nothing can boot, which is why `ready` is not `status ==
+                # "ready"`.
+                "status": row.get("status") or None,
+                "ready": bool(row.get("version")),
                 "events": row.get("events") or None,
                 "agent_version": row.get("agent_version") or None,
                 # From the runs, not from a probe: `ok` is what the last run on this snapshot
@@ -167,8 +173,9 @@ def api_rows(known: dict[str, dict]) -> list[dict]:
     return out
 
 
-_cache: tuple[float, tuple[str, ...]] | None = None
+_cache: tuple[float, tuple[str, ...], tuple[str, ...]] | None = None
 _versions: dict[str, str] = {}
+_statuses: dict[str, str] = {}
 
 
 def version(name: str) -> str:
@@ -179,36 +186,79 @@ def version(name: str) -> str:
     for something already in hand. `""` means "the last listing did not include this name",
     which is the same answer as for a snapshot that never existed — the caller has no use
     for the difference.
+
+    It is also how "can this be restored?" is answered — see `available`.
     """
     return _versions.get(name, "")
 
 
-async def available(boxd) -> tuple[str, ...]:
-    """Golden snapshot names in the fleet, memoised for `CACHE_TTL` seconds.
+def status(name: str) -> str:
+    """What the last listing said `name` was doing: `ready`, `pending`, or `""` if unseen."""
+    return _statuses.get(name, "")
 
-    `boxd` is an `AsyncBoxd`, left untyped so this module imports no third-party package and
-    the rest of it can be exercised without one.
 
-    Status is deliberately not filtered on. Re-saving a golden bumps its version while the
-    previous one stays forkable, so dropping a name because a newer capture is in flight
-    would make a working golden vanish from discovery mid-poll.
+async def _listing(boxd) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`(every golden, the ones that can actually be restored)`, memoised for `CACHE_TTL`.
+
+    The split is the whole point, and it cost a run to learn. boxd reports one row per
+    snapshot *name*: `version` is the newest **ready** capture and `status` is what the name
+    is doing right now. So there are two distinct states that both read as "pending":
+
+    - a re-save of a golden that already has a ready version — the older one stays
+      restorable, and dropping the name would make a working golden vanish mid-poll;
+    - a **first** capture, `version=None` — there is nothing behind it to restore, and boxd
+      answers `create(from_snapshot=...)` with `ConflictError: snapshot is 'pending' (no
+      ready version yet)`.
+
+    Filtering on `status` alone gets the first case wrong; not filtering at all gets the
+    second one wrong, which is what happened the first time a repo's golden was provisioned
+    and dispatched onto seconds later: three attempts, no VM, the issue halted. Having a
+    version is exactly the question — "is there something here to boot" — so that is what is
+    asked.
     """
-    global _cache, _versions
+    global _cache, _versions, _statuses
     now = time.monotonic()
     if _cache and now - _cache[0] < CACHE_TTL:
-        return _cache[1]
+        return _cache[1], _cache[2]
     found = [s for s in await boxd.snapshots.list() if is_golden(s.name)]
     # Replaced wholesale, never merged: a listing is the whole truth about the fleet at that
     # moment, so a snapshot that has been deleted must leave with it rather than linger as a
     # version nobody can fork any more.
     _versions = {s.name: str(getattr(s, "version", "") or "") for s in found}
+    _statuses = {s.name: str(getattr(s, "status", "") or "") for s in found}
     names = tuple(sorted(s.name for s in found))
-    _cache = (now, names)
-    return names
+    ready = tuple(n for n in names if _versions.get(n))
+    _cache = (now, names, ready)
+    return names, ready
+
+
+async def available(boxd) -> tuple[str, ...]:
+    """Golden snapshots a run could boot right now.
+
+    `boxd` is an `AsyncBoxd`, left untyped so this module imports no third-party package and
+    the rest of it can be exercised without one.
+
+    This is the dispatch answer, so a capture with no ready version behind it is not in it —
+    see `_listing`. Preflight and `settings.problems` ask the same question for the same
+    reason: a golden that cannot be restored yet is one a run cannot use yet, and reporting
+    it as present is how a repo gets dispatched into a `ConflictError`.
+    """
+    return (await _listing(boxd))[1]
+
+
+async def listed(boxd) -> tuple[str, ...]:
+    """Every golden the fleet holds, restorable or not.
+
+    What the fleet view shows, and what the refresh loop records. A snapshot still capturing
+    is a thing the operator built and is waiting on; hiding it until it goes ready would make
+    the Goldens page answer "where did it go?" for the two minutes it matters most.
+    """
+    return (await _listing(boxd))[0]
 
 
 def forget() -> None:
-    """Drop the memoised listing, so the next `available()` re-reads the fleet."""
-    global _cache, _versions
+    """Drop the memoised listing, so the next lookup re-reads the fleet."""
+    global _cache, _versions, _statuses
     _cache = None
     _versions = {}
+    _statuses = {}

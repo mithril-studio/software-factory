@@ -55,7 +55,10 @@ async def refresh() -> dict[str, dict]:
         # The refresh is the one caller that must not read a memoised fleet: it exists to
         # notice change, and a listing up to `CACHE_TTL` old is exactly what it is looking for.
         agents.forget()
-        names = await agents.available(boxd)
+        # Everything the fleet holds, not just what a run could boot: a snapshot still being
+        # captured is a thing somebody built and is waiting on, and it should be visible while
+        # it is pending rather than appearing only once it goes ready.
+        names = await agents.listed(boxd)
     except Exception:  # noqa: BLE001 - a fleet nobody can list is nothing to record
         log.exception("could not list the golden snapshots")
         return {}
@@ -75,6 +78,10 @@ async def refresh() -> dict[str, dict]:
             # name implies. The name stopped implying anything when goldens became per-repo.
             "agent": manifest.get("agent"),
             "version": agents.version(name),
+            # What the fleet said the snapshot was doing. A `pending` with no version behind it
+            # cannot be restored at all — see `agents._listing` — and the page says so rather
+            # than showing a golden that would fail at the first dispatch.
+            "status": agents.status(name),
             # What the golden announced on the way into its last run. Read back from the
             # run rather than from the machine, because asking the machine means booting it.
             "events": manifest.get("events"),

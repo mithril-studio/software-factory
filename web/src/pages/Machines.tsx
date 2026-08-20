@@ -15,6 +15,9 @@ import { PageHeader, Empty, ErrorNote } from "@/components/Page"
  *  usage — its credential is what expires, and using one is the only test that proves anything.
  *  So "unproven" is a real third state and must not read as broken. */
 function Health({ a }: { a: Golden }) {
+  // Before anything the runs can say: a capture with nothing behind it yet cannot be booted at
+  // all, and reading "unproven" there sends you looking for a credential problem.
+  if (!a.ready) return <Badge variant="muted">capturing…</Badge>
   if (a.error) return <Badge variant="bad">{a.error}</Badge>
   if (a.verified_at) return <Badge variant="ok">verified {a.verified_at.slice(0, 10)}</Badge>
   if (a.ok) return <Badge variant="muted">ran, no usage</Badge>

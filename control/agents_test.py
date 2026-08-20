@@ -31,9 +31,11 @@ from control.agents import (
     forget,
     golden_name,
     is_golden,
+    listed,
     parse_golden,
     resolve_snapshot,
     slug,
+    status,
     version,
 )
 
@@ -175,8 +177,15 @@ check("api rows: a golden whose last run failed carries that error",
       (rows[1]["ok"], rows[1]["error"]), (False, "boom"))
 check("api rows: the columns are exactly what the page asks for",
       sorted(rows[0]),
-      ["agent", "agent_version", "base", "error", "events", "ok", "repo", "snapshot",
-       "verified_at", "version"])
+      ["agent", "agent_version", "base", "error", "events", "ok", "ready", "repo", "snapshot",
+       "status", "verified_at", "version"])
+check("api rows: a golden with a version is bootable whatever it is currently doing",
+      [(r["snapshot"], r["ready"]) for r in api_rows({
+          BASE_SNAPSHOT: {"version": "1", "status": "ready"},
+          "golden-a-b": {"version": "3", "status": "pending"},
+          "golden-c-d": {"version": None, "status": "pending"},
+      })],
+      [(BASE_SNAPSHOT, True), ("golden-a-b", True), ("golden-c-d", False)])
 check("api rows: the base row names no repo, because it serves every repo",
       rows[0]["repo"], None)
 check("api rows: a row that recorded no agent says so rather than guessing one from the name",
@@ -195,22 +204,31 @@ check("api rows: an empty table is an empty list, not an error", api_rows({}), [
 # ---------- available
 
 class FakeSnapshot:
-    def __init__(self, name, snapshot_version="1"):
+    """A snapshot as boxd reports it: one row per *name*.
+
+    `version` is the newest **ready** capture and `status` is what the name is doing right now,
+    so `(None, "pending")` and `(1, "pending")` are different states — see `agents._listing`.
+    """
+
+    def __init__(self, name, snapshot_version="1", snapshot_status="ready"):
         self.name = name
         self.version = snapshot_version
+        self.status = snapshot_status
 
 
 class FakeBoxd:
     """Stands in for AsyncBoxd. Counts calls, so the memoisation is observable."""
 
-    def __init__(self, names):
+    def __init__(self, names, snapshots=None):
         self.calls = 0
         self.snapshots = self
         self.names = list(names)
+        # name -> (version, status), for the ones that are not a plain ready capture.
+        self.detail = dict(snapshots or {})
 
     async def list(self):
         self.calls += 1
-        return [FakeSnapshot(n) for n in self.names]
+        return [FakeSnapshot(n, *self.detail.get(n, ("1", "ready"))) for n in self.names]
 
     async def close(self):
         pass
@@ -230,6 +248,45 @@ check("available: forgetting the cache re-reads the fleet", boxd.calls, 2)
 check("available: the version arrives with the listing, no second round trip",
       version(BASE_SNAPSHOT), "1")
 check("available: a name the listing never held has no version", version("golden-acme-api"), "")
+check("available: the status arrives with it too", status(BASE_SNAPSHOT), "ready")
+
+# The failure this split exists for. The first capture of a repo's golden has no ready version
+# behind it, and boxd answers `create(from_snapshot=...)` with
+# `ConflictError: snapshot is 'pending' (no ready version yet)`. It cost three attempts, no VM
+# and a halted issue the first time a golden was provisioned and dispatched onto seconds later.
+forget()
+capturing = FakeBoxd(
+    [BASE_SNAPSHOT, WARM],
+    snapshots={WARM: (None, "pending")},
+)
+check("capturing: a first capture is not something a run can boot",
+      asyncio.run(available(capturing)), (BASE_SNAPSHOT,))
+check("capturing: so the repo falls back to the base instead of failing at the fork",
+      resolve_snapshot(REPO, asyncio.run(available(capturing))), BASE_SNAPSHOT)
+check("capturing: but the fleet view still shows it, because somebody is waiting on it",
+      asyncio.run(listed(capturing)), tuple(sorted([BASE_SNAPSHOT, WARM])))
+check("capturing: and says what it is doing", status(WARM), "pending")
+check("capturing: with no version behind it", version(WARM), "")
+
+# The other `pending`, and the reason this is not a filter on `status`. A re-save captures a
+# new version while the previous one stays restorable — dropping the name would make a working
+# golden vanish from discovery mid-poll, which is the bug the old code was avoiding.
+forget()
+resaving = FakeBoxd([BASE_SNAPSHOT, WARM], snapshots={WARM: ("3", "pending")})
+check("re-save: a golden being re-captured is still bootable on its previous version",
+      asyncio.run(available(resaving)), tuple(sorted([BASE_SNAPSHOT, WARM])))
+check("re-save: and the repo still resolves onto it",
+      resolve_snapshot(REPO, asyncio.run(available(resaving))), WARM)
+check("re-save: the version reported is the ready one, not the one in flight",
+      version(WARM), "3")
+
+forget()
+before_calls = capturing.calls
+asyncio.run(available(capturing))
+asyncio.run(listed(capturing))
+check("capturing: one fleet read answers both questions", capturing.calls - before_calls, 1)
+check("forget: clears the statuses as well as the versions",
+      (forget(), status(WARM), version(WARM))[1:], ("", ""))
 
 # A snapshot somebody deleted must leave the answer, not linger in a cache. This is what stops
 # a dispatch resolving onto a golden that is no longer forkable.
