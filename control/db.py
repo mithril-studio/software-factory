@@ -103,6 +103,27 @@ CREATE TABLE IF NOT EXISTS snapshots (
     verified_at   TEXT,
     checked_at    TEXT NOT NULL
 );
+
+-- Admission control between an agent noticing something and the factory treating it as
+-- durable truth. A candidate is evidence-backed, scoped to the run and repo that produced
+-- it, and sits in `pending` until something (not this table) decides to accept or reject it.
+-- Nothing here writes to a repo's own `.mem/` — that stays a later step's job.
+CREATE TABLE IF NOT EXISTS memory_candidates (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    repo        TEXT NOT NULL,
+    domain      TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT,
+    evidence    TEXT,
+    confidence  TEXT,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_candidates_repo_idx ON memory_candidates (repo);
+CREATE INDEX IF NOT EXISTS memory_candidates_status_idx ON memory_candidates (status);
 """
 
 # Additive migrations for databases created before a column existed. Each is tried once at
@@ -369,3 +390,86 @@ async def active_runs() -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- memory candidates
+
+# The only transitions a pending candidate may make. Both destinations are terminal — neither
+# key appears on the left below, so a second transition of any kind is rejected rather than
+# silently accepted.
+CANDIDATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "pending": ("accepted", "rejected"),
+}
+
+
+async def create_candidate(**fields: Any) -> None:
+    """Insert a candidate, or leave an already-inserted one exactly as it is.
+
+    `INSERT OR IGNORE` on the primary key: resubmitting the same candidate id (an agent
+    retrying, or a run observing the same evidence twice) must not duplicate it or reset a
+    status a reviewer has already moved on from.
+    """
+    fields = {"status": "pending", **fields}
+    now = utcnow()
+    fields.setdefault("created_at", now)
+    fields.setdefault("updated_at", now)
+    cols = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    async with connect() as conn:
+        await conn.execute(
+            f"INSERT OR IGNORE INTO memory_candidates ({cols}) VALUES ({marks})",
+            tuple(fields.values()),
+        )
+        await conn.commit()
+
+
+async def get_candidate(candidate_id: str) -> dict | None:
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM memory_candidates WHERE id = ?", (candidate_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_candidates(repo: str | None = None, status: str | None = None) -> list[dict]:
+    """Candidates oldest first, optionally scoped to a repo and/or a status."""
+    clauses = []
+    params: list[Any] = []
+    if repo is not None:
+        clauses.append("repo = ?")
+        params.append(repo)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    async with connect() as conn:
+        async with conn.execute(
+            f"SELECT * FROM memory_candidates{where} ORDER BY created_at", params
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def transition_candidate(candidate_id: str, to_status: str) -> dict:
+    """Move a candidate along an explicitly allowed edge, or raise.
+
+    Every candidate starts `pending`; `accepted` and `rejected` are terminal, so this is the
+    only place a status ever changes. Raising rather than returning a bool means a caller
+    cannot mistake "already there" for "just happened" — the two are different bugs.
+    """
+    candidate = await get_candidate(candidate_id)
+    if candidate is None:
+        raise ValueError(f"no such candidate: {candidate_id}")
+    current = candidate["status"]
+    allowed = CANDIDATE_TRANSITIONS.get(current, ())
+    if to_status not in allowed:
+        raise ValueError(f"cannot transition candidate {candidate_id} from {current} to {to_status}")
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE memory_candidates SET status = ?, updated_at = ? WHERE id = ?",
+            (to_status, utcnow(), candidate_id),
+        )
+        await conn.commit()
+    candidate["status"] = to_status
+    return candidate

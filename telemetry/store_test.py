@@ -45,18 +45,41 @@ def run(coro):
 
 run(store.write_memory_reads(
     "run-1",
-    [("mem_aaaa", "database", "2026-08-20T10:00:00Z"),
-     ("mem_bbbb", "auth", "2026-08-20T10:00:01Z")],
+    [("mem_aaaa", "2026-08-20T10:00:00Z"),
+     ("mem_bbbb", "2026-08-20T10:00:01Z")],
 ))
 rows = run(store.memory_reads_for_run("run-1"))
 check("both retrieved records come back", [r["memory_id"] for r in rows],
       ["mem_aaaa", "mem_bbbb"])
-check("the domain is preserved", [r["domain"] for r in rows], ["database", "auth"])
+# A read row carries no domain at all. The receipt names domains as a set over the run, with
+# no mapping back to individual records, so any per-row domain would be a guess written down
+# as a fact — the defect this table was reshaped to make unrepresentable.
+check("a read row cannot claim a domain", "domain" in dict(rows[0]), False)
+
+
+# ---------- AC2: the domains a run drew from, at run level
+
+run(store.write_memory_receipt("run-1", 9, ["repository", "auth"], "2026-08-20T10:00:03Z"))
+receipt = run(store.memory_receipt_for_run("run-1"))
+check("the receipt records how big the index was", receipt["indexed"], 9)
+check("both domains survive, neither collapsed into the other",
+      sorted(receipt["domains"]), ["auth", "repository"])
+run(store.write_memory_receipt("run-1", 10, ["repository"], "2026-08-20T10:00:04Z"))
+check("a second receipt corrects the first rather than duplicating the run",
+      run(store.memory_receipt_for_run("run-1"))["indexed"], 10)
+check("a run that filed no receipt reads back empty, not an error",
+      run(store.memory_receipt_for_run("run-nothing")), {})
+
+# The migration is what makes this work on a box whose table predates the change; it must be
+# safe to apply to a database that has already had it applied.
+run(store.init())
+run(store.init())
+check("init is idempotent across the column drop", run(store.memory_receipt_for_run("run-1"))["indexed"], 10)
 
 
 # ---------- AC2: memory reads are idempotent
 
-run(store.write_memory_reads("run-1", [("mem_aaaa", "database", "2026-08-20T10:00:02Z")]))
+run(store.write_memory_reads("run-1", [("mem_aaaa", "2026-08-20T10:00:02Z")]))
 rows = run(store.memory_reads_for_run("run-1"))
 check("writing the same record again leaves one row",
       len([r for r in rows if r["memory_id"] == "mem_aaaa"]), 1)
@@ -66,7 +89,7 @@ check("the first write's timestamp is kept, not overwritten",
 
 # ---------- AC3: memory reads retain run scope
 
-run(store.write_memory_reads("run-2", [("mem_aaaa", "database", "2026-08-20T11:00:00Z")]))
+run(store.write_memory_reads("run-2", [("mem_aaaa", "2026-08-20T11:00:00Z")]))
 run1_ids = [r["memory_id"] for r in run(store.memory_reads_for_run("run-1"))]
 run2_ids = [r["memory_id"] for r in run(store.memory_reads_for_run("run-2"))]
 check("run-1 still has its own rows", run1_ids, ["mem_aaaa", "mem_bbbb"])
@@ -81,7 +104,7 @@ check("a run with no retrievals reads back empty", run(store.memory_reads_for_ru
 
 # ---------- usage includes memory reads
 
-run(store.write_memory_reads("run-4", [("mem_cccc", "database", "2026-08-20T12:00:00Z")]))
+run(store.write_memory_reads("run-4", [("mem_cccc", "2026-08-20T12:00:00Z")]))
 usage = run(store.usage_for_run("run-4"))
 check("usage for a run with no llm calls still reports its memory reads",
       [r["memory_id"] for r in usage["memory"]], ["mem_cccc"])
@@ -120,10 +143,13 @@ async def seed_repo_metrics():
 
 
 run(seed_repo_metrics())
-run(store.write_memory_reads("run-repo-a-1", [("mem_dddd", "database", "2026-08-20T12:00:00Z")]))
-run(store.write_memory_reads("run-repo-a-2", [("mem_dddd", "database", "2026-08-20T12:00:01Z"),
-                                               ("mem_eeee", "auth", "2026-08-20T12:00:02Z")]))
-run(store.write_memory_reads("run-repo-b-1", [("mem_ffff", "database", "2026-08-20T12:00:03Z")]))
+run(store.write_memory_reads("run-repo-a-1", [("mem_dddd", "2026-08-20T12:00:00Z")]))
+run(store.write_memory_reads("run-repo-a-2", [("mem_dddd", "2026-08-20T12:00:01Z"),
+                                              ("mem_eeee", "2026-08-20T12:00:02Z")]))
+run(store.write_memory_reads("run-repo-b-1", [("mem_ffff", "2026-08-20T12:00:03Z")]))
+run(store.write_memory_receipt("run-repo-a-1", 4, ["database"], "2026-08-20T12:00:00Z"))
+run(store.write_memory_receipt("run-repo-a-2", 4, ["database", "auth"], "2026-08-20T12:00:02Z"))
+run(store.write_memory_receipt("run-repo-b-1", 4, ["database"], "2026-08-20T12:00:03Z"))
 
 by_repo = {row["repo"]: row for row in run(store.memory_metrics_by_repo())}
 check("both repositories with memory reads are reported", sorted(by_repo), ["org/a", "org/b"])
@@ -133,6 +159,11 @@ check("org/a's distinct records are not double-counted across its two runs",
 check("org/b counts its own run only", by_repo["org/b"]["runs_with_memory"], 1)
 check("org/b's distinct records are not attributed to org/a",
       by_repo["org/b"]["distinct_records"], 1)
+# The old per-row column would have reported org/a as `database` only, because `database`
+# was the first domain of the first receipt and every row inherited it.
+check("org/a reports every domain its runs drew from, not just the first",
+      by_repo["org/a"]["domains"], ["auth", "database"])
+check("org/b's domains are its own", by_repo["org/b"]["domains"], ["database"])
 check("every repo with memory reads has a positive average cost",
       all(row["avg_derived_cost_usd"] > 0 for row in by_repo.values()))
 

@@ -200,6 +200,15 @@ class StartRun(BaseModel):
     # resetting it to the base and throwing the previous attempt's commits away. For a
     # review: which review cycle.
     attempt: int = 1
+    # Why this attempt is happening, and what the last one produced. The automatic paths — a
+    # retry after a failure, a fix run after a red CI or a reviewer that requested changes —
+    # already carry both into the next prompt (`runner._fix_cycle`, `runner._fail_run`). A run
+    # started by hand had no way to, so resuming an `agent:blocked` issue meant dispatching an
+    # agent onto the branch with "reason not captured" and no idea what it was meant to change.
+    # That made `agent:blocked` a dead end: the label halts the repo, and the only way past it
+    # was to fix the code yourself. With these, a human unblocks an issue by saying what to do.
+    prior_error: str | None = None
+    prior_log: str | None = None
 
 
 @app.post("/api/runs")
@@ -223,7 +232,13 @@ async def api_start_run(body: StartRun):
                 repo, body.issue_number, body.pr_url, body.branch, cycle=body.attempt
             )
         elif body.kind == "build":
-            run_id = await runner.create(repo, body.issue_number, attempt=body.attempt)
+            run_id = await runner.create(
+                repo,
+                body.issue_number,
+                attempt=body.attempt,
+                prior_error=body.prior_error,
+                prior_log=body.prior_log,
+            )
         elif body.kind == "provision":
             run_id = await provision.create(repo)
         else:

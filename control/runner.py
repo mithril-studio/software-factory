@@ -340,13 +340,16 @@ async def _persist_memory_receipt(run_id: str, receipt: dict, log: RunLog) -> No
         return
     try:
         ts = db.utcnow()
-        # The receipt names the domains it drew from as a set, not a per-record mapping,
-        # so a row can only be attributed to *a* domain the run touched, not to a
-        # specific one it does not name; the first is close enough to be useful and
-        # honest about what it is not.
-        domain = next(iter(receipt.get("domains") or []), None)
+        # Two writes, at the two levels the receipt actually speaks at: one row per record it
+        # opened, and one row for the run saying how big the index was and which domains it
+        # drew from. The domains are not split across the records — the receipt names them as
+        # a set and says nothing about which record came from which — so nothing here picks
+        # one, and nothing can pick wrong.
         await telemetry_store.write_memory_reads(
-            run_id, [(memory_id, domain, ts) for memory_id in opened]
+            run_id, [(memory_id, ts) for memory_id in opened]
+        )
+        await telemetry_store.write_memory_receipt(
+            run_id, receipt.get("indexed") or 0, receipt.get("domains") or [], ts
         )
     except Exception as exc:  # noqa: BLE001 - telemetry must never fail an otherwise good run
         log.write(f"[factory] memory receipt not recorded: {exc!r}")
@@ -1506,8 +1509,19 @@ async def _execute(
         link = _run_link(run_id)
         if link:
             started += f"\n\nLive log: {link}"
+        # Clear every label that means "stopped", not just `agent:queued`. A run dispatched by
+        # hand onto a blocked or failed issue used to leave that label in place, and the poller
+        # halts a repo while any open issue carries one — so an issue that was resumed and fixed
+        # went on halting every issue behind it unless it happened to close. Whatever the run
+        # goes on to do will set the right label at the end; while it is running, none of these
+        # is true.
         await _mirror_issue(
-            repo, number, github.LABEL_RUNNING, [github.LABEL_QUEUED], log, comment=started
+            repo,
+            number,
+            github.LABEL_RUNNING,
+            [github.LABEL_QUEUED, github.LABEL_BLOCKED, github.LABEL_FAILED],
+            log,
+            comment=started,
         )
 
         # ---- provision

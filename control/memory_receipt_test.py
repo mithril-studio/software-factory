@@ -184,16 +184,18 @@ RESULT_EVENT = json.dumps({
 STDOUT = f"{ASSISTANT_EVENT}\n{RESULT_EVENT}\n"
 
 
-def run_stream(text, write_memory_reads):
+def run_stream(text, write_memory_reads, write_memory_receipt=None):
     """Drive `_stream` over one canned stdout, stubbing the recorder, the database, and the
-    telemetry write the receipt would trigger."""
+    two telemetry writes the receipt would trigger."""
     log = Log()
     real_recorder = runner.Recorder
     real_update = runner.db.update_run
     real_write = runner.telemetry_store.write_memory_reads
+    real_receipt = runner.telemetry_store.write_memory_receipt
     runner.Recorder = StubRecorder
     runner.db.update_run = lambda *a, **k: _noop()
     runner.telemetry_store.write_memory_reads = write_memory_reads
+    runner.telemetry_store.write_memory_receipt = write_memory_receipt or _capture_nothing
     try:
         code, usage, manifest = asyncio.run(
             runner._stream(StubBoxd(text), "vm-1", {}, log, "run-1")
@@ -202,7 +204,12 @@ def run_stream(text, write_memory_reads):
         runner.Recorder = real_recorder
         runner.db.update_run = real_update
         runner.telemetry_store.write_memory_reads = real_write
+        runner.telemetry_store.write_memory_receipt = real_receipt
     return code, usage, log.lines
+
+
+async def _capture_nothing(*args, **kwargs):
+    return None
 
 
 async def _noop():
@@ -226,6 +233,10 @@ check("stream persists receipt: written against the run that produced it",
       persisted_run_id, "run-1")
 check("stream persists receipt: one row per opened memory record",
       [r[0] for r in persisted_reads], RECEIPT["opened"])
+# The shape is the assertion. A read row is `(memory_id, ts)` and nothing else, so there is
+# no per-record domain slot for the receipt's set of domains to be guessed into.
+check("stream persists receipt: a read row is an id and a timestamp, nothing more",
+      {len(r) for r in persisted_reads}, {2})
 check("stream persists receipt: the run's result is unchanged",
       (code, usage.get("tokens_in"), usage.get("tokens_out")), (0, 10, 2))
 
@@ -233,6 +244,24 @@ writes.clear()
 run_stream(f"{ASSISTANT_EVENT}\n{ASSISTANT_EVENT}\n{RESULT_EVENT}\n", capture)
 check("stream persists receipt: a repeated receipt line in one run writes only once",
       len(writes), 1)
+
+
+# ---------- AC2: the domains go to the run, whole
+
+receipts = []
+
+
+async def capture_receipt(run_id, indexed, domains, ts=None):
+    receipts.append((run_id, indexed, list(domains)))
+
+
+writes.clear()
+run_stream(STDOUT, capture, capture_receipt)
+check("stream persists receipt: exactly one receipt row for the run", len(receipts), 1)
+check("stream persists receipt: it is the run that produced it", receipts[0][0], "run-1")
+check("stream persists receipt: the indexed count is carried", receipts[0][1], RECEIPT["indexed"])
+check("stream persists receipt: every domain the run drew from, not the first",
+      receipts[0][2], RECEIPT["domains"])
 
 
 # ---------- AC4: receipt persistence is best effort
