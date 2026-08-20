@@ -5,3 +5,4 @@
 {"id":"mem_d79c","domain":"repository","type":"decision","title":"Control plane runs on a Hetzner VM under systemd, not on boxd itself","files":["README.md","scripts/deploy.sh"]}
 {"id":"mem_c17a","domain":"repository","type":"convention","title":"One GitHub credential serves the control plane and every run VM, and it needs repo + workflow","files":["control/config.py","control/runner.py","control/github.py","control/preflight.py"]}
 {"id":"mem_5f2b","domain":"repository","type":"pattern","title":"Goldens are named for the repo, not the agent; the base is golden-copy","files":["control/agents.py","control/runner.py","control/preflight.py","scripts/refresh-golden.sh"]}
+{"id":"mem_9e41","domain":"repository","type":"convention","title":"Watched repos are a DB register with a sync cache; nothing about a golden gates dispatch","files":["control/repos.py","control/provision.py","control/poller.py"]}

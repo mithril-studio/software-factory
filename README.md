@@ -296,12 +296,16 @@ so it is the one place that says how *this* project is set up and how it is veri
 
 ### `## Setup`
 
-The single highest-value line in the file. A golden is an agent image, not a project image:
-it carries the toolchains and a warm package-manager download cache, and nothing installed
-for your repo. The prompt sends the agent to run this command once, in the foreground, before
-it touches any code — so naming it here is the difference between one install and a run that
-spends turns discovering it needs one, guessing a command, and re-reading its whole context
-between each guess.
+The single highest-value line in the file, and now the one the control plane reads too. The
+base golden carries toolchains and a warm package-manager download cache and nothing installed
+for your repo, so the prompt sends the agent to run this command once, in the foreground,
+before it touches any code — the difference between one install and a run that spends turns
+discovering it needs one, guessing a command, and re-reading its whole context between each
+guess.
+
+It is also what warming this repo's own golden runs, so a repo that names one gets that install
+done once into a snapshot instead of once per run. A repo that names none is not provisioned at
+all rather than provisioned with a guess.
 
 Name the command, and say roughly how long it takes so the agent picks a sane timeout. Put it
 above the verify commands: it runs first, and a file is read in the order it is written.
@@ -335,9 +339,10 @@ FastAPI — one deployable, at the cost of a `vite build` step. It reads the JSO
   one that has hung.
 - **Plan** — open issues across watched repos with their factory state, in the order the
   poller works them.
-- **Projects** — watched repos with run tallies, the agent each one dispatches to, and
-  whether that agent has a warm snapshot for it.
-- **Agents** — two tables, because they stopped being one question when goldens became
+- **Projects** — watched repos with run tallies and the golden each one boots, and where a
+  repo is connected: name it, read what preflight says, connect. Per row: warm or rebuild its
+  golden, drop it, or disconnect the repo.
+- **Goldens** — two tables, because they stopped being one question when goldens became
   snapshots. What the factory *can boot*: every golden snapshot (`/api/goldens`), its version,
   its telemetry adapter, and whether a run has ever proved its credentials. What *is* running:
   the boxd machines (`/api/machines`), by role, orphans flagged, with a reconcile button.
@@ -355,8 +360,10 @@ Named so they stay unbuilt until something proves they are needed:
   proven against real records.
 - No `ExecutionBackend` abstraction. The control plane talks to boxd concretely; the
   interface gets extracted when a second backend exists.
-- No issue polling yet. Runs are started from the UI.
 - No queue broker, no webhooks.
+- No second agent. One base image, and which agent it runs is what the image announces about
+  itself. A second agent needs a second base image and a way to choose between them; neither
+  exists until something needs it.
 
 ## Docs
 
