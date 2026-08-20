@@ -8,3 +8,4 @@
 {"id":"mem_9e41","domain":"repository","type":"convention","title":"Watched repos are a DB register with a sync cache; nothing about a golden gates dispatch","files":["control/repos.py","control/provision.py","control/poller.py"]}
 {"id":"mem_37db","domain":"repository","type":"convention","title":"telemetry/config.py's db_path is a plain module attribute, not a frozen settings object","files":["telemetry/config.py","telemetry/store.py","telemetry/store_test.py"]}
 {"id": "mem_6a59", "domain": "repository", "type": "pattern", "title": "Priming receipts are one FACTORY_MEMORY log line, parsed permissively and never persisted", "files": ["control/runner.py", "control/prompt_profile_test.py", "control/memory_receipt_test.py"]}
+{"id":"mem_f402","domain":"repository","type":"pattern","title":"Admission-control tables live in control/db.py as INSERT OR IGNORE plus a transition-edge dict","files":["control/db.py","control/memory_candidates_test.py"]}
