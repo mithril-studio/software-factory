@@ -230,7 +230,15 @@ re-snapshot it under the same name.
    `scripts/build-golden.sh` (above). A repo does not need a golden of its own; `golden-copy`
    serves every repo that has none. A warm `golden-<owner-repo>` is optional and only makes
    runs faster.
-2. Add it to `FACTORY_REPOS` as `owner/repo`.
+2. Connect it: `POST /api/repos {"repo": "owner/name"}`. Preflight runs first and a blocking
+   failure refuses the connection with its checks in the response. On success the repo is in
+   the register, its lifecycle labels exist, and the poller picks it up on its next tick —
+   **no restart and no `.env` edit.** `DELETE /api/repos/owner/name` disconnects it again; its
+   runs stay, because they are the ledger of what was spent and shipped rather than
+   configuration.
+
+   `FACTORY_REPOS` is now the *seed* for that register: entries are added on boot if they are
+   not already there, and removing one does not unwatch the repo.
 3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
    without checks, auto-merge can never pass its gate and every pull request waits for a
    human.

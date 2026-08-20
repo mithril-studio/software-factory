@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from telemetry import store as telemetry
 
-from . import agents, auth, db, github, goldens, poller, preflight, runner
+from . import agents, auth, db, github, goldens, poller, preflight, repos, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -30,6 +30,9 @@ DIST = ROOT / "web" / "dist"
 async def lifespan(app: FastAPI):
     await db.init()
     await telemetry.init()
+    # Before the poller, and before the first request: everything that asks which repos are
+    # watched reads a cache, and the cache is empty until this has run.
+    await repos.seed()
     poller.start()
     goldens.start()
     try:
@@ -115,7 +118,7 @@ async def api_config():
     """
     available = await _available()
     return {
-        "repos": list(settings.repos),
+        "repos": list(repos.watched()),
         "max_concurrent": settings.max_concurrent,
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
@@ -266,9 +269,9 @@ async def api_plan(repo: str | None = None):
 
     One repo if `repo` is given, otherwise every watched repo, concatenated.
     """
-    repos = [repo] if repo else list(settings.repos)
+    targets = [repo] if repo else list(repos.watched())
     out: list[dict] = []
-    for r in repos:
+    for r in targets:
         try:
             out.extend(await github.plan(r))
         except Exception as exc:  # noqa: BLE001 - one bad repo shouldn't blank the page
@@ -308,27 +311,92 @@ async def api_preflight(repo: str):
     }
 
 
+class ConnectRepo(BaseModel):
+    repo: str
+
+
+def _checks_json(checks) -> list[dict]:
+    return [{"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks]
+
+
+@app.post("/api/repos")
+async def api_connect_repo(body: ConnectRepo):
+    """Watch a repo from now on. The only supported way to connect one.
+
+    Preflight runs first and a blocking failure refuses the connection, with its checks in the
+    response so the caller can say *which* one. That is stricter than it looks: warnings do not
+    block, and "no warm golden yet" is not a failure at all — a repo dispatches onto
+    `golden-copy` and installs for itself, so connecting one never waits on provisioning.
+    What does block is a repo the token cannot read or push to, which would spend a VM and an
+    agent's whole context to discover the same thing.
+
+    Preflight also creates the lifecycle labels on its way through, which makes this the whole
+    of connecting a repo: no restart, no `.env` edit, no shell on the box.
+    """
+    repo = body.repo.strip()
+    if not repos.valid(repo):
+        raise HTTPException(400, f"{repo!r} is not owner/repo")
+    if repo in repos.watched():
+        raise HTTPException(409, f"{repo} is already watched")
+    try:
+        checks = await preflight.run(repo)
+    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
+        raise HTTPException(400, f"could not check {repo}: {exc}") from exc
+    blocking = [c for c in checks if not c.ok and c.fatal]
+    if blocking:
+        raise HTTPException(
+            400,
+            {
+                "message": f"{repo} is not ready: " + ", ".join(c.name for c in blocking),
+                "checks": _checks_json(checks),
+            },
+        )
+    await repos.add(repo)
+    return {"repo": repo, "checks": _checks_json(checks)}
+
+
+@app.delete("/api/repos/{owner}/{name}")
+async def api_disconnect_repo(owner: str, name: str):
+    """Stop watching a repo. Its runs stay — they are the ledger, not the configuration.
+
+    Two path segments rather than one encoded parameter, because `owner/repo` carries a slash
+    and a client that forgets to encode it would otherwise hit a route that does not exist and
+    read the 404 as "already gone".
+    """
+    repo = f"{owner}/{name}"
+    if not await repos.remove(repo):
+        raise HTTPException(404, f"{repo} is not watched")
+    return {"repo": repo, "removed": True}
+
+
 @app.get("/api/projects")
 async def api_projects():
     """Watched repos with their run tallies and the snapshot their runs boot."""
+    watched = repos.rows()
     stats = await db.stats_by_repo()
     # Derived the same way a dispatch derives it, rather than by reading a name off a config
     # value — otherwise this column would say what the repo was configured with where the
     # fleet views say what would actually boot.
     boxd = runner.client()
     try:
-        sources = {repo: await runner.source_for(boxd, repo) for repo in settings.repos}
+        sources = {r["repo"]: await runner.source_for(boxd, r["repo"]) for r in watched}
     except Exception:  # noqa: BLE001 - a boxd outage costs a column, not the page
         sources = {}
     finally:
         await boxd.close()
     out = []
-    for repo in settings.repos:
+    for row in watched:
+        repo = row["repo"]
         golden = sources.get(repo, "")
         s = stats.get(repo, {})
         out.append(
             {
                 "repo": repo,
+                "added_at": row.get("added_at"),
+                # What provisioning a warm golden for this repo did, which is not the same
+                # question as what its runs boot: a repo whose provisioning failed still
+                # dispatches onto the base, so this is a report and never a gate.
+                "provision_status": row.get("provision_status") or "none",
                 "golden": golden,
                 # Whether the snapshot that boots is this repo's own warm tier rather than
                 # the base image. Decided here, where the naming contract lives.

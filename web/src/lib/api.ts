@@ -46,6 +46,11 @@ export type PlanIssue = {
 
 export type Project = {
   repo: string
+  /** When it was connected. */
+  added_at: string | null
+  /** What provisioning a warm golden for this repo did — `none`, `running`, `ready`,
+   *  `failed`. A report, never a gate: a repo dispatches onto `golden-copy` either way. */
+  provision_status: string
   /** The snapshot this repo's runs actually boot. */
   golden: string
   /** True when that snapshot is this repo's own warm tier rather than the `golden-copy` base.
@@ -165,9 +170,17 @@ function onUnauthorized() {
   }
 }
 
+/** The server's explanation of a refusal.
+ *
+ *  `POST /api/repos` answers a blocking preflight with `{detail: {message, checks}}` rather
+ *  than a sentence, because the caller wants to render which check failed. Reading `.detail`
+ *  blindly would put `[object Object]` in front of the user at exactly that moment. */
 async function detail(resp: Response): Promise<string> {
   try {
-    return (await resp.json()).detail ?? resp.statusText
+    const body = (await resp.json()).detail
+    if (typeof body === "string") return body
+    if (body && typeof body === "object" && typeof body.message === "string") return body.message
+    return resp.statusText
   } catch {
     return resp.statusText
   }
@@ -188,6 +201,15 @@ export async function post<T>(url: string, body?: unknown): Promise<T> {
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   })
+  if (!resp.ok) {
+    if (resp.status === 401) onUnauthorized()
+    throw new Error(await detail(resp))
+  }
+  return resp.json()
+}
+
+export async function del<T>(url: string): Promise<T> {
+  const resp = await fetch(url, { method: "DELETE" })
   if (!resp.ok) {
     if (resp.status === 401) onUnauthorized()
     throw new Error(await detail(resp))

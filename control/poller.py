@@ -4,6 +4,10 @@ This is discovery only — it decides *what to pick up next*, nothing about the 
 The runner owns the whole run lifecycle and mirrors state back onto the issue; this loop
 just finds the next issue and hands it over.
 
+Which repos it watches comes from `repos.watched()`, not from configuration, so a repo
+connected through the API is picked up on the next tick without a restart. The loop runs even
+when nothing is watched yet, for the same reason: the list it reads can change under it.
+
 The contract with whoever files work (a human today, a composer later) is a single label:
 drop `agent:queued` on an open issue and the factory builds it. Issues are claimed lowest
 number first, and a repo runs one issue at a time — so a numbered sequence executes in
@@ -17,15 +21,35 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import db, github, runner
+from . import db, github, repos, runner
 from .config import settings
 
 log = logging.getLogger("factory.poller")
 
 _task: asyncio.Task | None = None
 
+# Repos whose lifecycle labels have been created. Kept because a repo can now be connected
+# while the loop is running, so this cannot happen once at startup — and because
+# `ensure_labels` is five POSTs, which is fine once per repo and wasteful every thirty
+# seconds forever. Idempotent either way; this is about the request budget, not correctness.
+_labelled: set[str] = set()
+
+
+async def _ensure_labels_once(repo: str) -> None:
+    """Create the lifecycle labels the first time this process sees `repo`.
+
+    Best-effort: a repo we cannot touch yet is skipped and retried on the next tick, rather
+    than stopping the poll. The label writes a dispatch does would fail on a repo that has
+    never seen the factory, which is what this prevents.
+    """
+    if repo in _labelled:
+        return
+    await github.ensure_labels(repo)
+    _labelled.add(repo)
+
 
 async def _poll_repo(repo: str) -> None:
+    await _ensure_labels_once(repo)
     # One run per repo at a time. This is what makes a numbered issue list sequential:
     # #2 does not start until #1 has reached a terminal state (its retries included).
     if await db.has_active_run(repo):
@@ -53,7 +77,7 @@ async def _poll_repo(repo: str) -> None:
 
 
 async def _tick() -> None:
-    for repo in settings.repos:
+    for repo in repos.watched():
         try:
             await _poll_repo(repo)
         except Exception:  # noqa: BLE001 - one bad repo must not stop the loop
@@ -61,26 +85,22 @@ async def _tick() -> None:
 
 
 async def _loop() -> None:
-    # Create the lifecycle labels once so the first dispatch's label writes can't fail on a
-    # repo that has never seen the factory. Best-effort: a repo we can't touch yet is skipped.
-    for repo in settings.repos:
-        try:
-            await github.ensure_labels(repo)
-        except Exception:  # noqa: BLE001
-            log.exception("could not ensure labels on %s", repo)
-
-    log.info("polling %s every %ss", ", ".join(settings.repos), settings.poll_interval)
+    log.info("polling every %ss: %s", settings.poll_interval, ", ".join(repos.watched()) or "nothing yet")
     while True:
         await _tick()
         await asyncio.sleep(settings.poll_interval)
 
 
 def start() -> None:
-    """Launch the poll loop, unless polling is off or no repos are configured."""
+    """Launch the poll loop, unless polling is switched off.
+
+    Not conditional on anything being watched. It used to be, which meant a deployment that
+    booted with an empty register never polled — and connecting a repo through the API would
+    have needed a restart to take effect, which is the whole thing this was supposed to stop
+    needing. An empty tick costs nothing.
+    """
     global _task
-    if _task is not None:
-        return
-    if not settings.poll_enabled or not settings.repos:
+    if _task is not None or not settings.poll_enabled:
         return
     _task = asyncio.create_task(_loop())
 
