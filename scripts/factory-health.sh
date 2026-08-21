@@ -8,6 +8,13 @@
 # the Hetzner box the control plane is moving to, so this keeps working across that move;
 # only FACTORY_URL changes.
 #
+# It asks two different questions, and for a while it only asked the first. *Could* the factory
+# dispatch — is the control plane up, is the fleet listable, is there a golden — and *is* it
+# dispatching. On 2026-08-20 an issue exhausted its retries, `FACTORY_HALT_ON_FAILURE` stopped
+# the repo, and the queue sat frozen for nineteen hours while six consecutive runs of this
+# script reported success: every "could" was still true. A monitor that cannot go red while
+# nothing is being built is not monitoring the thing anybody cares about.
+#
 # Reads FACTORY_URL, FACTORY_EMAIL, FACTORY_PASSWORD from the environment. Writes a markdown
 # report to stdout. Exits 0 when the factory could dispatch, 1 when it could not.
 #
@@ -70,8 +77,16 @@ fi
 # `// "unknown"` would be wrong here: jq's alternative operator fires on `false` as well as
 # on null, and `false` is the answer this field gives most often.
 poll=$(printf '%s' "$config" | jq -r 'if has("poll_enabled") then .poll_enabled else "unknown" end' 2>/dev/null)
-echo "Polling: \`$poll\`. Watched repos: \`$(printf '%s' "${repos:-none}" | tr '\n' ' ')\`"
+halt=$(printf '%s' "$config" | jq -r 'if has("halt_on_failure") then .halt_on_failure else "unknown" end' 2>/dev/null)
+echo "Polling: \`$poll\`. Halt on failure: \`$halt\`. Watched repos: \`$(printf '%s' "${repos:-none}" | tr '\n' ' ')\`"
 echo
+
+# Polling off is not a nuance to bury in a line of prose: nothing will ever be picked up.
+if [ "$poll" = "false" ]; then
+  echo "**Polling is off.** No queued issue will be dispatched until \`FACTORY_POLL=1\`."
+  echo
+  fail
+fi
 
 if [ -z "$repos" ]; then
   echo "No repos are being watched, so no issue can ever be picked up."
@@ -112,10 +127,50 @@ while IFS= read -r repo; do
   if printf '%s' "$pf" | jq -e '[.checks[] | select(.fatal and (.ok | not))] | length > 0' >/dev/null 2>&1; then
     fail
   fi
+
+  # --- is this repo's queue actually moving? ---------------------------------------------
+  #
+  # Everything above answers "could a run start". This answers "has one stopped everything".
+  # `/api/plan` is the poller's own view of the queue — open issues with the lifecycle state
+  # read off their labels — so no new endpoint and no second definition of "blocked".
+  plan=$(curl -sS -m 30 -b "$JAR" --get --data-urlencode "repo=$repo" "$URL/api/plan" 2>/dev/null)
+  if ! printf '%s' "$plan" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "- ⚠️ could not read the work queue for this repo"
+    echo
+    continue
+  fi
+
+  counts=$(printf '%s' "$plan" | jq -r '
+    [ .[] | .state ] | group_by(.) | map("\(.[0])=\(length)") | join(" ")')
+  echo "- 🗒 queue: \`${counts:-empty}\`"
+
+  # An issue that stopped for a human halts its whole repo when FACTORY_HALT_ON_FAILURE is on:
+  # `poller._poll_repo` dispatches nothing for it until the label is cleared. That is the
+  # nineteen-hour outage this script slept through, and it is one jq query away from being red.
+  stuck=$(printf '%s' "$plan" | jq -r '
+    [ .[] | select(.state == "failed" or .state == "blocked") | "#\(.number) \(.state)" ] | join(", ")')
+  if [ -n "$stuck" ]; then
+    if [ "$halt" = "true" ]; then
+      echo "- ❌ **the queue is halted** — $stuck. Nothing in this repo dispatches until a human clears the label."
+      fail
+    else
+      echo "- ⚠️ stopped for a human: $stuck (halting is off, so other issues still dispatch)"
+    fi
+  fi
+
+  # Queued work and nothing in flight, on a repo that is not halted, means the poller should
+  # have claimed something within one interval. Advisory rather than fatal: this script samples
+  # a moving system, and an issue queued seconds ago is legitimately not running yet.
+  queued=$(printf '%s' "$plan" | jq -r '[ .[] | select(.state == "queued") ] | length')
+  running=$(printf '%s' "$plan" | jq -r '[ .[] | select(.state == "running") ] | length')
+  if [ -z "$stuck" ] && [ "${queued:-0}" -gt 0 ] && [ "${running:-0}" -eq 0 ]; then
+    echo "- ⚠️ $queued issue(s) queued and nothing running; expect a dispatch within one poll"
+  fi
+  echo
 done <<< "$repos"
 
 if [ "$FAILED" -ne 0 ]; then
-  echo "One or more fatal checks failed: the factory cannot dispatch a run right now."
+  echo "One or more fatal checks failed: the factory is not building anything right now."
   exit 1
 fi
 
