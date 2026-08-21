@@ -5,12 +5,19 @@ in `control/prompt_profile_test.py`: it turns one machine-readable line back int
 `{"indexed", "opened", "domains"}`, or into nothing at all when the line is missing,
 malformed, or just ordinary agent chatter that happens to share no shape with a receipt.
 
+The rest of this file proves the other half — that a valid receipt seen mid-stream turns
+into telemetry rows (AC1), and that a telemetry layer which cannot write never takes the
+run down with it (AC4).
+
 Run it directly, no framework needed:
 
     .venv/bin/python -m control.memory_receipt_test
 """
+import asyncio
 import json
 import sys
+
+from telemetry.normalize import ClaudeCodeAdapter
 
 from control import runner
 
@@ -90,6 +97,187 @@ check("a line that only starts with the marker's letters is not the marker",
 check("no receipt anywhere in ordinary output", runner.parse_memory_receipt("just a normal log\nnothing here"), None)
 check("empty string does not raise", runner.parse_memory_receipt(""), None)
 check("None-shaped input does not raise", runner.parse_memory_receipt(None), None)
+
+
+# ---------- stream persists receipt / receipt persistence is best effort
+#
+# Nothing here talks to boxd or sqlite. `_stream` is driven the same way
+# `control/manifest_test.py` drives it: over a canned stdout, with the recorder and the
+# database stubbed, so what is under test is `_stream`'s own handling of the receipt line
+# rather than a real agent or a real database.
+
+
+class Log:
+    def __init__(self):
+        self.lines = []
+
+    def write(self, line):
+        self.lines.append(line)
+
+
+class Chunk:
+    def __init__(self, text, is_stderr=False):
+        self.data, self.is_stderr = text.encode(), is_stderr
+
+
+class StubStream:
+    def __init__(self, chunks):
+        self._chunks, self.exit_code = chunks, 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def iter_chunks(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class StubBoxd:
+    def __init__(self, text):
+        self.machines = self
+        self._text = text
+
+    def stream_exec(self, machine_id, command=None, env=None, close_stdin=True):
+        return StubStream([Chunk(self._text)])
+
+
+class StubRecorder:
+    """Stands in for the telemetry recorder. `summary` is the real Claude adapter's, so
+    the run's own usage is still checked here rather than stubbed into being right."""
+
+    def __init__(self, run_id):
+        self.dropped = 0
+        self.adapter = ClaudeCodeAdapter(run_id)
+
+    def use(self, events):
+        return self.adapter.name
+
+    def summary(self, event):
+        return self.adapter.summary(event)
+
+    async def feed(self, event):
+        pass
+
+    async def close(self):
+        pass
+
+
+RECEIPT = {"indexed": 3, "opened": ["mem_acac", "mem_5b24"], "domains": ["repository"]}
+RECEIPT_LINE = f'{runner.MEMORY_RECEIPT_MARKER} {json.dumps(RECEIPT)}'
+
+# The receipt printed as the agent's own assistant text, exactly how the prompt asks the
+# agent to report it — mixed with ordinary turn text on either side, the way a real
+# transcript would carry it.
+ASSISTANT_EVENT = json.dumps({
+    "type": "assistant",
+    "message": {"content": [
+        {"type": "text", "text": f"Primed from .mem/.\n{RECEIPT_LINE}\nStarting work now."},
+    ]},
+})
+RESULT_EVENT = json.dumps({
+    "type": "result", "subtype": "success", "num_turns": 2,
+    "usage": {"input_tokens": 10, "output_tokens": 2},
+})
+STDOUT = f"{ASSISTANT_EVENT}\n{RESULT_EVENT}\n"
+
+
+def run_stream(text, write_memory_reads, write_memory_receipt=None):
+    """Drive `_stream` over one canned stdout, stubbing the recorder, the database, and the
+    two telemetry writes the receipt would trigger."""
+    log = Log()
+    real_recorder = runner.Recorder
+    real_update = runner.db.update_run
+    real_write = runner.telemetry_store.write_memory_reads
+    real_receipt = runner.telemetry_store.write_memory_receipt
+    runner.Recorder = StubRecorder
+    runner.db.update_run = lambda *a, **k: _noop()
+    runner.telemetry_store.write_memory_reads = write_memory_reads
+    runner.telemetry_store.write_memory_receipt = write_memory_receipt or _capture_nothing
+    try:
+        code, usage, manifest = asyncio.run(
+            runner._stream(StubBoxd(text), "vm-1", {}, log, "run-1")
+        )
+    finally:
+        runner.Recorder = real_recorder
+        runner.db.update_run = real_update
+        runner.telemetry_store.write_memory_reads = real_write
+        runner.telemetry_store.write_memory_receipt = real_receipt
+    return code, usage, log.lines
+
+
+async def _capture_nothing(*args, **kwargs):
+    return None
+
+
+async def _noop():
+    return None
+
+
+# ---------- AC1: stream persists receipt
+
+writes = []
+
+
+async def capture(run_id, reads):
+    writes.append((run_id, list(reads)))
+
+
+code, usage, lines = run_stream(STDOUT, capture)
+
+check("stream persists receipt: one write call for the run", len(writes), 1)
+persisted_run_id, persisted_reads = writes[0]
+check("stream persists receipt: written against the run that produced it",
+      persisted_run_id, "run-1")
+check("stream persists receipt: one row per opened memory record",
+      [r[0] for r in persisted_reads], RECEIPT["opened"])
+# The shape is the assertion. A read row is `(memory_id, ts)` and nothing else, so there is
+# no per-record domain slot for the receipt's set of domains to be guessed into.
+check("stream persists receipt: a read row is an id and a timestamp, nothing more",
+      {len(r) for r in persisted_reads}, {2})
+check("stream persists receipt: the run's result is unchanged",
+      (code, usage.get("tokens_in"), usage.get("tokens_out")), (0, 10, 2))
+
+writes.clear()
+run_stream(f"{ASSISTANT_EVENT}\n{ASSISTANT_EVENT}\n{RESULT_EVENT}\n", capture)
+check("stream persists receipt: a repeated receipt line in one run writes only once",
+      len(writes), 1)
+
+
+# ---------- AC2: the domains go to the run, whole
+
+receipts = []
+
+
+async def capture_receipt(run_id, indexed, domains, ts=None):
+    receipts.append((run_id, indexed, list(domains)))
+
+
+writes.clear()
+run_stream(STDOUT, capture, capture_receipt)
+check("stream persists receipt: exactly one receipt row for the run", len(receipts), 1)
+check("stream persists receipt: it is the run that produced it", receipts[0][0], "run-1")
+check("stream persists receipt: the indexed count is carried", receipts[0][1], RECEIPT["indexed"])
+check("stream persists receipt: every domain the run drew from, not the first",
+      receipts[0][2], RECEIPT["domains"])
+
+
+# ---------- AC4: receipt persistence is best effort
+
+async def explode(run_id, reads):
+    raise RuntimeError("telemetry database is locked")
+
+
+code, usage, lines = run_stream(STDOUT, explode)
+
+check("best effort: a telemetry failure does not raise out of the stream", True, True)
+check("best effort: the run still finishes with its usage",
+      (code, usage.get("tokens_in"), usage.get("tokens_out")), (0, 10, 2))
+check("best effort: the failure is noted in the run log",
+      any("memory receipt not recorded" in ln for ln in lines), True)
+
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

@@ -12,6 +12,7 @@ to Postgres should be a driver swap and a handful of placeholders, not a rewrite
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -55,11 +56,24 @@ CREATE INDEX IF NOT EXISTS tool_calls_tool_idx ON tool_calls (tool);
 CREATE TABLE IF NOT EXISTS memory_reads (
     run_id      TEXT NOT NULL,
     memory_id   TEXT NOT NULL,
-    domain      TEXT,
     ts          TEXT,
     PRIMARY KEY (run_id, memory_id)
 );
 CREATE INDEX IF NOT EXISTS memory_reads_run_idx ON memory_reads (run_id);
+
+-- The receipt as the run gave it. `domains` is a JSON array because that is the shape the
+-- agent reports: which domain files the run drew from, as a set with no mapping back to
+-- individual records. There used to be a `domain` column on `memory_reads` filled by picking
+-- the first of them, which wrote every record as whichever domain sorted first and lost the
+-- rest. A record's domain is a property of the record — `index.jsonl` requires it — so a copy
+-- here could only ever be a second answer that disagrees. Stored at run level, which is also
+-- exactly what AC2 asks for, it is simply true.
+CREATE TABLE IF NOT EXISTS memory_receipts (
+    run_id      TEXT PRIMARY KEY,
+    indexed     INTEGER,
+    domains     TEXT,
+    received_at TEXT
+);
 
 CREATE TABLE IF NOT EXISTS model_prices (
     model                   TEXT NOT NULL,
@@ -122,9 +136,26 @@ async def connect() -> AsyncIterator[aiosqlite.Connection]:
         await conn.close()
 
 
+# Changes to tables that already exist on a deployed box. SQLite has no `IF EXISTS` for a
+# column drop, so each statement is tried and a failure means it was already applied — the
+# only two outcomes here are "the old column was there" and "it was not".
+#
+# Applied strictly *after* SCHEMA, and the ordering is the point: SCHEMA creates tables in
+# their current shape, so a migration that dropped something SCHEMA still created would undo
+# it on every single boot. Read the pair together before adding to either.
+MIGRATIONS = (
+    "ALTER TABLE memory_reads DROP COLUMN domain",
+)
+
+
 async def init() -> None:
     async with connect() as conn:
         await conn.executescript(SCHEMA)
+        for statement in MIGRATIONS:
+            try:
+                await conn.execute(statement)
+            except Exception:  # noqa: BLE001 - already applied is the normal case
+                pass
         # OR IGNORE, so a price corrected by hand is never overwritten on restart.
         await conn.executemany(
             "INSERT OR IGNORE INTO model_prices VALUES (?, ?, ?, ?, ?, ?, ?)", SEED_PRICES
@@ -184,20 +215,40 @@ async def clear_run(run_id: str) -> None:
         await conn.commit()
 
 
-async def write_memory_reads(run_id: str, reads: Sequence[tuple[str, str | None, str | None]]) -> None:
+async def write_memory_reads(run_id: str, reads: Sequence[tuple[str, str | None]]) -> None:
     """Record which memory records a run pulled into context.
 
-    Each item is `(memory_id, domain, ts)`. Keyed on `(run_id, memory_id)`, so retrieving
-    the same record twice in one run — the recorder replaying a transcript, or two turns
-    reaching for the same fact — leaves one row rather than accumulating duplicates.
+    Each item is `(memory_id, ts)` — no domain, because the receipt does not say which
+    record came from which file and a guess here is a wrong answer stored as a fact. The
+    domains a run drew from go to `write_memory_receipt`, at the level the run reports them.
+
+    Keyed on `(run_id, memory_id)`, so retrieving the same record twice in one run — the
+    recorder replaying a transcript, or two turns reaching for the same fact — leaves one
+    row rather than accumulating duplicates.
     """
     if not reads:
         return
     async with connect() as conn:
         await conn.executemany(
-            """INSERT OR IGNORE INTO memory_reads (run_id, memory_id, domain, ts)
+            "INSERT OR IGNORE INTO memory_reads (run_id, memory_id, ts) VALUES (?, ?, ?)",
+            [(run_id, memory_id, ts) for memory_id, ts in reads],
+        )
+        await conn.commit()
+
+
+async def write_memory_receipt(
+    run_id: str, indexed: int, domains: Sequence[str], ts: str | None = None
+) -> None:
+    """Record the run-level half of a receipt: how big the index was, which domains it drew from.
+
+    REPLACE rather than IGNORE: a run emits at most one receipt, and a second one is a
+    correction of the first — the priming step re-running, not two separate facts.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            """INSERT OR REPLACE INTO memory_receipts (run_id, indexed, domains, received_at)
                VALUES (?, ?, ?, ?)""",
-            [(run_id, memory_id, domain, ts) for memory_id, domain, ts in reads],
+            (run_id, int(indexed), json.dumps(list(domains)), ts),
         )
         await conn.commit()
 
@@ -205,10 +256,81 @@ async def write_memory_reads(run_id: str, reads: Sequence[tuple[str, str | None,
 async def memory_reads_for_run(run_id: str) -> list[dict]:
     """Every memory record a run retrieved. The per-run read endpoint for AC1."""
     return await _rows(
-        """SELECT memory_id, domain, ts FROM memory_reads
+        """SELECT memory_id, ts FROM memory_reads
            WHERE run_id = ? ORDER BY ts, memory_id""",
         (run_id,),
     )
+
+
+async def memory_receipt_for_run(run_id: str) -> dict:
+    """A run's receipt, with `domains` decoded back to a list. `{}` when it filed none."""
+    rows = await _rows(
+        "SELECT indexed, domains, received_at FROM memory_receipts WHERE run_id = ?",
+        (run_id,),
+    )
+    if not rows:
+        return {}
+    row = dict(rows[0])
+    try:
+        row["domains"] = json.loads(row["domains"] or "[]")
+    except (TypeError, ValueError):
+        row["domains"] = []
+    return row
+
+
+async def memory_metrics_by_repo() -> list[dict]:
+    """Retrieval rolled up per repository: how many runs used memory, how many distinct
+    records, and what those runs cost on average.
+
+    `repo` comes from `runs`, the same table `unit_economics` already joins — a run's
+    repository has exactly one source of truth in this system, so this reads it rather
+    than inventing a second place memory rows could disagree with it. This proves
+    retrieval happened alongside a run's outcome; it says nothing about whether a
+    retrieved record was actually useful.
+    """
+    rows = await _rows(
+        f"""
+        WITH run_cost AS (
+            SELECT c.run_id, SUM({COST_SQL}) AS cost
+            {PRICE_JOIN}
+            GROUP BY c.run_id
+        ),
+        repo_runs AS (
+            SELECT DISTINCT mr.run_id, r.repo
+            FROM memory_reads mr
+            JOIN runs r ON r.id = mr.run_id
+        )
+        SELECT rr.repo,
+               COUNT(DISTINCT rr.run_id) AS runs_with_memory,
+               (SELECT COUNT(DISTINCT mr2.memory_id)
+                  FROM memory_reads mr2
+                  JOIN runs r2 ON r2.id = mr2.run_id
+                 WHERE r2.repo = rr.repo)  AS distinct_records,
+               COALESCE(AVG(rc.cost), 0)   AS avg_derived_cost_usd
+        FROM repo_runs rr
+        LEFT JOIN run_cost rc ON rc.run_id = rr.run_id
+        GROUP BY rr.repo ORDER BY rr.repo
+        """
+    )
+    # Domains are unioned from the receipts rather than read off each row, because a run
+    # reports them as a set over the whole run. Done in Python rather than SQL: the column is
+    # a JSON array, and json_each would make this query depend on a SQLite build option for
+    # something one pass over a handful of rows does plainly.
+    by_repo: dict[str, set[str]] = {}
+    for receipt in await _rows(
+        """SELECT r.repo AS repo, mrc.domains AS domains
+             FROM memory_receipts mrc JOIN runs r ON r.id = mrc.run_id"""
+    ):
+        try:
+            names = json.loads(receipt["domains"] or "[]")
+        except (TypeError, ValueError):
+            names = []
+        by_repo.setdefault(receipt["repo"], set()).update(
+            n for n in names if isinstance(n, str)
+        )
+    for row in rows:
+        row["domains"] = sorted(by_repo.get(row["repo"], ()))
+    return rows
 
 
 # --------------------------------------------------------------------------- reads
@@ -283,7 +405,14 @@ async def usage_for_run(run_id: str) -> dict:
         """,
         (run_id,),
     )
-    return {"totals": totals[0] if totals else {}, "by_model": by_model, "tools": tools}
+    memory = await memory_reads_for_run(run_id)
+    return {
+        "totals": totals[0] if totals else {},
+        "by_model": by_model,
+        "tools": tools,
+        "memory": memory,
+        "memory_receipt": await memory_receipt_for_run(run_id),
+    }
 
 
 async def spend_by_day(days: int = 30) -> list[dict]:
