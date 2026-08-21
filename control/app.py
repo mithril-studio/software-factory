@@ -144,6 +144,11 @@ async def api_config():
         "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
         "poll_interval": settings.poll_interval,
+        # Whether one stopped issue stops its whole repo. Exposed because it decides whether an
+        # open `agent:failed` is an outage or a single issue somebody will get to: with this on,
+        # the poller dispatches nothing for that repo until a human clears the label, and
+        # `scripts/factory-health.sh` has to be able to tell those two apart.
+        "halt_on_failure": settings.halt_on_failure,
         "missing": settings.missing(),
         "problems": settings.problems(available),
     }
