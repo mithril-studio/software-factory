@@ -298,6 +298,103 @@ with tempfile.TemporaryDirectory() as tmp:
     check("missing evidence: a _universal record with no evidence path is not reported", findings, [])
 
 
+# ---------- the index's `files`, which is the field priming actually selects on
+#
+# §3.2 defines an index line's `files` as `evidence.files` plus `evidence.dirs`, merged.
+# `domain`, `type` and `title` are copied verbatim and drift there is visible to anyone
+# reading both lines; `files` is derived, so it silently goes stale when a record's evidence
+# grows. §4 step 3 matches a working set against the index and nothing else, so a path present
+# in the record but missing from its index line means the record is simply never retrieved for
+# that path — a store that validates clean and quietly under-serves. This repo's own `.mem/`
+# had five such lines.
+
+with tempfile.TemporaryDirectory() as tmp:
+    rec = record(evidence={
+        "files": ["widget.py", "widget_test.py"], "dirs": [], "branch": "main",
+        "issues": [], "run": None,
+    })
+    stale = index_line(rec)
+    stale["files"] = ["widget.py"]  # the line as it was before the record gained a second file
+    repo = build_repo(
+        tmp,
+        index_lines=[stale],
+        domain_records={"widgets": [rec]},
+        touch_files=["widget.py", "widget_test.py"],
+    )
+    findings = validate(str(repo))
+    check("index files: a path the record names but the index omits is reported",
+          any_message_contains(findings, "omits evidence path(s)") and
+          any_message_contains(findings, "widget_test.py"), True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    rec = record()
+    invented = index_line(rec)
+    invented["files"] = rec["evidence"]["files"] + ["not/in/the/record.py"]
+    repo = build_repo(
+        tmp,
+        index_lines=[invented],
+        domain_records={"widgets": [rec]},
+        touch_files=["widget.py"],
+    )
+    findings = validate(str(repo))
+    check("index files: a path the index invents is reported",
+          any_message_contains(findings, "not/in/the/record.py"), True)
+
+# A record's `dirs` belong in the index line too — they are half of what §3.2 merges, and the
+# broadest half: a `dirs` entry left out takes every file under it out of retrieval range.
+with tempfile.TemporaryDirectory() as tmp:
+    rec = record(evidence={
+        "files": ["widget.py"], "dirs": ["widgets"], "branch": "main", "issues": [], "run": None,
+    })
+    without_dirs = index_line(rec)
+    without_dirs["files"] = ["widget.py"]
+    repo = build_repo(
+        tmp,
+        index_lines=[without_dirs],
+        domain_records={"widgets": [rec]},
+        touch_files=["widget.py", "widgets/a.py"],
+    )
+    findings = validate(str(repo))
+    check("index files: evidence.dirs missing from the index line is reported",
+          any_message_contains(findings, "'widgets'"), True)
+
+# Order is not part of the contract; the same set written differently is the same line.
+with tempfile.TemporaryDirectory() as tmp:
+    rec = record(evidence={
+        "files": ["widget.py"], "dirs": ["widgets"], "branch": "main", "issues": [], "run": None,
+    })
+    reordered = index_line(rec)
+    reordered["files"] = ["widgets", "widget.py"]
+    repo = build_repo(
+        tmp,
+        index_lines=[reordered],
+        domain_records={"widgets": [rec]},
+        touch_files=["widget.py", "widgets/a.py"],
+    )
+    check("index files: the same paths in a different order are not a finding",
+          validate(str(repo)), [])
+
+
+# ---------- one index line per record (§3.2)
+#
+# Two lines for one id is not untidy, it is ambiguous: whichever the reader reaches first
+# decides what it believes about the record, and nothing reconciles the other.
+
+with tempfile.TemporaryDirectory() as tmp:
+    rec = record()
+    second = index_line(rec)
+    second["title"] = "Widgets are always green"
+    repo = build_repo(
+        tmp,
+        index_lines=[index_line(rec), second],
+        domain_records={"widgets": [rec]},
+        touch_files=["widget.py"],
+    )
+    findings = validate(str(repo))
+    check("duplicate index entry: a second line for one id is reported",
+          any_message_contains(findings, "appears twice"), True)
+
+
 print()
 if fails:
     print(f"{len(fails)} failed: " + ", ".join(fails))

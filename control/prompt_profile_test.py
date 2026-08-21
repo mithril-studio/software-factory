@@ -170,6 +170,34 @@ for kind, built in (("with a profile", p), ("without one", d)):
     check(f"memory receipt: {kind}, a missing `.mem/` still gets an explicit receipt",
           json.dumps(runner.EMPTY_MEMORY_RECEIPT) in built, True)
 
+# ---------- memory candidate contract (AC1)
+# A run that noticed something it is not sure enough to write into `.mem/` had nowhere to put
+# it, so the observation died with the VM. The prompt now names the file, says when to write
+# it, and — the part that makes the queue safe to propose into — says plainly that what goes
+# there is not memory and reaches nobody until a human accepts it.
+for kind, built in (("with a profile", p), ("without one", d)):
+    check(f"memory candidate: {kind}, the environment variable is named",
+          runner.MEMORY_CANDIDATE_ENV in built, True)
+    check(f"memory candidate: {kind}, and the path it points at",
+          runner.MEMORY_CANDIDATE_PATH in built, True)
+    check(f"memory candidate: {kind}, it says when — before finishing",
+          "before you finish" in built, True)
+    check(f"memory candidate: {kind}, it says a candidate is not active memory",
+          "candidates, not memory" in built and "until a human accepts it" in built, True)
+    check(f"memory candidate: {kind}, the record shape is spelled out",
+          all(f'"{field}"' in built for field in
+              ("domain", "type", "title", "body", "evidence", "confidence")), True)
+    # The rubric is the admission control that happens before any code sees the file: six
+    # words an agent can check itself against, so most runs propose nothing.
+    check(f"memory candidate: {kind}, the rubric names all six tests",
+          all(word in built for word in
+              ("novel", "specific", "reusable", "scoped", "evidence-backed", "not already obvious")),
+          True)
+    check(f"memory candidate: {kind}, the per-run cap is stated",
+          str(runner.MEMORY_CANDIDATE_MAX_RECORDS) in built, True)
+    check(f"memory candidate: {kind}, secrets are ruled out explicitly",
+          "Never put a secret" in built, True)
+
 # ---------- which machines the factory owns
 # The leak this pins down: reconcile swept `run-` only, so an orphaned review VM survived on
 # its self-destruct timer alone and showed up in the fleet view as a golden.
