@@ -151,6 +151,60 @@ async def repo_info(repo: str) -> dict | None:
     return resp.json() if resp.status_code == 200 else None
 
 
+async def list_repos(limit: int = 300) -> list[dict]:
+    """Every repo this deployment's token can see, most recently pushed first.
+
+    For the connect picker, and only for it. Connecting a repo has never needed this — the
+    register takes an `owner/name` string and preflight asks GitHub the questions that matter
+    — but "which repos are there" was a question only the person at the keyboard could
+    answer, from memory, into a free-text box. A typo there is a 404 an hour later.
+
+    `affiliation` rather than `type`: a factory is pointed at repos somebody owns, collaborates
+    on, or reaches through an org, and the default (`owner,collaborator,organization_member`)
+    is exactly that set. Sorted by `pushed` because the repo you want to connect is
+    overwhelmingly one you touched recently.
+
+    Paginated to `limit` and no further. A hard stop rather than "follow every page" because
+    this feeds a dropdown: an account with four thousand repos should cost one second and a
+    truncated list, not thirty seconds and a complete one.
+    """
+    out: list[dict] = []
+    async with httpx.AsyncClient(timeout=20) as client:
+        for page in range(1, limit // 100 + 2):
+            resp = await client.get(
+                f"{API}/user/repos",
+                headers=_headers(),
+                params={
+                    "affiliation": "owner,collaborator,organization_member",
+                    "sort": "pushed",
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if not body:
+                break
+            out.extend(
+                {
+                    "full_name": r.get("full_name") or "",
+                    "private": bool(r.get("private")),
+                    "archived": bool(r.get("archived")),
+                    "default_branch": r.get("default_branch") or "",
+                    "pushed_at": r.get("pushed_at"),
+                    # What the *account* may do, which is not what the token may do — see
+                    # `can_push`, which asks git rather than trusting this. Good enough to
+                    # grey out a row in a picker; never good enough to skip preflight.
+                    "can_push": bool((r.get("permissions") or {}).get("push")),
+                }
+                for r in body
+                if r.get("full_name")
+            )
+            if len(body) < 100 or len(out) >= limit:
+                break
+    return out[:limit]
+
+
 async def workflow_count(repo: str, ref: str) -> int:
     """How many Actions workflow files exist on `ref`.
 

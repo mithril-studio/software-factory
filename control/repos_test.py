@@ -155,6 +155,25 @@ check("removal: the repo's runs are kept", [r["id"] for r in run(db.list_runs())
 check("removal: and it is no longer watched", "acme/web" in repos.watched(), False)
 
 
+# ---------- warming a golden does not stop the repo it was connected for
+
+# `POST /api/repos` starts a provisioning run the moment a repo is connected, and the poller
+# skips any repo with a run in flight. Counting the warm-up there made a repo arriving with
+# queued issues sit idle for the whole install — the exact opposite of "dispatchable the moment
+# it is registered", which is what the two-tier golden design exists to make true.
+run(db.create_run(
+    id="p1", repo="acme/api", issue_number=0, status="running", kind="provision",
+    created_at=db.utcnow(),
+))
+check("dispatch: a warm-up in flight does not claim the repo",
+      run(db.has_active_run("acme/api")), False)
+run(db.create_run(
+    id="b1", repo="acme/api", issue_number=7, status="running", kind="build",
+    created_at=db.utcnow(),
+))
+check("dispatch: a build in flight still does", run(db.has_active_run("acme/api")), True)
+
+
 tmp.cleanup()
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

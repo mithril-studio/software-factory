@@ -65,14 +65,31 @@ _log = logging.getLogger("factory.runner")
 # Run ids of in-flight runs -> their asyncio task, so the UI can cancel them.
 _tasks: dict[str, asyncio.Task] = {}
 _semaphore: asyncio.Semaphore | None = None
+_provision_semaphore: asyncio.Semaphore | None = None
 
 
 def semaphore() -> asyncio.Semaphore:
-    """Created lazily so it binds to the running loop, not import-time."""
+    """How many build and review runs may execute at once.
+
+    Created lazily so it binds to the running loop, not import-time.
+    """
     global _semaphore
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(settings.max_concurrent)
     return _semaphore
+
+
+def provision_semaphore() -> asyncio.Semaphore:
+    """How many goldens may be warmed at once — a separate budget from the runs.
+
+    Provisioning used to take `semaphore()`, which meant connecting three repos consumed the
+    entire build concurrency until their installs finished. A warm-up is a speed-up that is
+    allowed to be slow; a build queued behind three of them is a factory that has stopped.
+    """
+    global _provision_semaphore
+    if _provision_semaphore is None:
+        _provision_semaphore = asyncio.Semaphore(settings.max_provision)
+    return _provision_semaphore
 
 
 # Every VM a run creates is named from its run id with one of these prefixes: `run-` for a

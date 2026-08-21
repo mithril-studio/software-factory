@@ -11,6 +11,12 @@ ways that goes wrong quietly, and each is a section below:
    slot out of an account that caps at 20, and holds it until the auto-destroy timer.
 3. **It reports success it did not have.** A repo whose install failed must not end up marked
    `ready` with a snapshot behind it that has half a `node_modules` in it.
+4. **It destroys the machine while boxd is still writing the capture.** `snapshots.create`
+   returns once the capture is *queued*; reaping then leaves the name `pending` forever with
+   no version behind it, which `agents.available()` refuses to dispatch onto and nothing can
+   repair. The stub below models that delay deliberately — a stub that publishes the finished
+   snapshot synchronously cannot express the bug at all, which is why this test passed for as
+   long as the bug was live.
 
 Nothing here talks to boxd. The stub records what was asked of it, which is what makes the
 order assertable: restore, install, *then* capture, then destroy. A test that only checked the
@@ -46,6 +52,9 @@ tmp = tempfile.TemporaryDirectory()
 object.__setattr__(settings, "db_path", Path(tmp.name) / "factory.db")
 object.__setattr__(settings, "log_dir", Path(tmp.name) / "logs")
 object.__setattr__(settings, "repos", ())
+# No real waiting: the wait is asserted by counting fleet listings, not by burning seconds.
+object.__setattr__(settings, "capture_poll", 0.0)
+object.__setattr__(settings, "capture_timeout", 30)
 settings.log_dir.mkdir(parents=True, exist_ok=True)
 asyncio.run(db.init())
 
@@ -117,34 +126,82 @@ class Machines:
         )
 
 
+class Snap:
+    """A snapshot as the fleet reports one: a name, the newest *ready* version, a status.
+
+    `version` is the load-bearing field. boxd answers with the name the moment a capture is
+    queued and fills the version in only when the capture has been written, which is the whole
+    reason a warm-up cannot reap its machine as soon as `create` returns.
+    """
+
+    def __init__(self, name, version="v1", status="ready"):
+        self.name, self.version, self.status = name, version, status
+        # `runner._is_snapshot` matches on either, so the stub carries both.
+        self.id = f"snap-{name}"
+
+
 class Snapshots:
+    """A fleet where a capture takes `capture_ticks` listings to land, or never lands.
+
+    The stub used to make `create` publish the finished snapshot synchronously, which is the
+    one thing boxd does not do — so the test asserted that `snapshots.create` was called
+    before `machines.delete` (true, and not the question) while production destroyed the
+    machine underneath a capture that had only been queued.
+    """
+
     def __init__(self, boxd):
         self._boxd = boxd
 
     async def list(self, **kw):
-        return [Thing(f"s-{i}", n) for i, n in enumerate(self._boxd.snapshot_names)]
+        self._boxd.listings += 1
+        for name, pending in list(self._boxd.capturing.items()):
+            pending["ticks"] -= 1
+            if pending["ticks"] <= 0 and pending["lands"]:
+                self._boxd.snaps[name] = Snap(name, pending["version"])
+                del self._boxd.capturing[name]
+        rows = [Snap(n, s.version, s.status) for n, s in self._boxd.snaps.items()]
+        rows += [Snap(n, "", "pending") for n in self._boxd.capturing]
+        return rows
 
     async def create(self, machine_id, name):
         self._boxd.calls.append(("snapshots.create", {"machine": machine_id, "name": name}))
-        self._boxd.snapshot_names.append(name)
-        return Thing("s-new", name)
+        was = self._boxd.snaps.get(name)
+        self._boxd.capturing[name] = {
+            "ticks": self._boxd.capture_ticks,
+            "lands": self._boxd.capture_lands,
+            # A re-save bumps the version. The wait has to notice *that*, not merely that a
+            # version exists — it already did, from the previous build.
+            "version": f"v{int((was.version or 'v0')[1:]) + 1}" if was else "v1",
+        }
+        return Snap(name, "", "pending")
 
     async def delete(self, name, **kw):
         self._boxd.calls.append(("snapshots.delete", {"name": name}))
-        if name not in self._boxd.snapshot_names:
+        gone = self._boxd.capturing.pop(name, None)
+        if self._boxd.snaps.pop(name, None) is None and gone is None:
             raise RuntimeError(f"no such snapshot: {name}")
-        self._boxd.snapshot_names.remove(name)
 
 
 class FakeBoxd:
-    def __init__(self, snapshots=(agents.BASE_SNAPSHOT,), exit_code=0):
+    def __init__(self, snapshots=(agents.BASE_SNAPSHOT,), exit_code=0,
+                 capture_ticks=2, capture_lands=True):
         self.calls = []
         self.destroyed = []
         self.live = []
-        self.snapshot_names = list(snapshots)
+        self.snaps = {n: Snap(n) for n in snapshots}
+        # Names whose capture has been queued but not yet written.
+        self.capturing = {}
+        self.listings = 0
+        self.capture_ticks = capture_ticks
+        self.capture_lands = capture_lands
         self.exit_code = exit_code
         self.machines = Machines(self)
         self.snapshots = Snapshots(self)
+
+    @property
+    def snapshot_names(self):
+        """Restorable names — what `resolve_snapshot` would actually be given."""
+        return list(self.snaps)
 
     async def close(self):
         pass
@@ -259,25 +316,132 @@ check("failed: so the repo falls back to the base and installs for itself",
       agents.resolve_snapshot(REPO, boxd.snapshot_names), agents.BASE_SNAPSHOT)
 
 
-# ---------- a repo that names no setup command is refused before anything is spent
+# ---------- the capture is waited out, not assumed
+#
+# The bug this section exists for: boxd answers `create` when the capture is queued, and the
+# machine used to be destroyed on that answer. Every check here is about ordering against the
+# *version appearing*, which is the only evidence a capture actually landed.
+
+boxd = FakeBoxd(capture_ticks=3)
+run_id = warm(boxd)
+run = asyncio.run(db.get_run(run_id))
+
+check("capture: the run waits for the fleet to publish a version",
+      boxd.listings >= 3, True)
+check("capture: nothing is still mid-capture when the run finishes", boxd.capturing, {})
+check("capture: and the snapshot is restorable, not merely named",
+      boxd.snaps[SNAPSHOT].version, "v1")
+check("capture: the machine is destroyed only after that",
+      boxd.destroyed, ["vm-1"])
+check("capture: the run succeeded", run["status"], "succeeded")
+check("capture: the log names the version that landed",
+      "v1 saved" in Path(run["log_path"]).read_text(), True)
+
+
+# ---------- a rebuild waits for the version to *change*
+#
+# A re-save publishes a new version under a name that already had one, so "does it have a
+# version" is true before the capture starts. Testing that instead would return instantly and
+# reap the machine exactly as the original bug did.
+
+boxd = FakeBoxd(snapshots=[agents.BASE_SNAPSHOT, SNAPSHOT], capture_ticks=2)
+run_id = warm(boxd)
+run = asyncio.run(db.get_run(run_id))
+
+check("rebuild: it waits past the version the golden already had",
+      boxd.snaps[SNAPSHOT].version, "v2")
+check("rebuild: the run succeeded", run["status"], "succeeded")
+check("rebuild: the register points at the rebuilt golden",
+      (repos.rows()[0]["golden"], repos.rows()[0]["provision_status"]),
+      (SNAPSHOT, provision.READY))
+
+
+# ---------- a capture that never lands is deleted rather than left in the fleet
+
+boxd = FakeBoxd(capture_lands=False)
+run_id = warm(boxd)
+run = asyncio.run(db.get_run(run_id))
+
+check("stuck: the run fails rather than reporting a golden nothing can boot",
+      run["status"], "failed")
+check("stuck: the half-written name is deleted",
+      (boxd.named("snapshots.delete") or {}).get("name"), SNAPSHOT)
+check("stuck: so the fleet holds no unrestorable golden",
+      SNAPSHOT in boxd.snapshot_names, False)
+check("stuck: the machine is still reaped", boxd.destroyed, ["vm-1"])
+check("stuck: and the repo falls back to the base",
+      agents.resolve_snapshot(REPO, boxd.snapshot_names), agents.BASE_SNAPSHOT)
+
+
+# ---------- a failed rebuild leaves the golden that is still there alone
+#
+# Provisioning always rebuilds from the base, so a failed re-provision does not touch the
+# previous snapshot — `resolve_snapshot` keeps resolving onto it. Blanking the register would
+# make the Projects page report "no golden" for a repo whose runs are booting one.
+
+boxd = FakeBoxd(snapshots=[agents.BASE_SNAPSHOT, SNAPSHOT], exit_code=94)
+run_id = warm(boxd)
+run = asyncio.run(db.get_run(run_id))
+
+check("survivor: the rebuild failed", run["status"], "failed")
+check("survivor: the previous golden is untouched", SNAPSHOT in boxd.snapshot_names, True)
+check("survivor: so the register keeps pointing at it",
+      (repos.rows()[0]["golden"], repos.rows()[0]["provision_status"]),
+      (SNAPSHOT, provision.READY))
+check("survivor: and a dispatch still boots it",
+      agents.resolve_snapshot(REPO, boxd.snapshot_names), SNAPSHOT)
+
+
+# ---------- a repo that names no setup command still gets a golden, without the install
+#
+# The clone is the half the control plane can always do without guessing, and it is worth
+# minutes on its own. What it must never do is infer an install command from a lock file.
+
+NO_SETUP = "# acme/api\n\nNo setup section here.\n"
+boxd = FakeBoxd()
+run_id = warm(boxd, profile=NO_SETUP)
+run = asyncio.run(db.get_run(run_id))
+env = (boxd.named("stream_exec") or {}).get("env") or {}
+
+check("clone-only: the run is not refused", run["status"], "succeeded")
+check("clone-only: a golden is captured anyway",
+      (boxd.named("snapshots.create") or {}).get("name"), SNAPSHOT)
+check("clone-only: with no setup command to run", env.get("FACTORY_SETUP"), "")
+check("clone-only: the script skips the install rather than running an empty one",
+      'if [ -n "$FACTORY_SETUP" ]; then' in provision.SCRIPT, True)
+# The stub replays canned output rather than running the script, so what the VM would print
+# is asserted against the script text — the same place the install command is checked.
+check("clone-only: and the script says why it skipped, in the log the UI tails",
+      "capturing the clone without installing" in provision.SCRIPT, True)
+check("clone-only: and says what to add to get the install baked in too",
+      "## Setup" in provision.SCRIPT, True)
+check("clone-only: the register reports it warm",
+      (repos.rows()[0]["golden"], repos.rows()[0]["provision_status"]),
+      (SNAPSHOT, provision.READY))
+
+
+# ---------- a setup command spanning lines is still refused
+#
+# That is a malformed profile, not an absent one, and running it would be running something
+# nobody wrote.
 
 boxd = FakeBoxd()
 real = (runner.client, github.default_branch, github.file)
 runner.client = lambda: boxd
 github.default_branch = lambda repo: _async("main")
-github.file = lambda repo, path, ref=None: _async("# acme/api\n\nNo setup section here.\n")
+github.file = lambda repo, path, ref=None: _async(PROFILE)
+real_setup = provision.setup_command
+provision.setup_command = lambda repo, base: _async("npm ci\nnpm run build")
 try:
     asyncio.run(provision.create(REPO))
-    check("no setup: a repo that names no install command is refused", False)
+    check("multiline: a setup command spanning lines is refused", False)
 except ValueError as exc:
-    check("no setup: a repo that names no install command is refused", True)
-    check("no setup: and the refusal says what to add",
-          "## Setup" in str(exc) and runner.PROFILE_PATH in str(exc), True)
+    check("multiline: a setup command spanning lines is refused",
+          "more than one line" in str(exc), True)
 finally:
     runner.client, github.default_branch, github.file = real
-check("no setup: no VM was created to find that out", boxd.calls, [])
-check("no setup: and no run row was written for it",
-      [r for r in asyncio.run(db.list_runs()) if r["status"] == "queued"], [])
+    provision.setup_command = real_setup
+check("multiline: no VM was created to find that out", boxd.calls, [])
 
 
 # ---------- deleting a golden

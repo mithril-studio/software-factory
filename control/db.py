@@ -352,11 +352,19 @@ async def has_active_run(repo: str) -> bool:
     This is the dispatch guard. The poller checks it before claiming, so a repo runs one
     issue at a time (lowest number first) and a slow label write can never cause a double
     dispatch — the database, not the issue label, decides what is already in flight.
+
+    Provisioning runs are excluded. They are runs in every other sense — a VM, a streamed
+    log, a cancel button — but they claim no issue, and counting them here made connecting a
+    repo stop it: `POST /api/repos` starts a warm-up immediately, so a repo arriving with
+    queued issues sat idle for the whole install. Nothing about a golden gates dispatch, and
+    that is the point of the two-tier design: a repo with no warm snapshot boots `golden-copy`
+    and installs for itself, including while its own snapshot is being built.
     """
     marks = ", ".join("?" for _ in TERMINAL)
     async with connect() as conn:
         async with conn.execute(
-            f"SELECT 1 FROM runs WHERE repo = ? AND status NOT IN ({marks}) LIMIT 1",
+            f"SELECT 1 FROM runs WHERE repo = ? AND kind != 'provision' "
+            f"AND status NOT IN ({marks}) LIMIT 1",
             (repo, *TERMINAL),
         ) as cur:
             return await cur.fetchone() is not None

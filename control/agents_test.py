@@ -32,6 +32,7 @@ from control.agents import (
     golden_name,
     is_golden,
     listed,
+    wait_until_captured,
     parse_golden,
     resolve_snapshot,
     slug,
@@ -279,6 +280,57 @@ check("re-save: and the repo still resolves onto it",
       resolve_snapshot(REPO, asyncio.run(available(resaving))), WARM)
 check("re-save: the version reported is the ready one, not the one in flight",
       version(WARM), "3")
+
+# ---------- waiting for a capture to land
+
+# The bug: `snapshots.create` returns when the capture is *queued*, and `provision` used to
+# destroy the machine on that answer — which aborts the capture and leaves the name `pending`
+# with no version, permanently unbootable. The wait is what turns "queued" into "written".
+
+
+class CapturingBoxd(FakeBoxd):
+    """A fleet where `name` gains `lands` after `after` listings. `lands=None` never finishes."""
+
+    def __init__(self, names, name, after, lands="2"):
+        super().__init__(names, {name: (None, "pending")})
+        self._name, self._after, self._lands = name, after, lands
+
+    async def list(self):
+        rows = await super().list()
+        self._after -= 1
+        if self._after <= 0 and self._lands:
+            self.detail[self._name] = (self._lands, "ready")
+        return rows
+
+
+forget()
+landing = CapturingBoxd([BASE_SNAPSHOT, WARM], WARM, after=3)
+check("wait: it blocks until the fleet publishes a version",
+      asyncio.run(wait_until_captured(landing, WARM, "", timeout=5, poll=0)), "2")
+check("wait: and it kept asking until it did", landing.calls >= 3, True)
+check("wait: after which the golden is one a run can boot",
+      resolve_snapshot(REPO, asyncio.run(available(landing))), WARM)
+
+# A re-save publishes a *new* version under a name that already has one, so "does it have a
+# version" is true before the capture even starts. Testing that instead would return
+# immediately and reap the machine exactly as the original bug did.
+forget()
+resave = CapturingBoxd([BASE_SNAPSHOT, WARM], WARM, after=2, lands="4")
+resave.detail[WARM] = ("3", "pending")
+check("wait: a re-save waits for the version to change, not merely to exist",
+      asyncio.run(wait_until_captured(resave, WARM, "3", timeout=5, poll=0)), "4")
+
+# A capture that never lands must time out rather than hold the machine forever. `provision`
+# catches this and deletes the fragment, because a name with no version behind it is the one
+# shape no dispatch can ever resolve onto.
+forget()
+stuck = CapturingBoxd([BASE_SNAPSHOT, WARM], WARM, after=1, lands=None)
+try:
+    asyncio.run(wait_until_captured(stuck, WARM, "", timeout=0, poll=0))
+    check("wait: a capture that never lands times out", False)
+except TimeoutError as exc:
+    check("wait: a capture that never lands times out", True)
+    check("wait: and the message says what it was still doing", "pending" in str(exc), True)
 
 forget()
 before_calls = capturing.calls

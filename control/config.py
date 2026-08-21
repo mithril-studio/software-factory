@@ -82,6 +82,21 @@ class Settings:
     # checkout at this path; it is the rollback for that migration and goes away with it.
     repo_dir: str = os.environ.get("FACTORY_REPO_DIR", "/home/boxd/repo")
     max_concurrent: int = int(os.environ.get("FACTORY_MAX_CONCURRENT", "3"))
+    # How many goldens may be warmed at once. Its own budget rather than a share of
+    # max_concurrent, because provisioning is slow, bursty (connecting three repos starts
+    # three) and must never be able to starve the builds — which is what happened while both
+    # took the same semaphore.
+    max_provision: int = int(os.environ.get("FACTORY_MAX_PROVISION", "2"))
+    # How long to wait for boxd to finish *writing* a snapshot before giving up on it.
+    # `snapshots.create` returns when the capture is queued, and destroying the machine
+    # underneath a queued capture aborts it permanently — see agents.wait_until_captured.
+    # Twenty minutes is generous against an 8GB image; past it the half-written name is
+    # deleted rather than left in the fleet as something no dispatch can resolve onto.
+    capture_timeout: int = int(os.environ.get("FACTORY_CAPTURE_TIMEOUT", "1200"))
+    # Seconds between asking the fleet whether that capture has landed. One list call, so it
+    # can be frequent; the wait is minutes long and nobody should spend an extra one of them
+    # on a snapshot that went ready right after the last poll.
+    capture_poll: float = float(os.environ.get("FACTORY_CAPTURE_POLL", "5"))
     # Hard ceiling on one agent run. Observed successful runs took 27-53 minutes, so 60
     # minutes killed work that was still going somewhere (and did it silently). 90 leaves
     # real headroom; it must stay comfortably below FACTORY_AUTO_DESTROY, which is the VM's

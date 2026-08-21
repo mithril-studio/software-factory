@@ -42,6 +42,8 @@ logging.basicConfig(
 for noisy in ("httpx", "httpcore", "aiosqlite", "urllib3"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
+log = logging.getLogger("factory.app")
+
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -332,29 +334,67 @@ async def api_goldens_refresh():
     return await goldens.refresh()
 
 
+def _checks_json(checks) -> list[dict]:
+    return [{"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks]
+
+
+@app.get("/api/github/repos")
+async def api_github_repos():
+    """The repos this deployment's token can see, for the connect picker.
+
+    Never a gate and never a source of truth: connecting a repo takes an `owner/name` string
+    and preflight is what decides whether it can be dispatched to. This only spares the person
+    at the keyboard from typing a slug from memory, so a GitHub outage costs the dropdown and
+    nothing else — the error is returned beside an empty list rather than raised, and the form
+    falls back to free text.
+
+    Archived repos are dropped: they cannot take a pull request, so offering one is offering a
+    repo that will pass preflight and then fail at the end of its first run.
+    """
+    watched = set(repos.watched())
+    try:
+        found = await github.list_repos()
+    except Exception as exc:  # noqa: BLE001 - the message is what the picker shows
+        log.warning("could not list the token's repos: %r", exc)
+        return {"repos": [], "error": f"could not list your GitHub repos: {exc}"}
+    return {
+        "repos": [
+            {**r, "connected": r["full_name"] in watched}
+            for r in found
+            if not r["archived"]
+        ],
+        "error": None,
+    }
+
+
 @app.get("/api/preflight")
 async def api_preflight(repo: str):
     """Whether `repo` is ready to be dispatched to, and a golden exists to boot for it.
 
     Read-only: it reports, it never repairs. Answers here cost a second; the same answers
     found during a run cost a VM and forty minutes.
+
+    Shape is validated and GitHub failures are caught, the same way `POST /api/repos` does
+    both. The two used to disagree: this one called `preflight.run` bare, so a typo'd or
+    private repo raised out of `github.default_branch` and the person who mistyped a slug got
+    "Internal Server Error" where the connect button would have told them what was wrong.
     """
-    checks = await preflight.run(repo.strip())
+    repo = repo.strip()
+    if not repos.valid(repo):
+        raise HTTPException(400, f"{repo!r} is not owner/repo")
+    try:
+        checks = await preflight.run(repo)
+    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
+        raise HTTPException(400, f"could not check {repo}: {exc}") from exc
     return {
         "repo": repo,
         "ready": not any(c for c in checks if not c.ok and c.fatal),
-        "checks": [
-            {"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks
-        ],
+        "checks": _checks_json(checks),
     }
 
 
 class ConnectRepo(BaseModel):
     repo: str
-
-
-def _checks_json(checks) -> list[dict]:
-    return [{"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal} for c in checks]
 
 
 @app.post("/api/repos")
@@ -390,10 +430,11 @@ async def api_connect_repo(body: ConnectRepo):
             },
         )
     await repos.add(repo)
-    # Warm a golden for it, if it says how to install itself. Best-effort and reported rather
-    # than awaited: the repo is dispatchable the moment it is registered, so provisioning that
-    # cannot start is a slower repo and not a failed connection. `provision` refuses when the
-    # repo names no `## Setup` command, which is the ordinary reason this returns no run.
+    # Warm a golden for it. Best-effort and reported rather than awaited: the repo is
+    # dispatchable the moment it is registered, so provisioning that cannot start is a slower
+    # repo and not a failed connection. A repo that names no `## Setup` command still gets one
+    # — the clone without the install — so `provision_skipped` is now the unusual answer
+    # (a malformed profile, an unreachable GitHub) rather than the ordinary one.
     provision_run, why = None, None
     try:
         provision_run = await provision.create(repo)
