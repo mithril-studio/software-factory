@@ -279,6 +279,69 @@ check("best effort: the failure is noted in the run log",
       any("memory receipt not recorded" in ln for ln in lines), True)
 
 
+# ---------- the empty receipt is a fact, not an absence
+#
+# `EMPTY_MEMORY_RECEIPT` exists so that "primed, opened nothing" and "never reached step 1"
+# stop looking the same. Dropping its row because there were no records to attribute put them
+# straight back to looking the same — and a run that indexed 40 records and opened none is the
+# most interesting row in the table, because it is memory failing to earn its keep.
+
+EMPTY_LINE = f'{runner.MEMORY_RECEIPT_MARKER} {json.dumps({"indexed": 12, "opened": [], "domains": []})}'
+EMPTY_EVENT = json.dumps({
+    "type": "assistant",
+    "message": {"content": [{"type": "text", "text": f"Nothing here applies.\n{EMPTY_LINE}"}]},
+})
+
+writes.clear()
+receipts.clear()
+run_stream(f"{EMPTY_EVENT}\n{RESULT_EVENT}\n", capture, capture_receipt)
+check("empty receipt: it still files a run-level row", len(receipts), 1)
+check("empty receipt: the index size it saw is kept", receipts[0][1], 12)
+check("empty receipt: no per-record rows, because there are no records", len(writes), 0)
+
+
+# ---------- an empty receipt is provisional until something opens a record
+#
+# The build prompt spells the empty receipt out literally, as valid JSON, so an agent with no
+# `.mem/` can copy it — which means anything echoing the prompt back through the stream (a
+# `cat` of the prompt file, a subagent quoting its instructions) carries a parseable receipt.
+# Stopping at the first match let that echo claim the run and discarded the real receipt
+# printed seconds later.
+
+writes.clear()
+receipts.clear()
+run_stream(f"{EMPTY_EVENT}\n{ASSISTANT_EVENT}\n{RESULT_EVENT}\n", capture, capture_receipt)
+check("provisional: the real receipt still lands after an echoed empty one",
+      [r[0] for r in writes[0][1]] if writes else None, RECEIPT["opened"])
+check("provisional: the run-level row is corrected, not left at the echo",
+      receipts[-1][1], RECEIPT["indexed"])
+check("provisional: the echo and the correction, and nothing more", len(receipts), 2)
+
+# The prompt's own empty-receipt text is the exact string at risk, so use it verbatim.
+prompt_echo = json.dumps({
+    "type": "user",
+    "message": {"content": [{
+        "type": "tool_result",
+        "content": f"$ cat prompt.txt\n... print the explicit empty receipt instead of staying "
+                   f"silent: {runner.MEMORY_RECEIPT_MARKER} "
+                   f"{json.dumps(runner.EMPTY_MEMORY_RECEIPT)}\n",
+    }]},
+})
+writes.clear()
+receipts.clear()
+run_stream(f"{prompt_echo}\n{ASSISTANT_EVENT}\n{RESULT_EVENT}\n", capture, capture_receipt)
+check("provisional: a prompt echo does not stop the real receipt being recorded",
+      [r[0] for r in writes[0][1]] if writes else None, RECEIPT["opened"])
+
+# Once a run has said it opened something, it has answered. A later line — a retry's
+# transcript, a subagent priming for itself — does not get to overwrite that.
+writes.clear()
+receipts.clear()
+run_stream(f"{ASSISTANT_EVENT}\n{EMPTY_EVENT}\n{RESULT_EVENT}\n", capture, capture_receipt)
+check("provisional: a later empty receipt does not overwrite a real one", len(receipts), 1)
+check("provisional: and the real one is what was kept", receipts[0][1], RECEIPT["indexed"])
+
+
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

@@ -496,6 +496,7 @@ async def api_projects():
     """Watched repos with their run tallies and the snapshot their runs boot."""
     watched = repos.rows()
     stats = await db.stats_by_repo()
+    pending = await db.pending_candidates_by_repo()
     # Derived the same way a dispatch derives it, rather than by reading a name off a config
     # value — otherwise this column would say what the repo was configured with where the
     # fleet views say what would actually boot.
@@ -528,9 +529,69 @@ async def api_projects():
                 "failed": s.get("failed", 0) or 0,
                 "active": s.get("active", 0) or 0,
                 "last_run": s.get("last_run"),
+                # Learnings this repo's runs proposed and nobody has decided on yet. Scoped by
+                # `repo`, so one project's queue never shows up under another's.
+                "pending_candidates": pending.get(repo, 0),
             }
         )
     return out
+
+
+# --------------------------------------------------------------------------- memory candidates
+
+# Triage, and only triage. Accepting a candidate says a human read it and thinks it is true;
+# it does not write it into any repository's `.mem/`. Promotion is a separate, deliberate
+# workflow — conflating the two would make the accept button a commit to someone else's repo.
+
+
+def _candidate_out(row: dict) -> dict:
+    """A candidate as the UI reads it, with its evidence decoded back into an object.
+
+    Stored as a JSON string because SQLite has no object column; handing that string to a
+    caller would make every consumer parse it again and one of them would forget.
+    """
+    out = dict(row)
+    try:
+        out["evidence"] = json.loads(row.get("evidence") or "{}")
+    except (TypeError, ValueError):
+        # Kept verbatim rather than dropped: the original evidence is the point of the row,
+        # and a reviewer looking at something unparseable is better served than one shown
+        # nothing at all.
+        out["evidence"] = {"raw": row.get("evidence")}
+    return out
+
+
+@app.get("/api/memory/candidates")
+async def api_memory_candidates(repo: str | None = None, status: str | None = None):
+    """Pending learnings, oldest first, optionally scoped to one repo and/or one status."""
+    return [_candidate_out(row) for row in await db.list_candidates(repo=repo, status=status)]
+
+
+@app.get("/api/memory/candidates/{candidate_id}")
+async def api_memory_candidate(candidate_id: str):
+    row = await db.get_candidate(candidate_id)
+    if row is None:
+        raise HTTPException(404, f"no such memory candidate: {candidate_id}")
+    return _candidate_out(row)
+
+
+@app.post("/api/memory/candidates/{candidate_id}/{decision}")
+async def api_memory_candidate_decision(candidate_id: str, decision: str):
+    """Accept or reject a pending candidate, exactly once.
+
+    409 rather than 200 on a repeat: a candidate that has already been decided has not just
+    been decided again, and a reviewer whose click lost a race needs to be told so rather than
+    shown a success that overwrote someone else's decision.
+    """
+    if decision not in ("accept", "reject"):
+        raise HTTPException(404, f"no such decision: {decision}")
+    if await db.get_candidate(candidate_id) is None:
+        raise HTTPException(404, f"no such memory candidate: {candidate_id}")
+    try:
+        row = await db.transition_candidate(candidate_id, f"{decision}ed")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return _candidate_out(row)
 
 
 # --------------------------------------------------------------------------- goldens / fleet

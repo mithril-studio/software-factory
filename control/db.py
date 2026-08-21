@@ -409,6 +409,19 @@ CANDIDATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "pending": ("accepted", "rejected"),
 }
 
+CANDIDATE_INITIAL_STATUS = "pending"
+
+# The columns a caller may set. Values are always bound as parameters, but column *names* are
+# interpolated into the statement — there is no placeholder for an identifier in SQL — so the
+# set of legal names has to be closed here rather than taken from whatever the caller passed.
+# It matters because of where candidates come from: a run collects them from a JSONL file the
+# agent wrote, and an unknown key would otherwise travel from that file straight into the text
+# of a statement. A typo becomes a clear error at the same time.
+CANDIDATE_COLUMNS = frozenset({
+    "id", "run_id", "repo", "domain", "type", "title", "body", "evidence",
+    "confidence", "status", "created_at", "updated_at",
+})
+
 
 async def create_candidate(**fields: Any) -> None:
     """Insert a candidate, or leave an already-inserted one exactly as it is.
@@ -416,8 +429,22 @@ async def create_candidate(**fields: Any) -> None:
     `INSERT OR IGNORE` on the primary key: resubmitting the same candidate id (an agent
     retrying, or a run observing the same evidence twice) must not duplicate it or reset a
     status a reviewer has already moved on from.
+
+    Raises `ValueError` on an unknown column, or on a status this table does not define.
     """
-    fields = {"status": "pending", **fields}
+    fields = {"status": CANDIDATE_INITIAL_STATUS, **fields}
+    unknown = sorted(set(fields) - CANDIDATE_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown memory_candidates column(s): {', '.join(unknown)}")
+    # Every candidate is born pending. `transition_candidate` is the only door to a terminal
+    # state, and it is the door that enforces "exactly once" — so letting an insert name its
+    # own status would be a way to arrive at `accepted` having skipped triage entirely, which
+    # is the one thing this queue exists to prevent.
+    if fields["status"] != CANDIDATE_INITIAL_STATUS:
+        raise ValueError(
+            f"a candidate is created {CANDIDATE_INITIAL_STATUS}, not {fields['status']!r}; "
+            f"use transition_candidate"
+        )
     now = utcnow()
     fields.setdefault("created_at", now)
     fields.setdefault("updated_at", now)
@@ -459,6 +486,18 @@ async def list_candidates(repo: str | None = None, status: str | None = None) ->
     return [dict(r) for r in rows]
 
 
+async def pending_candidates_by_repo() -> dict[str, int]:
+    """How many undecided candidates each repo is holding. Keyed by repo, absent when zero."""
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT repo, COUNT(*) AS pending FROM memory_candidates "
+            "WHERE status = ? GROUP BY repo",
+            (CANDIDATE_INITIAL_STATUS,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return {r["repo"]: r["pending"] for r in rows}
+
+
 async def transition_candidate(candidate_id: str, to_status: str) -> dict:
     """Move a candidate along an explicitly allowed edge, or raise.
 
@@ -473,11 +512,23 @@ async def transition_candidate(candidate_id: str, to_status: str) -> dict:
     allowed = CANDIDATE_TRANSITIONS.get(current, ())
     if to_status not in allowed:
         raise ValueError(f"cannot transition candidate {candidate_id} from {current} to {to_status}")
+    now = utcnow()
     async with connect() as conn:
-        await conn.execute(
-            "UPDATE memory_candidates SET status = ?, updated_at = ? WHERE id = ?",
-            (to_status, utcnow(), candidate_id),
+        # `WHERE status = ?` as well as `WHERE id = ?`, and the row count is the answer. The
+        # read above cannot be what decides: two reviewers clicking accept and reject at the
+        # same moment both read `pending`, and an unconditional UPDATE would let both "succeed"
+        # with the slower one silently overwriting the faster. The database decides who was
+        # first; the loser is told, and gets the same error as any other invalid transition.
+        cursor = await conn.execute(
+            "UPDATE memory_candidates SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+            (to_status, now, candidate_id, current),
         )
         await conn.commit()
+        if not cursor.rowcount:
+            raise ValueError(
+                f"cannot transition candidate {candidate_id} from {current} to {to_status}: "
+                f"it changed underneath this request"
+            )
     candidate["status"] = to_status
+    candidate["updated_at"] = now
     return candidate

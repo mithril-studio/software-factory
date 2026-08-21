@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import hashlib
 import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 from boxd import AsyncBoxd, _mappers as _boxd_mappers
@@ -21,7 +23,7 @@ from boxd import AsyncBoxd, _mappers as _boxd_mappers
 from telemetry import store as telemetry_store
 from telemetry.recorder import Recorder
 
-from . import agents, db, github
+from . import agents, db, github, memory
 from .config import settings
 
 # boxd reports a snapshot's timestamps in **milliseconds**, but the SDK's snapshot mapper reads
@@ -341,6 +343,30 @@ def _receipt_candidates(event: dict) -> list[str]:
     return texts
 
 
+def _better_receipt(current: dict | None, texts: Iterable[str]) -> dict | None:
+    """The first receipt in `texts` worth replacing `current` with, or `None` for none.
+
+    A receipt that opened nothing is accepted but held provisionally, and here is why: the
+    build prompt spells the empty receipt out literally, as valid JSON, so that an agent with
+    no `.mem/` can copy it. Anything that echoes the prompt back through the stream — a
+    `cat` of the prompt file, a subagent quoting its instructions, the transcript of a
+    retry — therefore carries a parseable empty receipt. Stopping at the first match would
+    let that echo claim the run, and the real receipt printed seconds later would be
+    discarded as a duplicate. So a run keeps listening until something says it opened a
+    record, and telemetry corrects itself: the run-level row REPLACEs, the per-record rows
+    are keyed and IGNORE, so an upgrade costs one extra write and no wrong row.
+
+    A receipt identical to the one already held is not a correction and writes nothing.
+    """
+    if current is not None and current.get("opened"):
+        return None
+    for text in texts:
+        candidate = parse_memory_receipt(text)
+        if candidate is not None and candidate != current:
+            return candidate
+    return None
+
+
 async def _persist_memory_receipt(run_id: str, receipt: dict, log: RunLog) -> None:
     """Turn one parsed `FACTORY_MEMORY` receipt into telemetry rows, one per opened record.
 
@@ -349,12 +375,14 @@ async def _persist_memory_receipt(run_id: str, receipt: dict, log: RunLog) -> No
     schema that has not migrated — is logged and swallowed rather than allowed to fail or
     stop the agent stream that produced it.
 
-    A receipt with nothing `opened` (including the explicit empty receipt) writes nothing:
-    there is no record to attribute a row to.
+    A receipt with nothing `opened` still writes its run-level row. That is the whole reason
+    the empty receipt is explicit rather than silence (`EMPTY_MEMORY_RECEIPT`): "the agent
+    primed and found nothing worth opening" and "the agent never reached step 1" are different
+    facts about a run, and dropping the row here would have made them identical downstream —
+    the exact confusion the contract was written to prevent. Only the per-record rows depend
+    on `opened`; there is no record to attribute those to.
     """
     opened = receipt.get("opened") or []
-    if not opened:
-        return
     try:
         ts = db.utcnow()
         # Two writes, at the two levels the receipt actually speaks at: one row per record it
@@ -362,14 +390,218 @@ async def _persist_memory_receipt(run_id: str, receipt: dict, log: RunLog) -> No
         # drew from. The domains are not split across the records — the receipt names them as
         # a set and says nothing about which record came from which — so nothing here picks
         # one, and nothing can pick wrong.
-        await telemetry_store.write_memory_reads(
-            run_id, [(memory_id, ts) for memory_id in opened]
-        )
+        if opened:
+            await telemetry_store.write_memory_reads(
+                run_id, [(memory_id, ts) for memory_id in opened]
+            )
         await telemetry_store.write_memory_receipt(
             run_id, receipt.get("indexed") or 0, receipt.get("domains") or [], ts
         )
     except Exception as exc:  # noqa: BLE001 - telemetry must never fail an otherwise good run
         log.write(f"[factory] memory receipt not recorded: {exc!r}")
+
+
+# --------------------------------------------------------------------------- memory candidates
+
+# Where the agent writes the learnings it wants to propose, and the variable that tells it.
+# A file rather than a marker in the stream, because a candidate is a paragraph with evidence
+# attached, and a run that could file one by printing would turn every stray line of narration
+# into a queue entry. The path is per-run and inside the VM, which dies with the run.
+MEMORY_CANDIDATE_ENV = "FACTORY_MEMORY_CANDIDATES"
+MEMORY_CANDIDATE_PATH = "/tmp/factory-memory-candidates.jsonl"
+
+# Bounds, so a run cannot turn its transcript into a queue. Each is enforced on the way in and
+# every rejection is logged with its reason — a silent truncation reads as "nothing more was
+# proposed", which is the one thing a triage queue must never imply.
+MEMORY_CANDIDATE_MAX_BYTES = 64 * 1024
+MEMORY_CANDIDATE_MAX_RECORDS = 20
+MEMORY_CANDIDATE_MAX_TITLE = 200
+MEMORY_CANDIDATE_MAX_BODY = 4000
+
+# A candidate is a proposed memory record, so it answers to the memory skill's vocabulary
+# rather than a second one invented here.
+MEMORY_CANDIDATE_TYPES = memory.VALID_TYPES
+MEMORY_CANDIDATE_CONFIDENCE = memory.VALID_CONFIDENCE
+
+_CANDIDATE_REQUIRED = ("domain", "type", "title", "body", "evidence")
+_DOMAIN_NAME = re.compile(r"[a-z0-9_][a-z0-9_-]*\Z")
+
+
+def _candidate_paths(evidence: dict) -> tuple[list[str], str | None]:
+    """The repository-relative paths an evidence object names, or why it has none usable.
+
+    Repository-relative is the whole check. `/etc/passwd` and `../../secrets` are not evidence
+    about this repository, and a candidate carrying one is either confused or reaching — either
+    way it is not something to store and later show a reviewer as this repo's own learning.
+    """
+    if not isinstance(evidence, dict):
+        return [], "evidence is not an object"
+    paths = []
+    for key in ("files", "dirs"):
+        value = evidence.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            return [], f"evidence.{key} is not a list"
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                return [], f"evidence.{key} holds something that is not a path"
+            path = item.strip()
+            if path.startswith("/") or path.startswith("~"):
+                return [], f"evidence path {path!r} is absolute, not repository-relative"
+            if any(part == ".." for part in PurePosixPath(path).parts):
+                return [], f"evidence path {path!r} climbs out of the repository"
+            paths.append(path)
+    if not paths:
+        return [], "evidence names no file or directory in this repository"
+    return paths, None
+
+
+def _candidate_id(run_id: str, record: dict) -> str:
+    """A stable id for one proposal, so collecting twice is one candidate and not two.
+
+    Derived from the run and the content rather than handed out by the agent: an id the agent
+    chose is an id the agent can reuse for a different learning, and `INSERT OR IGNORE` would
+    then silently keep the first and drop the second.
+    """
+    payload = json.dumps(
+        {k: record.get(k) for k in _CANDIDATE_REQUIRED}, sort_keys=True, ensure_ascii=False
+    )
+    digest = hashlib.sha256(f"{run_id}\x00{payload}".encode()).hexdigest()[:16]
+    return f"cand_{digest}"
+
+
+def parse_memory_candidates(text: str, run_id: str) -> tuple[list[dict], list[str]]:
+    """Split a candidate artifact into what may be queued and what was refused, and why.
+
+    Pure and total: it reads text an agent wrote inside a VM and returns
+    `(accepted, rejections)`. Nothing here raises and nothing here decides a candidate is
+    *true* — admission is about shape, scope and bounds, and the reviewer decides the rest.
+    """
+    rejections: list[str] = []
+    if not text:
+        return [], rejections
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) > MEMORY_CANDIDATE_MAX_BYTES:
+        return [], [
+            f"candidate artifact is {len(raw)} bytes, over the "
+            f"{MEMORY_CANDIDATE_MAX_BYTES}-byte limit; nothing was queued"
+        ]
+
+    accepted: list[dict] = []
+    seen: set[str] = set()
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        if len(accepted) >= MEMORY_CANDIDATE_MAX_RECORDS:
+            rejections.append(
+                f"line {lineno}: over the {MEMORY_CANDIDATE_MAX_RECORDS}-candidate limit "
+                f"for one run"
+            )
+            continue
+        record, why = _read_candidate(line, lineno)
+        if why is not None:
+            rejections.append(why)
+            continue
+        record["id"] = _candidate_id(run_id, record)
+        if record["id"] in seen:
+            rejections.append(f"line {lineno}: the same candidate was already proposed")
+            continue
+        seen.add(record["id"])
+        accepted.append(record)
+    return accepted, rejections
+
+
+def _read_candidate(line: str, lineno: int) -> tuple[dict, None] | tuple[None, str]:
+    """One line of the artifact, as a queueable record or as the reason it is not one."""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError as exc:
+        return None, f"line {lineno}: not JSON ({exc.msg})"
+    if not isinstance(obj, dict):
+        return None, f"line {lineno}: not a JSON object"
+    missing = [f for f in _CANDIDATE_REQUIRED if not obj.get(f)]
+    if missing:
+        return None, f"line {lineno}: missing {', '.join(missing)}"
+
+    domain = str(obj["domain"]).strip()
+    if not _DOMAIN_NAME.match(domain):
+        return None, f"line {lineno}: {domain!r} is not a domain slug"
+    if obj["type"] not in MEMORY_CANDIDATE_TYPES:
+        return None, f"line {lineno}: unknown type {obj['type']!r}"
+    # The memory skill's own rule (§3.1), applied here rather than after the fact: a `failure`
+    # without its fix is the half of the learning that costs time and none of the half that
+    # saves it.
+    if obj["type"] == "failure" and not str(obj.get("resolution") or "").strip():
+        return None, f"line {lineno}: type 'failure' with no resolution"
+    confidence = str(obj.get("confidence") or "medium")
+    if confidence not in MEMORY_CANDIDATE_CONFIDENCE:
+        return None, f"line {lineno}: unknown confidence {confidence!r}"
+
+    title = str(obj["title"]).strip()
+    body = str(obj["body"]).strip()
+    if len(title) > MEMORY_CANDIDATE_MAX_TITLE:
+        return None, f"line {lineno}: title is {len(title)} characters, over {MEMORY_CANDIDATE_MAX_TITLE}"
+    if len(body) > MEMORY_CANDIDATE_MAX_BODY:
+        return None, f"line {lineno}: body is {len(body)} characters, over {MEMORY_CANDIDATE_MAX_BODY}"
+
+    paths, why = _candidate_paths(obj["evidence"])
+    if why is not None:
+        return None, f"line {lineno}: {why}"
+
+    evidence = {"files": [], "dirs": []}
+    for key in ("files", "dirs"):
+        value = obj["evidence"].get(key)
+        if isinstance(value, list):
+            evidence[key] = [v.strip() for v in value if isinstance(v, str) and v.strip()]
+    if obj["type"] == "failure":
+        evidence["resolution"] = str(obj["resolution"]).strip()
+    return {
+        "domain": domain,
+        "type": obj["type"],
+        "title": title,
+        "body": body,
+        "evidence": json.dumps(evidence, ensure_ascii=False),
+        "confidence": confidence,
+    }, None
+
+
+async def _collect_memory_candidates(
+    boxd: AsyncBoxd, machine_id: str, run_id: str, repo: str, log: RunLog
+) -> int:
+    """Read the run's candidate artifact out of the VM and queue what passes.
+
+    Called before the VM is destroyed, on every path that had one — a run that failed may
+    have learned the most useful thing in the batch, and a run that is about to be reaped is
+    the last moment the file exists.
+
+    Best effort, like the transcript salvage beside it: nothing about proposing a learning is
+    worth failing a run that has already done its work.
+    """
+    script = (
+        f'[ -f "{MEMORY_CANDIDATE_PATH}" ] && '
+        f'[ "$(wc -c < "{MEMORY_CANDIDATE_PATH}")" -le {MEMORY_CANDIDATE_MAX_BYTES * 2} ] && '
+        f'cat "{MEMORY_CANDIDATE_PATH}" || true'
+    )
+    try:
+        result = await boxd.machines.exec(machine_id, script, timeout=60)
+        text = result.stdout or ""
+        if not text.strip():
+            return 0
+        accepted, rejections = parse_memory_candidates(text, run_id)
+        for why in rejections:
+            log.write(f"[factory] memory candidate rejected: {why}")
+        for record in accepted:
+            await db.create_candidate(run_id=run_id, repo=repo, **record)
+        if accepted:
+            log.write(
+                f"[factory] {len(accepted)} memory candidate(s) queued for review"
+                + (f", {len(rejections)} rejected" if rejections else "")
+            )
+        return len(accepted)
+    except Exception as exc:  # noqa: BLE001 - a proposal is never worth a run
+        log.write(f"[factory] memory candidates not collected: {exc!r}")
+        return 0
 
 
 # --------------------------------------------------------------------------- prompt
@@ -415,6 +647,21 @@ How to work:
 5. Verify with the repo's own fast checks — the ones named under "This project" below,
    and only those. Do not add a test framework or test runner that isn't already in the repo.
 6. Record anything durable you learned into `.mem/`, following the memory skill.
+   Separately, if you learned something reusable that you are **not** confident enough to
+   write into `.mem/` yourself, propose it: append one JSON object per line to the file named
+   by `${memory_candidate_env}` (`{memory_candidate_path}`), before you finish. These are
+   **candidates, not memory** — nothing you write there enters `.mem/` or reaches another run
+   until a human accepts it, so proposing costs a later reviewer thirty seconds and nothing
+   else. One line per learning:
+   `{{"domain": "<slug>", "type": "convention|failure|pattern|decision|reference", "title": "<one line>", "body": "<a few sentences, including why>", "evidence": {{"files": ["path/in/this/repo"], "dirs": []}}, "confidence": "high|medium|low"}}`
+   A `failure` also needs `"resolution"`: what actually fixed it.
+   Propose one only if it is all six of: **novel** (not already in `.mem/`), **specific**
+   (a fact, not a sentiment), **reusable** (a future run on this repo would want it),
+   **scoped** (evidence paths inside this repository, never absolute), **evidence-backed**
+   (you saw it in the code or in a command's output), and **not already obvious** from the
+   README, CLAUDE.md, `.factory.md` or the code itself. At most {memory_candidate_max}, and
+   usually zero — a run that discovered nothing new writes nothing. Never put a secret, a
+   token, or a transcript excerpt in one.
 7. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
    referencing the issue in the body so it links (e.g. "Closes #{number}").
 
@@ -580,6 +827,9 @@ def build_prompt(
         project_notes=notes,
         memory_receipt_marker=MEMORY_RECEIPT_MARKER,
         empty_memory_receipt=json.dumps(EMPTY_MEMORY_RECEIPT),
+        memory_candidate_env=MEMORY_CANDIDATE_ENV,
+        memory_candidate_path=MEMORY_CANDIDATE_PATH,
+        memory_candidate_max=MEMORY_CANDIDATE_MAX_RECORDS,
     )
     if attempt > 1:
         prompt += RETRY_TEMPLATE.format(
@@ -860,6 +1110,11 @@ def dispatch_env(
     }
     if attempt is not None:
         env["FACTORY_ATTEMPT"] = str(attempt)
+    if kind != "review":
+        # Where to propose learnings, read back before the VM is reaped. Set only on the path
+        # that asks for it and reads it: an environment variable naming a file nobody collects
+        # is an invitation to write into a void, and the review prompt makes no such promise.
+        env[MEMORY_CANDIDATE_ENV] = MEMORY_CANDIDATE_PATH
     if settings.github_token:
         env["GH_TOKEN"] = settings.github_token
     # Durable auth for the agent itself, overriding the golden's expiring OAuth.
@@ -1512,6 +1767,7 @@ async def _execute(
     boxd = client()
     machine = None
     reaped = False
+    collected = False
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
@@ -1584,6 +1840,11 @@ async def _execute(
         else:
             log.write("[factory] no pull request found for this branch")
         await _salvage_transcript(boxd, machine.id, run_id, log, manifest)
+        # Whatever the agent proposed, read out while the VM still exists. This is the
+        # ordinary path and it covers a failed agent as well as a successful one — a run that
+        # exited non-zero still gets here, and is often the one that learned the most.
+        await _collect_memory_candidates(boxd, machine.id, run_id, repo, log)
+        collected = True
 
         ok = exit_code == 0 and pr_url is not None
         review_next = False
@@ -1642,6 +1903,11 @@ async def _execute(
         # those used to leave a machine running until its two-hour self-destruct. The reap in
         # the body is the ordinary path and this is the one that catches the rest; `reaped`
         # keeps it from running twice.
+        # The exceptional path: the stream dropped, the run timed out, a GitHub call blew up
+        # after the agent had finished. The ordinary collection above never ran, and the reap
+        # below is about to take the file with it — so this is the last moment there is.
+        if machine is not None and not collected:
+            await _collect_memory_candidates(boxd, machine.id, run_id, repo, log)
         if not reaped:
             await reap(boxd, machine, log, keep=settings.keep_failed)
         await boxd.close()
@@ -1947,19 +2213,15 @@ async def _stream(
                     await recorder.feed(event)
                     for formatted in stream_lines(event, line):
                         log.write(formatted)
-                    if receipt is None:
-                        for text in _receipt_candidates(event):
-                            candidate = parse_memory_receipt(text)
-                            if candidate is not None:
-                                receipt = candidate
-                                await _persist_memory_receipt(run_id, receipt, log)
-                                break
-                    continue
-                if receipt is None:
-                    candidate = parse_memory_receipt(line)
-                    if candidate is not None:
-                        receipt = candidate
+                    better = _better_receipt(receipt, _receipt_candidates(event))
+                    if better is not None:
+                        receipt = better
                         await _persist_memory_receipt(run_id, receipt, log)
+                    continue
+                better = _better_receipt(receipt, (line,))
+                if better is not None:
+                    receipt = better
+                    await _persist_memory_receipt(run_id, receipt, log)
                 log.write(line)
         code = stream.exit_code
         if inspect.isawaitable(code):

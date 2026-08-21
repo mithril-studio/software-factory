@@ -76,8 +76,15 @@ def _relpath(repo: Path, path: Path) -> str:
         return str(path)
 
 
-def _read_jsonl(path: Path, repo: Path, findings: list[Finding]) -> list[tuple[int, dict]]:
-    """Parse a JSONL file, reporting one finding per unparseable line."""
+def _read_jsonl(path: Path, repo: Path,
+                findings: list[Finding]) -> list[tuple[int, str, dict]]:
+    """Parse a JSONL file, reporting one finding per unparseable line.
+
+    Each entry carries the raw line alongside the parsed object, because the index's
+    byte-budget check (§3.2) is about the bytes on disk, not about what they decode to.
+    Handing it back here is what keeps the caller from re-reading the whole file once per
+    line to find them again.
+    """
     rel = _relpath(repo, path)
     entries = []
     for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
@@ -91,7 +98,7 @@ def _read_jsonl(path: Path, repo: Path, findings: list[Finding]) -> list[tuple[i
         if not isinstance(obj, dict):
             findings.append(Finding(rel, "line is valid JSON but not an object", lineno))
             continue
-        entries.append((lineno, obj))
+        entries.append((lineno, raw, obj))
     return entries
 
 
@@ -212,7 +219,7 @@ def _collect_records(mem: Path, repo: Path, subdir: str, retired: bool,
     for path in sorted(directory.glob("*.jsonl")):
         rel = _relpath(repo, path)
         domain_file = path.stem
-        for lineno, obj in _read_jsonl(path, repo, findings):
+        for lineno, _raw, obj in _read_jsonl(path, repo, findings):
             _check_record_shape(rel, lineno, obj, domain_file, findings)
             if not retired:
                 _check_evidence(rel, lineno, obj, repo, findings)
@@ -246,21 +253,40 @@ def _check_unique_ids(records: list[_Record], findings: list[Finding]) -> None:
             ))
         else:
             findings.append(Finding(
-                rec.path, f"id {rec.id!r} appears both active ({'archived' if rec.retired else 'live'} "
-                          f"at {prior.path}:{prior.line}) and retired — a live id must not also be "
-                          f"archived", rec.line,
+                rec.path, f"id {rec.id!r} is both live and archived — {'archived' if prior.retired else 'live'} "
+                          f"at {prior.path}:{prior.line}, {'archived' if rec.retired else 'live'} here; a "
+                          f"retired record moves to archive/, it is not copied there", rec.line,
             ))
+
+
+def _index_files(obj: dict) -> list[str]:
+    """§3.2: an index line's `files` is `evidence.files` plus `evidence.dirs`, merged.
+
+    Order is not part of the contract, so this returns the list as written and the caller
+    compares it as a set — but nothing may be dropped, because this list is the only thing
+    priming (§4 step 3) matches a working set against.
+    """
+    return _evidence_paths(obj)
 
 
 def _check_index_consistency(index_entries: list[tuple[int, dict]], live: list[_Record],
                               index_rel: str, findings: list[Finding]) -> None:
     live_by_id = {r.id: r for r in live if isinstance(r.obj, dict) and r.obj.get("id") == r.id}
-    indexed_ids = set()
+    indexed_ids: dict[str, int] = {}
     for lineno, obj in index_entries:
         rid = obj.get("id")
         if rid is None:
             continue
-        indexed_ids.add(rid)
+        # Exactly one line per active record (§3.2). Two lines for one id is not merely
+        # untidy: whichever the reader hits first decides what it believes about a record,
+        # and the other is a second answer nothing reconciles.
+        if rid in indexed_ids:
+            findings.append(Finding(
+                index_rel, f"index entry {rid!r} appears twice, first at line "
+                           f"{indexed_ids[rid]}; a record gets exactly one index line", lineno,
+            ))
+            continue
+        indexed_ids[rid] = lineno
         record = live_by_id.get(rid)
         if record is None:
             findings.append(Finding(
@@ -273,6 +299,29 @@ def _check_index_consistency(index_entries: list[tuple[int, dict]], live: list[_
                     index_rel, f"index entry {rid!r} {field}={obj.get(field)!r} disagrees with "
                                f"record {field}={record.obj.get(field)!r} ({record.path}:{record.line})",
                     lineno,
+                ))
+        # The one field where drift is silent and expensive. `domain`, `type` and `title` are
+        # copied verbatim and a mismatch is visible to anyone reading both lines; `files` is
+        # derived, so it goes stale the moment a record's evidence grows and the index line
+        # does not. Priming selects on the index alone, so a path that is in the record but
+        # not the index means the record is simply never retrieved for that path — the store
+        # looks healthy and quietly under-serves. Checked here so it cannot happen twice.
+        entry_files = obj.get("files")
+        if isinstance(entry_files, list):
+            want = _index_files(record.obj)
+            have = [f for f in entry_files if isinstance(f, str)]
+            dropped = sorted(set(want) - set(have))
+            invented = sorted(set(have) - set(want))
+            if dropped:
+                findings.append(Finding(
+                    index_rel, f"index entry {rid!r} omits evidence path(s) the record names: "
+                               f"{dropped} — priming matches on this list, so the record is "
+                               f"invisible to work touching them", lineno,
+                ))
+            if invented:
+                findings.append(Finding(
+                    index_rel, f"index entry {rid!r} names path(s) the record's evidence does "
+                               f"not: {invented}", lineno,
                 ))
 
     for rec in live:
@@ -315,8 +364,7 @@ def validate(repo_path: str = ".") -> list[Finding]:
     index_entries: list[tuple[int, dict]] = []
     if index_path.exists():
         index_rel = _relpath(repo, index_path)
-        for lineno, obj in _read_jsonl(index_path, repo, findings):
-            raw = index_path.read_text().splitlines()[lineno - 1]
+        for lineno, raw, obj in _read_jsonl(index_path, repo, findings):
             _check_index_entry(index_rel, lineno, raw, obj, findings)
             index_entries.append((lineno, obj))
     elif domains_dir.is_dir() and any(domains_dir.glob("*.jsonl")):

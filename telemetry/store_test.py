@@ -168,6 +168,61 @@ check("every repo with memory reads has a positive average cost",
       all(row["avg_derived_cost_usd"] > 0 for row in by_repo.values()))
 
 
+# ---------- a run that primed and opened nothing is still a run that primed
+#
+# Reading only `memory_reads` made it invisible, and with it every repo whose runs all look
+# like that — which is precisely the repo whose memory is not earning its keep, the one an
+# operator most needs to see. `runs_with_memory` still means "retrieved a record"; the count
+# of runs that got as far as priming is its own number.
+
+async def seed_primed_only():
+    async with aiosqlite.connect(config.db_path) as conn:
+        await conn.execute(
+            "INSERT INTO runs (id, repo, issue_number, issue_title, branch, status, attempt, "
+            "agent, log_path, created_at) VALUES ('run-repo-c-1', 'org/c', 1, 't', 'b', 's', 1, "
+            "'a', 'l', '2026-08-20T00:00:00Z')"
+        )
+        await conn.execute(
+            "INSERT INTO llm_calls (run_id, turn, ts, model, input_tokens, output_tokens) "
+            "VALUES ('run-repo-c-1', 1, '2026-08-20T00:00:00Z', 'claude-sonnet-5', 1000, 1000)"
+        )
+        await conn.commit()
+
+
+run(seed_primed_only())
+run(store.write_memory_receipt("run-repo-c-1", 14, [], "2026-08-20T13:00:00Z"))
+
+by_repo = {row["repo"]: row for row in run(store.memory_metrics_by_repo())}
+check("a repo whose only run primed but opened nothing is still reported",
+      "org/c" in by_repo, True)
+check("that run counts as primed", by_repo["org/c"]["runs_primed"], 1)
+check("but not as a run that used memory", by_repo["org/c"]["runs_with_memory"], 0)
+check("and it retrieved no records", by_repo["org/c"]["distinct_records"], 0)
+check("a repo whose runs both primed and opened counts both ways",
+      (by_repo["org/a"]["runs_primed"], by_repo["org/a"]["runs_with_memory"]), (2, 2))
+
+
+# ---------- clear_run means the run
+#
+# A backfill replays a run's transcript over the top of whatever is already stored. Leaving
+# the memory rows behind was survivable only while the replay produced an identical receipt;
+# a replay of a corrected transcript, or one that finds no receipt at all, would otherwise
+# leave the old rows standing as the run's answer forever.
+
+run(store.write_memory_reads("run-clear", [("mem_9999", "2026-08-20T14:00:00Z")]))
+run(store.write_memory_receipt("run-clear", 7, ["repository"], "2026-08-20T14:00:00Z"))
+check("before clearing, the run has its memory rows",
+      (len(run(store.memory_reads_for_run("run-clear"))),
+       bool(run(store.memory_receipt_for_run("run-clear")))), (1, True))
+run(store.clear_run("run-clear"))
+check("clear_run drops the run's memory reads",
+      run(store.memory_reads_for_run("run-clear")), [])
+check("clear_run drops the run's receipt",
+      run(store.memory_receipt_for_run("run-clear")), {})
+check("clear_run left another run's memory rows alone",
+      len(run(store.memory_reads_for_run("run-repo-a-2"))), 2)
+
+
 if fails:
     print(f"\n{len(fails)} failed: {', '.join(fails)}")
     sys.exit(1)

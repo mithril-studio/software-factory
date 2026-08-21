@@ -208,10 +208,19 @@ async def write(rows: Sequence[LlmCall | ToolCall]) -> None:
 
 
 async def clear_run(run_id: str) -> None:
-    """Drop a run's rows. Makes re-running a backfill safe."""
+    """Drop a run's rows. Makes re-running a backfill safe.
+
+    Every table keyed on `run_id`, memory included. `memory_reads` IGNOREs a repeat and
+    `memory_receipts` REPLACEs one, so leaving them behind looked harmless — but only while a
+    replay produces exactly the same receipt. A replay that reads a *corrected* transcript, or
+    one that finds no receipt at all, would otherwise leave the old rows standing as the run's
+    answer forever. "Clear the run" has to mean the run.
+    """
     async with connect() as conn:
         await conn.execute("DELETE FROM llm_calls WHERE run_id = ?", (run_id,))
         await conn.execute("DELETE FROM tool_calls WHERE run_id = ?", (run_id,))
+        await conn.execute("DELETE FROM memory_reads WHERE run_id = ?", (run_id,))
+        await conn.execute("DELETE FROM memory_receipts WHERE run_id = ?", (run_id,))
         await conn.commit()
 
 
@@ -295,13 +304,27 @@ async def memory_metrics_by_repo() -> list[dict]:
             {PRICE_JOIN}
             GROUP BY c.run_id
         ),
+        -- Every run that reported on memory at all, whether or not it opened anything. A run
+        -- that primed an index of 40 records and opened none is the single most useful row in
+        -- this table — it is memory failing to earn its keep — and reading only `memory_reads`
+        -- made exactly that run invisible, along with every repo whose runs all look like it.
+        -- `runs_with_memory` still counts only runs that retrieved a record, because that is
+        -- what the phrase means; `runs_primed` counts the ones that got as far as priming.
         repo_runs AS (
             SELECT DISTINCT mr.run_id, r.repo
             FROM memory_reads mr
             JOIN runs r ON r.id = mr.run_id
+            UNION
+            SELECT DISTINCT mrc.run_id, r.repo
+            FROM memory_receipts mrc
+            JOIN runs r ON r.id = mrc.run_id
         )
         SELECT rr.repo,
-               COUNT(DISTINCT rr.run_id) AS runs_with_memory,
+               (SELECT COUNT(DISTINCT mr3.run_id)
+                  FROM memory_reads mr3
+                  JOIN runs r3 ON r3.id = mr3.run_id
+                 WHERE r3.repo = rr.repo)  AS runs_with_memory,
+               COUNT(DISTINCT rr.run_id)   AS runs_primed,
                (SELECT COUNT(DISTINCT mr2.memory_id)
                   FROM memory_reads mr2
                   JOIN runs r2 ON r2.id = mr2.run_id

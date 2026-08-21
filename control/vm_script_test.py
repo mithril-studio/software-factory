@@ -320,10 +320,17 @@ for name, env in (("build", build), ("review", review)):
           env.get("FACTORY_BASE")), ("factory/issue-7", "main"))
     check(f"env: {name} carries the prompt", env.get("FACTORY_PROMPT"), "do the thing")
 
-# What the two paths may differ on, and nothing else.
-check("env: the two paths differ only in the attempt and the trace",
+# What the two paths may differ on, and nothing else. The list is the guard: a review VM that
+# cloned a different repo, or authenticated as somebody else, than the build VM whose work it
+# is checking would not be reviewing that work. Each entry here is a difference someone argued
+# for — a build counts attempts, a review labels its trace, and only a build is asked to
+# propose learnings, so only a build is told where to write them.
+check("env: the two paths differ only in the attempt, the trace and the candidate file",
       sorted(k for k in set(build) | set(review) if build.get(k) != review.get(k)),
-      ["FACTORY_ATTEMPT", "OTEL_RESOURCE_ATTRIBUTES"])
+      ["FACTORY_ATTEMPT", "FACTORY_MEMORY_CANDIDATES", "OTEL_RESOURCE_ATTRIBUTES"])
+check("env: only a build run is given somewhere to propose learnings",
+      (runner.MEMORY_CANDIDATE_ENV in build, runner.MEMORY_CANDIDATE_ENV in review),
+      (True, False))
 check("env: only a build run counts attempts",
       ("FACTORY_ATTEMPT" in build, "FACTORY_ATTEMPT" in review), (True, False))
 check("env: only a review run says so in its trace",
