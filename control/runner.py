@@ -1432,6 +1432,20 @@ async def _guarded_review(
     try:
         async with semaphore():
             await _execute_review(run_id, repo, issue, branch, pr_url, log, cycle)
+        # Terminal only now, and this ordering is load-bearing. `_execute_review` used to write
+        # `status="succeeded"` the moment the verdict was read, then go on to merge the pull
+        # request (up to FACTORY_MERGE_CHECK_TIMEOUT) or create a fix run. For the whole of
+        # that window the repo had no non-terminal run, so `db.has_active_run` said idle and
+        # the poller claimed the next issue — the one thing `poller._poll_repo` exists to
+        # prevent. On 2026-08-21 that dispatched foundation-e-learning #71's fix run and #72's
+        # first build in the same second, both branched from a main containing neither.
+        #
+        # The build path has always got this right and says why at `_fail_or_retry`: the retry
+        # is created before the run it replaces is marked terminal. This is the same rule.
+        #
+        # Holding the run open is safe against the reaper: `reconcile` skips any run still in
+        # `_tasks`, and this task is one until `_guarded_review` returns.
+        await db.update_run(run_id, status="succeeded", finished_at=db.utcnow())
     except asyncio.CancelledError:
         log.write("[factory] review cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
@@ -1713,6 +1727,10 @@ async def _execute_review(
         await _salvage_transcript(boxd, machine.id, run_id, log, manifest)
 
         approved, why, findings = decide(verdict, criteria)
+        # Everything the reviewer produced, recorded now — but deliberately *not* `status` or
+        # `finished_at`. A review is not finished when the reviewer stops talking; it is
+        # finished when what it decided has been scheduled, which is what the rest of this
+        # function does. `_guarded_review` marks it terminal on the way out. See the note there.
         await db.update_run(
             run_id,
             exit_code=exit_code,
@@ -1720,9 +1738,7 @@ async def _execute_review(
             tokens_out=usage.get("tokens_out"),
             cost_usd=usage.get("cost_usd"),
             verdict=json.dumps(verdict) if verdict else None,
-            status="succeeded",
             error=None if approved else why,
-            finished_at=db.utcnow(),
         )
         log.write(f"[factory] verdict: {'approve' if approved else 'request changes'} — {why}")
         for finding in findings:
