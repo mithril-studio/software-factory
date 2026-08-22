@@ -246,6 +246,60 @@ async def list_runs(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# Which runs are the same piece of work. A build, the CI that judged what it pushed and the
+# review of that same pull request are three dispatches and one attempt at an issue — so the
+# dispatch log used to show them as three unrelated rows in reverse time order, and a build
+# sat there reading `succeeded` directly above the review that had sent it back. `cycle` is
+# what makes the key work: crash retries of one cycle group together, and a fix cycle opens
+# a new group rather than reopening the old one.
+#
+# A run with no issue behind it is its own group. Provisioning runs all carry `issue_number`
+# 0, so grouping them the same way would collapse every golden a repo ever built into a
+# single row that claimed to be one attempt.
+ATTEMPT_KEY = (
+    "CASE WHEN issue_number > 0 "
+    "THEN repo || '#' || issue_number || '/' || COALESCE(cycle, 1) "
+    "ELSE id END"
+)
+
+
+async def list_attempts(limit: int = 60) -> list[dict]:
+    """The run log grouped into attempts: newest attempt first, phases in causal order.
+
+    Paginates on *groups*, which is the whole reason this is a query rather than a groupBy in
+    the browser. Fetching the newest N runs and grouping them there cuts whichever attempt
+    straddles the boundary in half, and the surviving half is the one that reads wrong — a
+    build with no review under it looks like work that succeeded and stopped.
+
+    Phases ascend by `created_at` because the interesting reading is causal: what was built,
+    what CI made of it, what the reviewer then decided. The list as a whole stays newest
+    first, so the two orders are deliberately opposite.
+    """
+    async with connect() as conn:
+        async with conn.execute(
+            f"SELECT {ATTEMPT_KEY} AS k, MAX(created_at) AS last_at "
+            "FROM runs GROUP BY k ORDER BY last_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            keys = [r["k"] for r in await cur.fetchall()]
+        if not keys:
+            return []
+        marks = ", ".join("?" for _ in keys)
+        async with conn.execute(
+            f"SELECT *, {ATTEMPT_KEY} AS attempt_key FROM runs "
+            f"WHERE {ATTEMPT_KEY} IN ({marks}) ORDER BY created_at ASC",
+            tuple(keys),
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row.pop("attempt_key"), []).append(row)
+    # `keys` carries the newest-first order the first query established; the second query
+    # threw it away by ordering on time ascending. Rebuild from `keys`, never from `grouped`.
+    return [{"key": k, "phases": grouped[k]} for k in keys if k in grouped]
+
+
 async def record_snapshot(name: str, **fields: Any) -> None:
     """Store what the refresh saw. One row per golden snapshot, replaced each time."""
     fields = {"name": name, **fields}

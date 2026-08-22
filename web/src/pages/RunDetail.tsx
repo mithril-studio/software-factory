@@ -33,6 +33,10 @@ function lineClass(line: string): string {
 export function RunDetail() {
   const { runId = "" } = useParams()
   const { data: run, error, refresh } = usePoll<Run>(`/api/runs/${runId}`, 3000)
+  // Whether this run was a thing that ran on a machine. `ci` is the only kind that is not:
+  // it records what GitHub's checks decided about a commit, which the factory observed
+  // rather than executed.
+  const dispatched = run?.kind !== "ci"
   const { data: trace } = usePoll<RunTelemetry>(`/api/runs/${runId}/telemetry`, 10000)
   const { lines, done } = useRunLog(runId)
   const logRef = useRef<HTMLDivElement>(null)
@@ -92,14 +96,21 @@ export function RunDetail() {
             </Field>
             <Field label="Kind">{run.kind}</Field>
             <Field label="Branch">{run.branch || "—"}</Field>
-            <Field label="Machine">{run.vm_name || "—"}</Field>
             <Field label="Cycle">{run.cycle ?? 1}</Field>
-            <Field label="Attempt">{run.attempt ?? 1}</Field>
             <Field label="Duration">{duration(run)}</Field>
-            <Field label="Tokens">{tokens(totalTokens)}</Field>
-            <Field label="Cost">{cost(run.cost_usd)}</Field>
-            <Field label="Exit">{run.exit_code ?? "—"}</Field>
-            <Field label="Agent">{run.agent ?? "—"}</Field>
+            {/* A CI phase is not a dispatch: no machine, no agent, no tokens, no exit code.
+                Rendering those as em dashes would say the run had them and reported nothing,
+                which is a different and wronger claim than not having them. */}
+            {!dispatched || (
+              <>
+                <Field label="Machine">{run.vm_name || "—"}</Field>
+                <Field label="Attempt">{run.attempt ?? 1}</Field>
+                <Field label="Tokens">{tokens(totalTokens)}</Field>
+                <Field label="Cost">{cost(run.cost_usd)}</Field>
+                <Field label="Exit">{run.exit_code ?? "—"}</Field>
+                <Field label="Agent">{run.agent ?? "—"}</Field>
+              </>
+            )}
             <Field label="Pull request">
               {run.pr_url ? (
                 <a
@@ -166,7 +177,7 @@ export function RunDetail() {
         </Card>
       )}
 
-      <SectionHead>Agent output</SectionHead>
+      <SectionHead>{dispatched ? "Agent output" : "Check output"}</SectionHead>
       {/* The log keeps its own ink ground in both themes — a terminal that turned to
           paper in light mode would stop reading as a terminal. */}
       <div
