@@ -119,7 +119,7 @@ in `../README.md` §3.1.
 - `FACTORY_WORKDIR` — where checkouts live. Empty means `$HOME/work`.
 - `FACTORY_REPO_DIR` — a pre-clone checkout to reuse, honoured only when it holds
   `FACTORY_REPO`. The rollback for repo-agnostic goldens; it goes away with them.
-- `FACTORY_BRANCH`, `FACTORY_BASE`, `FACTORY_ATTEMPT` (build runs only), `FACTORY_PROMPT`
+- `FACTORY_BRANCH`, `FACTORY_BASE`, `FACTORY_RESUME` (build runs only), `FACTORY_PROMPT`
 - `GH_TOKEN` — the control plane's durable credential, covering the clone, the push and
   `gh pr create` from one source. Left unset rather than empty when unconfigured, so the
   golden's own `gh` login stays as the fallback instead of being shadowed.

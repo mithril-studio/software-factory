@@ -156,9 +156,19 @@ export function Runs() {
                   <TableCell>
                     <div className="flex items-center gap-2">
                       <StateBadge state={runOutcome(r)} />
+                      {/* Two counters, and they answer different questions: `cycle 2` is the
+                          second pass over the pull request, `try 2` the second dispatch after
+                          a crash. This used to render one column as both — a fix run opened by
+                          a review said "try 2", which reads as "the first build failed" about
+                          a build that succeeded. */}
+                      {r.cycle && r.cycle > 1 && (
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          cycle {r.cycle}
+                        </span>
+                      )}
                       {r.attempt && r.attempt > 1 && (
                         <span className="font-mono text-[10px] text-muted-foreground">
-                          {r.kind === "review" ? "cycle" : "try"} {r.attempt}
+                          try {r.attempt}
                         </span>
                       )}
                     </div>
