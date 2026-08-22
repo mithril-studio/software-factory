@@ -93,7 +93,8 @@ export function RunDetail() {
             <Field label="Kind">{run.kind}</Field>
             <Field label="Branch">{run.branch || "—"}</Field>
             <Field label="Machine">{run.vm_name || "—"}</Field>
-            <Field label={run.kind === "review" ? "Cycle" : "Attempt"}>{run.attempt ?? 1}</Field>
+            <Field label="Cycle">{run.cycle ?? 1}</Field>
+            <Field label="Attempt">{run.attempt ?? 1}</Field>
             <Field label="Duration">{duration(run)}</Field>
             <Field label="Tokens">{tokens(totalTokens)}</Field>
             <Field label="Cost">{cost(run.cost_usd)}</Field>

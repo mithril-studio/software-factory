@@ -695,6 +695,25 @@ _CRITERIA_BLOCK = re.compile(
 BLOCKING_MODES = ("test", "probe", "structure")
 
 
+# Why a review run ended where it did, written into its `error` column.
+#
+# A review's `status` answers a different question from its outcome: a reviewer that runs
+# cleanly and refuses the change is a `succeeded` run, and so is one that approves a change
+# CI then rejects. The outcome lives in `error`, which had three possible authors and no way
+# to tell them apart — so the interface rendered an *approved* review whose pull request went
+# red on CI as "changes requested", the opposite of what the reviewer said. That is what
+# happened to foundation-e-learning#77, and reading it off the runs list was misleading in the
+# one direction that matters: it blamed the change for a coverage floor the agent had never
+# been told to run.
+#
+# Prefixes rather than a fourth column because the sentence after them is the thing a human
+# actually reads, and it is already stored. `web/src/lib/api.ts:runOutcome` is the other side
+# of this contract; `review_outcome_test.py` holds the two together.
+REVIEW_REFUSED = "changes requested: "
+REVIEW_CI_RED = "ci red: "
+REVIEW_UNMERGED = "not merged: "
+
+
 def parse_criteria(body: str) -> list[dict]:
     """Extract an issue's acceptance criteria. Returns [] when there are none to run.
 
@@ -753,20 +772,30 @@ async def _mirror_issue(
         log.write(f"[factory] issue update skipped: {exc!r}")
 
 
+# Two headers over one body, because the two situations are not the same and an agent told
+# the wrong one debugs the wrong thing. A retry follows a run that crashed. A fix run follows
+# a run that finished, opened a pull request, and had it sent back — telling that agent its
+# "earlier attempts failed" points it at a failure that did not happen.
+RETRY_HEADER = """This is attempt {attempt} of {max_attempts}. Earlier attempts on this issue \
+failed ({prior_error}). Read the log below, work out the root cause, and fix *that* — do not
+blindly repeat what failed."""
+
+FIX_HEADER = """This is fix cycle {cycle} of {max_cycles}. The earlier run on this issue did \
+not fail: it opened a pull request, and that pull request was sent back ({prior_error}). Read
+the detail below and fix exactly what it names — the rest of the change was accepted."""
+
 RETRY_TEMPLATE = """
 
---- retry context ---
-This is attempt {attempt} of {max_attempts}. Earlier attempts on this issue failed
-({prior_error}). Below is the tail of the previous attempt's log. Read it, work out the root
-cause, and fix *that* — do not blindly repeat what failed.
+--- {label} context ---
+{header}
 
-You are already checked out on {branch}, including any commits an earlier attempt pushed to
-it — read them first (`git log --oneline origin/{base}..HEAD` and `git diff origin/{base}`)
-and continue from there. Do not start over, and do not force-push over that work.
+You are already checked out on {branch}, including the commits already pushed to it — read
+them first (`git log --oneline origin/{base}..HEAD` and `git diff origin/{base}`) and continue
+from there. Do not start over, and do not force-push over that work.
 
-previous attempt log (tail):
+{detail_label}:
 {prior_log}
---- end retry context ---
+--- end {label} context ---
 """
 
 
@@ -816,6 +845,7 @@ def build_prompt(
     attempt: int = 1,
     prior_error: str | None = None,
     prior_log: str | None = None,
+    review_cycle: int = 1,
 ) -> str:
     prompt = PROMPT_TEMPLATE.format(
         repo=repo,
@@ -831,11 +861,29 @@ def build_prompt(
         memory_candidate_path=MEMORY_CANDIDATE_PATH,
         memory_candidate_max=MEMORY_CANDIDATE_MAX_RECORDS,
     )
-    if attempt > 1:
+    # Keyed on the cycle and the attempt, not on the attempt alone. A fix run is attempt 1 of
+    # cycle 2, so `attempt > 1` was false for it — and the review findings or CI log the whole
+    # run exists to act on were assembled, passed in, and then silently dropped from the
+    # prompt. The agent was dispatched onto a branch it had never seen with no idea why.
+    fix = review_cycle > 1
+    if fix or attempt > 1:
+        header = (
+            FIX_HEADER.format(
+                cycle=review_cycle,
+                max_cycles=settings.max_review_cycles,
+                prior_error=prior_error or "reason not captured",
+            )
+            if fix
+            else RETRY_HEADER.format(
+                attempt=attempt,
+                max_attempts=settings.max_attempts,
+                prior_error=prior_error or "reason not captured",
+            )
+        )
         prompt += RETRY_TEMPLATE.format(
-            attempt=attempt,
-            max_attempts=settings.max_attempts,
-            prior_error=prior_error or "reason not captured",
+            label="fix" if fix else "retry",
+            header=header,
+            detail_label="what came back" if fix else "previous attempt log (tail)",
             prior_log=prior_log or "(previous log unavailable)",
             branch=branch,
             base=base,
@@ -1033,11 +1081,17 @@ fi
 """
 
 VM_SCRIPT = PRELUDE + r"""
-# On a retry, resume the branch a previous attempt pushed to rather than resetting to the base
-# and throwing that work away. The VM is always fresh; the branch is what carries work forward.
-# Only on a retry: a first attempt always starts from the base, so re-queueing an issue whose
-# branch is still lying around from an earlier merged PR gets a clean start, not a resurrection.
-if [ "$FACTORY_ATTEMPT" -gt 1 ] && git rev-parse --verify --quiet "origin/$FACTORY_BRANCH" > /dev/null; then
+# When there is earlier work on this issue, resume the branch it was pushed to rather than
+# resetting to the base and throwing it away. The VM is always fresh; the branch is what
+# carries work forward. Only then: a genuinely first dispatch starts from the base, so
+# re-queueing an issue whose branch is still lying around from an earlier merged PR gets a
+# clean start, not a resurrection.
+#
+# The control plane decides which of those this is and says so in one variable, because it is
+# the only side that knows both counters. This used to test the attempt counter directly, and
+# a fix run opened by a review is attempt 1 of its cycle — so keying on the attempt alone
+# would reset the branch to the base and discard the very commits the reviewer just approved.
+if [ "$FACTORY_RESUME" = "1" ] && git rev-parse --verify --quiet "origin/$FACTORY_BRANCH" > /dev/null; then
   echo "FACTORY: resuming $FACTORY_BRANCH from origin/$FACTORY_BRANCH"
   git checkout -B "$FACTORY_BRANCH" "origin/$FACTORY_BRANCH" || { echo "FACTORY: checkout failed" >&2; exit 92; }
 else
@@ -1067,7 +1121,7 @@ def dispatch_env(
     run_id: str,
     number: int,
     vm_name: str,
-    attempt: int | None = None,
+    resume: bool | None = None,
     kind: str = "build",
 ) -> dict:
     """Everything a run VM is told, for either kind of run.
@@ -1075,8 +1129,14 @@ def dispatch_env(
     One builder because the two paths must agree: a review VM that clones a different repo,
     or authenticates as somebody else, than the build VM whose work it is checking is not
     reviewing that work. The differences between them are the two arguments — a build run
-    counts attempts, a review run labels itself in the trace — and everything else is shared
-    by construction rather than by two people remembering to edit both.
+    says whether to resume the branch, a review run labels itself in the trace — and
+    everything else is shared by construction rather than by two people remembering to edit
+    both.
+
+    `resume` is a decision, not a counter. Whether there is earlier work on the branch depends
+    on both the attempt and the review cycle, and only the caller holds both, so it answers
+    the question here instead of shipping the numbers and having the shell reason about them.
+    `None` is the review path, which never checks out anything of its own to continue.
 
     `GH_TOKEN` is the control plane's own durable credential and covers the clone, the push
     and `gh pr create` from one source. The golden's `gh` login stays as the fallback for a
@@ -1108,8 +1168,8 @@ def dispatch_env(
             + (",kind=review" if kind == "review" else "")
         ),
     }
-    if attempt is not None:
-        env["FACTORY_ATTEMPT"] = str(attempt)
+    if resume is not None:
+        env["FACTORY_RESUME"] = "1" if resume else "0"
     if kind != "review":
         # Where to propose learnings, read back before the VM is reaped. Set only on the path
         # that asks for it and reads it: an environment variable naming a file nobody collects
@@ -1477,10 +1537,16 @@ async def _fix_cycle(
     if cycle < settings.max_review_cycles:
         log.write(f"[factory] {reason}; fix run {cycle + 1} scheduled")
         await _mirror_issue(repo, number, None, [], log, comment=going_back)
+        # `attempt=1`, not `cycle + 1`. A fix run is the first dispatch of a new pass over
+        # the pull request, not the second try at a build that failed — the build it follows
+        # succeeded. Passing the cycle number as the attempt number spent the crash-retry
+        # budget on review cycles and made the runs list say "try 2" about work whose first
+        # try was fine. The two budgets are separate and both still cap this: at most
+        # `max_review_cycles` passes, each with at most `max_attempts` dispatches.
         await create(
             repo,
             number,
-            attempt=cycle + 1,
+            attempt=1,
             prior_error=reason,
             prior_log=detail,
             review_cycle=cycle + 1,
@@ -1505,6 +1571,7 @@ async def _fail_run(
     reason: str,
     log: RunLog,
     pr_url: str | None = None,
+    review_cycle: int = 1,
 ) -> None:
     """Mark a run failed, then either schedule a retry or halt the issue.
 
@@ -1522,6 +1589,10 @@ async def _fail_run(
                 attempt=attempt + 1,
                 prior_error=reason,
                 prior_log=_log_tail(run_id),
+                # Carried, not defaulted. Without it a crash inside fix cycle 2 came back as
+                # a cycle-1 run, and the review that followed it would have been allowed a
+                # fix cycle the budget had already spent.
+                review_cycle=review_cycle,
             )
             scheduled = True
         except Exception as exc:  # noqa: BLE001 - can't retry -> fall through and halt
@@ -1574,6 +1645,11 @@ async def create(
     `attempt` > 1 marks a retry: the previous attempt's error and log tail are woven into
     the prompt so the agent diagnoses the failure instead of repeating it. Retries reuse the
     same branch, so the whole chain resolves into one pull request.
+
+    `review_cycle` is the other counter, and it is not the same one. An attempt is a dispatch
+    of this build that has to be repeated because it crashed; a cycle is a pass over the pull
+    request, opened by a review that sent it back. A fix run is `attempt=1, review_cycle=2` —
+    its predecessor did not fail. They are stored in separate columns for that reason.
     """
     issue = await github.get_issue(repo, issue_number)
     run_id = uuid.uuid4().hex
@@ -1589,6 +1665,7 @@ async def create(
         branch=branch,
         status="queued",
         attempt=attempt,
+        cycle=review_cycle,
         agent=agents.DEFAULT_AGENT,
         log_path=str(log_path),
         created_at=db.utcnow(),
@@ -1626,7 +1703,10 @@ async def create_review(
         branch=branch,
         status="queued",
         kind="review",
-        attempt=cycle,
+        # A review is dispatched once per cycle and never retried, so its attempt is always
+        # 1. It used to be `cycle`, which is why the two numbers were indistinguishable.
+        attempt=1,
+        cycle=cycle,
         agent=agents.DEFAULT_AGENT,
         pr_url=pr_url,
         log_path=str(log_path),
@@ -1761,7 +1841,7 @@ async def _guarded(
             reason = f"timed out after {settings.run_timeout}s"
         else:
             reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        await _fail_run(run_id, repo, issue, attempt, reason, log)
+        await _fail_run(run_id, repo, issue, attempt, reason, log, review_cycle=review_cycle)
     finally:
         await _salvage_usage(run_id, log)
         log.close()
@@ -1787,11 +1867,22 @@ async def _execute(
         base = await github.default_branch(repo)
         notes = await project_notes(repo, base)
         prompt = build_prompt(
-            repo, issue, branch, base, notes, attempt, prior_error, prior_log
+            repo, issue, branch, base, notes, attempt, prior_error, prior_log, review_cycle
         )
 
         # ---- claim: mirror the pickup onto the issue for anyone watching on GitHub
-        which = f" (attempt {attempt} of {settings.max_attempts})" if attempt > 1 else ""
+        #
+        # Each counter against the budget that actually caps it. This used to be one line
+        # reading "attempt {attempt} of {max_attempts}" for both, so a fix run opened by a
+        # review said "attempt 2 of 3" when the budget governing it was `max_review_cycles`
+        # — 2 — and it was already on the last one. Nobody watching the issue could tell the
+        # run was the factory's final unsupervised go.
+        parts = []
+        if review_cycle > 1:
+            parts.append(f"fix cycle {review_cycle} of {settings.max_review_cycles}")
+        if attempt > 1:
+            parts.append(f"attempt {attempt} of {settings.max_attempts}")
+        which = f" ({', '.join(parts)})" if parts else ""
         started = f"Factory run started on branch `{branch}`{which}."
         link = _run_link(run_id)
         if link:
@@ -1833,7 +1924,10 @@ async def _execute(
             run_id=run_id,
             number=number,
             vm_name=machine.name,
-            attempt=attempt,
+            # Either counter being past its first value means the branch already carries
+            # commits: a crashed attempt pushed some, or a review sent an approved pull
+            # request back for another pass.
+            resume=attempt > 1 or review_cycle > 1,
         )
         exit_code, usage, manifest = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log, run_id), timeout=settings.run_timeout
@@ -1895,7 +1989,10 @@ async def _execute(
             )
         else:
             reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
-            await _fail_run(run_id, repo, issue, attempt, reason, log, pr_url=pr_url)
+            await _fail_run(
+                run_id, repo, issue, attempt, reason, log,
+                pr_url=pr_url, review_cycle=review_cycle,
+            )
 
         # ---- reap
         keep = not ok and settings.keep_failed
@@ -2004,7 +2101,7 @@ async def _execute_review(
             tokens_out=usage.get("tokens_out"),
             cost_usd=usage.get("cost_usd"),
             verdict=json.dumps(verdict) if verdict else None,
-            error=None if approved else why,
+            error=None if approved else f"{REVIEW_REFUSED}{why}",
         )
         log.write(f"[factory] verdict: {'approve' if approved else 'request changes'} — {why}")
         for finding in findings:
@@ -2040,7 +2137,7 @@ async def _execute_review(
                 return
 
             if outcome == "human":
-                await db.update_run(run_id, error=f"not merged: {merge_attempt.why}")
+                await db.update_run(run_id, error=f"{REVIEW_UNMERGED}{merge_attempt.why}")
                 await _mirror_issue(
                     repo,
                     number,
@@ -2057,7 +2154,8 @@ async def _execute_review(
             # Fetch the failing job's log now, while we still know which commit CI judged, and
             # hand it to the fix run. Without it the next agent is told only that a check named
             # `gates` failed, which is equally true of a broken test and of a registry timeout.
-            await db.update_run(run_id, error=merge_attempt.ci_failure)
+            # Tagged with which of the three things went wrong — see REVIEW_CI_RED.
+            await db.update_run(run_id, error=f"{REVIEW_CI_RED}{merge_attempt.ci_failure}")
             ci_log = "(head commit unknown, could not fetch logs)"
             if merge_attempt.head_sha:
                 ci_log = await github.failing_check_logs(repo, merge_attempt.head_sha)

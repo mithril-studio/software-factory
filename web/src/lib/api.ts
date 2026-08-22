@@ -9,7 +9,11 @@ export type Run = {
   issue_title: string | null
   branch: string | null
   status: string
+  /** Dispatches of this run inside its cycle. A crash retry increments it. */
   attempt: number | null
+  /** Which pass over the pull request this run belongs to. A review that sends the change
+   *  back opens the next one. Not the same number as `attempt`, and it used to be. */
+  cycle: number | null
   kind: string
   verdict: string | null
   agent: string | null
@@ -25,14 +29,33 @@ export type Run = {
   finished_at: string | null
 }
 
+/** What a review run's `error` column says happened, as written by `control/runner.py`.
+ *  Keep in step with the constants there — `review_outcome_test.py` checks that they exist. */
+const REVIEW_OUTCOME: [string, string][] = [
+  ["changes requested: ", "changes requested"],
+  ["ci red: ", "ci red"],
+  ["not merged: ", "not merged"],
+]
+
 // A run's `status` is the *process* outcome — did the agent complete — which is not the same
 // question as whether the result was good. A reviewer that runs cleanly and rejects the pull
 // request records `succeeded` with the reason in `error`, so in the runs list a rejected
-// review was indistinguishable from an approved one: both green. Fold the verdict back in
-// here rather than at each call site, so the list and the detail page cannot disagree.
+// review was indistinguishable from an approved one: both green.
+//
+// This used to read "any error at all means the reviewer refused", which was wrong in the
+// worst available direction. An *approved* review whose pull request then failed CI also
+// writes to `error`, and so does one that could not be merged — both were rendered "changes
+// requested", saying the reviewer rejected a change it had signed off. Read the tag the
+// server writes instead of inferring from the column being non-empty. Folded in here rather
+// than at each call site, so the list and the detail page cannot disagree.
 export function runOutcome(r: Run): string {
-  if (r.kind === "review" && r.status === "succeeded" && r.error) return "changes requested"
-  return r.status
+  if (r.kind !== "review" || r.status !== "succeeded" || !r.error) return r.status
+  for (const [prefix, outcome] of REVIEW_OUTCOME) {
+    if (r.error.startsWith(prefix)) return outcome
+  }
+  // An older row, written before the tags existed. Every one of them is a refusal — the two
+  // approved-but-not-merged paths came later — so this stays the honest reading of history.
+  return "changes requested"
 }
 
 export type PlanIssue = {
