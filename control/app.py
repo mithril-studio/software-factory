@@ -162,6 +162,17 @@ async def api_runs():
     return await db.list_runs()
 
 
+@app.get("/api/attempts")
+async def api_attempts():
+    """The same runs as `/api/runs`, grouped into the units of work they belong to.
+
+    Both endpoints stay. A phase is still a run and still has its own page; this only answers
+    the other question — what happened to issue #77 on its second cycle — which the flat log
+    could not answer without a human matching timestamps by eye.
+    """
+    return await db.list_attempts()
+
+
 @app.get("/api/runs/{run_id}")
 async def api_run(run_id: str):
     run = await db.get_run(run_id)

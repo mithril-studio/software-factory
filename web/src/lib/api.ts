@@ -49,6 +49,10 @@ const REVIEW_OUTCOME: [string, string][] = [
 // server writes instead of inferring from the column being non-empty. Folded in here rather
 // than at each call site, so the list and the detail page cannot disagree.
 export function runOutcome(r: Run): string {
+  // A CI phase never "ran" anywhere, so `failed` would be read as a dispatch that broke.
+  // Say what it actually is, in the same words the review path already uses for it, so the
+  // phase and the review that reports it do not describe one event two ways.
+  if (r.kind === "ci") return r.status === "failed" ? "ci red" : r.status
   if (r.kind !== "review" || r.status !== "succeeded" || !r.error) return r.status
   for (const [prefix, outcome] of REVIEW_OUTCOME) {
     if (r.error.startsWith(prefix)) return outcome
@@ -56,6 +60,48 @@ export function runOutcome(r: Run): string {
   // An older row, written before the tags existed. Every one of them is a refusal — the two
   // approved-but-not-merged paths came later — so this stays the honest reading of history.
   return "changes requested"
+}
+
+/** One unit of work: every dispatch that went into a single pass at a single issue.
+ *  `key` groups them — see ATTEMPT_KEY in `control/db.py`. Phases ascend by time. */
+export type Attempt = {
+  key: string
+  phases: Run[]
+}
+
+// What the whole attempt amounts to, which is the question the dispatch log was not
+// answering. The rule is only "whatever its last phase came to", and that works because the
+// phases are appended in causal order: a build pushes, CI judges what was pushed, the review
+// decides what to do about it. So a green build under a red CI no longer reads as success —
+// the attempt takes the CI phase's verdict, because that is the one that came last and is
+// therefore the one that is still true.
+//
+// Anything unfinished wins over all of it. An attempt whose review is still running is
+// "running" even though its build succeeded twenty minutes ago; reporting the build's
+// outcome as the attempt's is exactly the confusion this replaces.
+export function attemptOutcome(a: Attempt): string {
+  // An unrecognised status counts as unfinished, deliberately: a live row is a better
+  // wrong answer than an outcome the run never actually reached.
+  if (a.phases.some((p) => !TERMINAL.includes(p.status))) return "running"
+  const last = a.phases[a.phases.length - 1]
+  return last ? runOutcome(last) : "unknown"
+}
+
+/** Sum a numeric column across an attempt's phases, or null when no phase reported one.
+ *  Null rather than 0 because a provisioning run and a run that cost nothing are different
+ *  facts, and the table renders the first as an em dash. */
+export function attemptTotal(a: Attempt, pick: (r: Run) => number | null): number | null {
+  const given = a.phases.map(pick).filter((n): n is number => n != null)
+  return given.length ? given.reduce((x, y) => x + y, 0) : null
+}
+
+/** The pull request the attempt produced. Later phases carry it and the build that opened it
+ *  may not have by the time it was written, so read from the end. */
+export function attemptPr(a: Attempt): string | null {
+  for (let i = a.phases.length - 1; i >= 0; i--) {
+    if (a.phases[i].pr_url) return a.phases[i].pr_url
+  }
+  return null
 }
 
 export type PlanIssue = {
