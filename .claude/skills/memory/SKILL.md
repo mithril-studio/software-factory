@@ -135,8 +135,16 @@ printf '%s\n' '{"id":"mem_7a3f",...}'                              >> .mem/domai
 printf '%s\n' '{"id":"mem_7a3f","domain":"database","type":"convention","title":"...","files":["src/db/*.ts"]}' >> .mem/index.jsonl
 ```
 
-Append-only matters: two agents recording concurrently append different lines, so git merges
-them cleanly. Rewriting a line creates a conflict.
+Append-only matters: two agents recording concurrently append different lines, and git
+resolves that with the `merge=union` driver a memory-carrying repo declares in
+`.gitattributes`. Rewriting a line conflicts outright.
+
+Be precise about what that driver buys. Two appends at the end of one file *do* conflict in
+plain git; union is what resolves them, and it applies only where the working tree and
+`.gitattributes` are — every laptop and every CI runner, and **not** GitHub's merge API, which
+merges content with no working tree and reads no attributes. So a pull request can merge
+cleanly under `git merge` and be refused by GitHub as conflicted. Nothing you do while writing
+prevents it; the factory repairs it at merge time (`github.merge_base_into_branch`).
 
 Keep `body` and `resolution` tight — a few sentences, not an essay. Every record you write is
 read by future sessions; distil it now so they don't pay for your narration later.

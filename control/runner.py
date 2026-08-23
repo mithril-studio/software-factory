@@ -1577,6 +1577,13 @@ async def _merge(
     Also the one place the factory ever learns a CI verdict, which is why recording that
     verdict lives here rather than at either call site: a phase that is written in one branch
     of one caller is a phase that is missing from the other.
+
+    Runs at most twice. A merge GitHub refuses *as conflicted* is repaired by merging the base
+    back into the branch where the repo's own merge drivers apply (`github.merge_base_into_branch`)
+    and then asked again — and asked from the top, checks included, because reconciling moves
+    the head and the whole point of pinning to a verified sha is that no other commit may land.
+    Twice and no more: if a merge conflicts again after a successful reconcile, something is
+    moving underneath this that a third attempt would only race with.
     """
     try:
         pr_number = int(pr_url.rstrip("/").split("/")[-1])
@@ -1585,25 +1592,39 @@ async def _merge(
         # Bound before the branch below: with `merge_require_checks` off nothing is fetched
         # and nothing is recorded, and both return paths still read this.
         ci_log: str | None = None
-        started_at = db.utcnow()
-        if settings.merge_require_checks:
-            # The merge API waits for nothing, so without this the PR is merged seconds after
-            # `gh pr create` — before CI has even started. Every run forks from main, so a red
-            # main propagates into all of them.
-            log.write(f"[factory] waiting for checks on PR #{pr_number}")
-            sha = await github.pr_head_sha(repo, pr_number)
-            green, why, failed = await github.checks_green(
-                repo, sha, timeout=settings.merge_check_timeout
-            )
-            ci_log = await _record_ci(
-                repo, issue, branch, cycle, pr_url, sha, green, why, failed, started_at, log
-            )
-        if not green:
-            log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
-            return MergeAttempt(False, why if failed else None, why, sha, ci_log)
-        await github.merge_pr(repo, pr_number, sha=sha)
-        log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
-        return MergeAttempt(True, None, why, sha, ci_log)
+        for reconciled in (False, True):
+            started_at = db.utcnow()
+            if settings.merge_require_checks:
+                # The merge API waits for nothing, so without this the PR is merged seconds
+                # after `gh pr create` — before CI has even started. Every run forks from main,
+                # so a red main propagates into all of them.
+                log.write(f"[factory] waiting for checks on PR #{pr_number}")
+                sha = await github.pr_head_sha(repo, pr_number)
+                green, why, failed = await github.checks_green(
+                    repo, sha, timeout=settings.merge_check_timeout
+                )
+                ci_log = await _record_ci(
+                    repo, issue, branch, cycle, pr_url, sha, green, why, failed, started_at, log
+                )
+            if not green:
+                log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
+                return MergeAttempt(False, why if failed else None, why, sha, ci_log)
+            try:
+                await github.merge_pr(repo, pr_number, sha=sha)
+            except Exception as exc:  # noqa: BLE001 - re-raised below unless it is repairable
+                if reconciled or not github.is_merge_conflict(exc):
+                    raise
+                log.write(f"[factory] PR #{pr_number} is conflicted; reconciling {branch}")
+                ok, detail = await github.merge_base_into_branch(repo, branch, base, log.write)
+                if not ok:
+                    log.write(f"[factory] could not reconcile {branch}: {detail}")
+                    raise
+                continue
+            log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
+            return MergeAttempt(True, None, why, sha, ci_log)
+        # Unreachable — the second pass returns or raises — and spelled out anyway, because
+        # falling out of the loop would return None into code that reads `.merged` off it.
+        return MergeAttempt(False, None, "the merge loop ended without a decision", sha, ci_log)
     except Exception as exc:  # noqa: BLE001
         # Keep the reason. GitHub nearly always says what was wrong, and throwing that away
         # left a human with an unmerged pull request and nothing to go on.

@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import tempfile
+from collections.abc import Callable
 
 import httpx
 
@@ -640,3 +642,120 @@ async def ensure_labels(repo: str) -> None:
             )
             if resp.status_code not in (201, 422):
                 resp.raise_for_status()
+
+
+# --------------------------------------------------------------------------- branch reconcile
+
+# What GitHub says when it refuses a merge because the branch has diverged in a way its own
+# merge could not resolve. Matched on the message because the status code does not separate
+# this from the other things a 405 means.
+_CONFLICT_PHRASES = ("merge conflict", "not mergeable")
+
+
+def is_merge_conflict(exc: BaseException) -> bool:
+    """Whether a failed merge failed *because the branch conflicts*, not for some other reason.
+
+    A conflict is the one merge failure that can be repaired without a human, so it has to be
+    told apart from a refused permission, a protected branch, or a required review — none of
+    which reconciling would fix, and all of which arrive as the same 405.
+    """
+    return any(p in str(exc).lower() for p in _CONFLICT_PHRASES)
+
+
+def _redact(text: str) -> str:
+    """Strip the token out of anything on its way to a log."""
+    token = settings.github_token
+    return text.replace(token, "***") if token else text
+
+
+async def _git(*args: str, cwd: str | None = None, timeout: float = 300) -> tuple[int, str]:
+    """Run one git command, returning (exit code, combined output)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 124, f"git {args[0]} timed out after {timeout}s"
+    return proc.returncode or 0, _redact(out.decode("utf-8", "replace").strip())
+
+
+def clone_url(repo: str) -> str:
+    """Where to clone `repo` from, authenticated to push.
+
+    A named function rather than an inline f-string because it is the seam the tests replace
+    to point at a bare repository on disk — a merge driver either applies or it does not, and
+    that is only worth asserting against real git.
+    """
+    return f"https://x-access-token:{settings.github_token}@github.com/{repo}.git"
+
+
+async def merge_base_into_branch(
+    repo: str, branch: str, base: str, write: Callable[[str], None]
+) -> tuple[bool, str]:
+    """Bring `branch` up to date with `base` using *the repo's own* merge configuration.
+
+    This exists because GitHub's merge API is not git. It performs a three-way content merge
+    with no working tree, and so it never reads the repository's `.gitattributes` — a repo that
+    declares `merge=union` for its append-only logs gets that driver on every laptop and CI
+    runner and does not get it here. The result is a pull request that merges cleanly with
+    `git merge` and that GitHub refuses as conflicted, which is not a state anyone can act on
+    by reading the pull request.
+
+    That is not hypothetical: it is how foundation-e-learning#82 halted a queue of four issues
+    with every check green, on one appended line of `.mem/index.jsonl` — the exact file whose
+    `.gitattributes` entry exists to make that line mergeable.
+
+    So do the merge where the drivers are: a throwaway clone, `git merge`, and push the result
+    for GitHub to look at again. Returns (ok, detail); never raises.
+
+    Deliberately narrow, because this writes to a branch:
+
+    - It only ever merges *into* the pull request's own branch. `base` is read and never
+      written, so the worst case is a factory branch nobody wanted.
+    - No force, no rebase, no `-X ours`/`-X theirs`, no `--strategy`. If git says conflict,
+      this aborts and reports — resolving a genuine disagreement is a human's call, and a
+      strategy flag would silently pick a side of one.
+    - "Already up to date" is a failure here, not a success: it means the branch did not
+      diverge and the merge was refused for some other reason, which reconciling cannot fix.
+    """
+    if not settings.github_token:
+        return False, "no GitHub token is configured, so nothing can push"
+    with tempfile.TemporaryDirectory(prefix="factory-reconcile-") as tmp:
+        url = clone_url(repo)
+        code, out = await _git(
+            "clone", "--filter=blob:none", "--no-single-branch", url, tmp, timeout=600
+        )
+        if code != 0:
+            return False, f"could not clone {repo}: {out}"
+
+        for key, value in (("user.name", "software-factory"),
+                           ("user.email", "factory@users.noreply.github.com")):
+            await _git("config", key, value, cwd=tmp)
+
+        code, out = await _git("checkout", branch, cwd=tmp)
+        if code != 0:
+            return False, f"could not check out {branch}: {out}"
+
+        code, out = await _git("merge", "--no-edit", f"origin/{base}", cwd=tmp)
+        if code != 0:
+            # `git merge` leaves the tree mid-merge on failure. Aborting is tidiness in a
+            # directory about to be deleted, but it also makes `diff --name-only` below mean
+            # what it says if this ever grows a second attempt.
+            _, conflicted = await _git("diff", "--name-only", "--diff-filter=U", cwd=tmp)
+            await _git("merge", "--abort", cwd=tmp)
+            files = ", ".join(conflicted.split()) or "unknown files"
+            return False, f"git could not merge {base} either — conflicts in {files}"
+        if "Already up to date" in out:
+            return False, f"{branch} is already up to date with {base}"
+
+        code, out = await _git("push", "origin", branch, cwd=tmp)
+        if code != 0:
+            return False, f"could not push {branch}: {out}"
+
+    write(f"[factory] merged {base} into {branch} with the repo's own merge drivers")
+    return True, f"merged {base} into {branch}"
