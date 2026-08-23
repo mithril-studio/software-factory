@@ -80,8 +80,8 @@ for name, script in SCRIPTS.items():
 
 check("only the build script resets from the base branch",
       ["origin/$FACTORY_BASE" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [True, False])
-check("only the build script resumes a previous attempt",
-      ["$FACTORY_ATTEMPT" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [True, False])
+check("only the build script resumes work already on the branch",
+      ["$FACTORY_RESUME" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [True, False])
 check("only the review script clears the stale verdict",
       ["rm -f /tmp/factory-verdict.json" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [False, True])
 check("the review script never pushes", "git push" in REVIEW_SCRIPT, False)
@@ -303,7 +303,7 @@ def envs(**overrides):
     try:
         common = dict(repo=REPO, branch="factory/issue-7", base="main", prompt="do the thing",
                       run_id="run-1", number=7, vm_name="run-abc")
-        return (dispatch_env(attempt=2, **common), dispatch_env(kind="review", **common))
+        return (dispatch_env(resume=True, **common), dispatch_env(kind="review", **common))
     finally:
         runner.settings = real
 
@@ -323,16 +323,22 @@ for name, env in (("build", build), ("review", review)):
 # What the two paths may differ on, and nothing else. The list is the guard: a review VM that
 # cloned a different repo, or authenticated as somebody else, than the build VM whose work it
 # is checking would not be reviewing that work. Each entry here is a difference someone argued
-# for — a build counts attempts, a review labels its trace, and only a build is asked to
-# propose learnings, so only a build is told where to write them.
-check("env: the two paths differ only in the attempt, the trace and the candidate file",
+# for — a build is told whether to resume its branch, a review labels its trace, and only a
+# build is asked to propose learnings, so only a build is told where to write them.
+check("env: the two paths differ only in the resume flag, the trace and the candidate file",
       sorted(k for k in set(build) | set(review) if build.get(k) != review.get(k)),
-      ["FACTORY_ATTEMPT", "FACTORY_MEMORY_CANDIDATES", "OTEL_RESOURCE_ATTRIBUTES"])
+      ["FACTORY_MEMORY_CANDIDATES", "FACTORY_RESUME", "OTEL_RESOURCE_ATTRIBUTES"])
 check("env: only a build run is given somewhere to propose learnings",
       (runner.MEMORY_CANDIDATE_ENV in build, runner.MEMORY_CANDIDATE_ENV in review),
       (True, False))
-check("env: only a build run counts attempts",
-      ("FACTORY_ATTEMPT" in build, "FACTORY_ATTEMPT" in review), (True, False))
+check("env: only a build run is told whether to resume its branch",
+      ("FACTORY_RESUME" in build, "FACTORY_RESUME" in review), (True, False))
+# The flag is a decision the control plane made, so it must survive as one: a build that is
+# *not* resuming still carries it, saying no, rather than leaving the script to read an unset
+# variable and guess.
+check("env: a first dispatch carries the flag too, set to no",
+      dispatch_env(resume=False, repo=REPO, branch="b", base="main", prompt="p",
+                   run_id="r", number=1, vm_name="v").get("FACTORY_RESUME"), "0")
 check("env: only a review run says so in its trace",
       ["kind=review" in e["OTEL_RESOURCE_ATTRIBUTES"] for e in (build, review)], [False, True])
 check("env: the trace correlates the run with its issue and VM",

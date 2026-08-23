@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS runs (
     log_path        TEXT,
     transcript_path TEXT,
     attempt         INTEGER NOT NULL DEFAULT 1,
+    cycle           INTEGER NOT NULL DEFAULT 1,
     kind            TEXT NOT NULL DEFAULT 'build',
     verdict         TEXT,
     manifest        TEXT,
@@ -163,6 +164,14 @@ MIGRATIONS = (
     # written and nothing can boot it; `pending` with one is a re-save, and the older version
     # stays restorable. The distinction cost a run to learn.
     "ALTER TABLE snapshots ADD COLUMN status TEXT",
+    # Which review cycle a run belongs to. `attempt` used to carry both numbers: a crash
+    # retry incremented it, and so did a fix run sent back by a review — so the runs list
+    # said "try 2" about a build whose first try had succeeded, and the issue comment
+    # counted a fix cycle against `max_attempts` when the budget that governs it is
+    # `max_review_cycles`. Two questions, two columns: `attempt` is how many times this
+    # build has been dispatched inside its cycle, `cycle` is which pass over the pull
+    # request it belongs to.
+    "ALTER TABLE runs ADD COLUMN cycle INTEGER NOT NULL DEFAULT 1",
 )
 
 # Terminal states. Anything else means the run is still in flight.
