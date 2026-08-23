@@ -25,6 +25,14 @@ const VARIANT: Record<string, "ok" | "warn" | "bad" | "muted" | "default"> = {
   error: "bad",
 }
 
+/** The colour one state carries, for the places that need the hue without the badge —
+ *  the phase strip on the runs list. Exported so a second reading of "is this state bad?"
+ *  cannot drift away from the badge's, which is how a rejected review and an approved one
+ *  came to look alike in the first place. */
+export function stateVariant(state: string): "ok" | "warn" | "bad" | "muted" | "default" {
+  return VARIANT[state] ?? "default"
+}
+
 export function StateBadge({ state }: { state: string }) {
-  return <Badge variant={VARIANT[state] ?? "default"}>{state}</Badge>
+  return <Badge variant={stateVariant(state)}>{state}</Badge>
 }

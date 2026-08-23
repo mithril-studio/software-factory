@@ -1471,26 +1471,121 @@ class MergeAttempt:
                      had in fact said exactly what was wrong.
     - `head_sha`   — the commit the checks were verified on, so the caller can fetch that
                      commit's failing logs rather than whatever is at the head by then.
+    - `ci_log`     — the failing checks' logs, fetched once while recording the CI phase and
+                     carried here so the fix prompt does not go and fetch the same thing a
+                     second time. None whenever there was nothing red to read.
     """
 
     merged: bool
     ci_failure: str | None
     why: str
     head_sha: str | None = None
+    ci_log: str | None = None
 
 
-async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt:
+async def _record_ci(
+    repo: str,
+    issue: dict,
+    branch: str,
+    cycle: int,
+    pr_url: str,
+    sha: str | None,
+    green: bool,
+    why: str,
+    failed: list[str],
+    started_at: str,
+    log: RunLog,
+) -> str | None:
+    """Write what CI decided into the run log as a phase of its own, and return its log text.
+
+    CI was the one thing that judged a run and left no trace of its own. Its verdict reached
+    the database as a string on the *review's* `error` column, and its log reached nothing but
+    the prompt of the fix run that followed — so the dispatch log could show a build reading
+    `succeeded` above the review that sent it back, and answering "red on what?" meant leaving
+    the factory for the Actions API. A red check is an outcome of the work like any other, so
+    it gets a row like any other.
+
+    Not a dispatch. No VM, no agent, no tokens, no cost, and those columns stay NULL rather
+    than 0 — zero would read as "this ran and was free" instead of "this never ran anywhere".
+    `kind` is what tells the two apart, and the UI reads it to know which fields to show.
+
+    Best effort throughout: a run is never failed over its own bookkeeping. A record that
+    could not be written costs a row in a log; a raised exception here would cost the merge.
+    """
+    detail = None
+    try:
+        run_id = uuid.uuid4().hex
+        log_path = settings.log_dir / f"{run_id}.log"
+        lines = [
+            f"[ci] pull request {pr_url}",
+            f"[ci] commit {sha or '(unknown)'}",
+            f"[ci] {why}",
+        ]
+        if failed:
+            lines.append(f"[ci] failed: {', '.join(failed)}")
+        if failed and sha:
+            # Fetched here, once, and handed back to the caller. The fix prompt used to make
+            # this same call for itself a moment later, which is two round trips for one
+            # answer and — worse — two answers, since the second one reads whatever the head
+            # is by then rather than the commit these checks actually judged.
+            detail = await github.failing_check_logs(repo, sha)
+            log.write(f"[factory] fetched {len(detail)} chars of failing check log")
+            lines += ["", detail]
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        await db.create_run(
+            id=run_id,
+            repo=repo,
+            issue_number=issue["number"],
+            issue_title=issue.get("title"),
+            branch=branch,
+            kind="ci",
+            # A commit is judged once per cycle, so there is nothing here for `attempt` to
+            # count. It stays 1 for the same reason a review's does.
+            attempt=1,
+            cycle=cycle,
+            status="succeeded" if green else "failed",
+            error=None if green else why,
+            pr_url=pr_url,
+            log_path=str(log_path),
+            created_at=started_at,
+            started_at=started_at,
+            finished_at=db.utcnow(),
+        )
+    except Exception as exc:  # noqa: BLE001 - see the docstring: bookkeeping never fails a run
+        log.write(f"[factory] could not record the CI phase: {exc!r}")
+    return detail
+
+
+async def _merge(
+    repo: str,
+    pr_url: str,
+    base: str,
+    log: RunLog,
+    *,
+    issue: dict,
+    branch: str,
+    cycle: int = 1,
+) -> MergeAttempt:
     """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
     than one we force, and the PR simply stays open for a human.
 
     The merge itself retries while GitHub is unavailable (see `github.merge_pr`) and is
     pinned to the sha the checks passed on, so "auto-merge once the tests are done" holds
     even across an outage, and can still only ever land the commit that was tested.
+
+    Also the one place the factory ever learns a CI verdict, which is why recording that
+    verdict lives here rather than at either call site: a phase that is written in one branch
+    of one caller is a phase that is missing from the other.
     """
     try:
         pr_number = int(pr_url.rstrip("/").split("/")[-1])
         sha: str | None = None
         green, why, failed = True, "checks not required", []
+        # Bound before the branch below: with `merge_require_checks` off nothing is fetched
+        # and nothing is recorded, and both return paths still read this.
+        ci_log: str | None = None
+        started_at = db.utcnow()
         if settings.merge_require_checks:
             # The merge API waits for nothing, so without this the PR is merged seconds after
             # `gh pr create` — before CI has even started. Every run forks from main, so a red
@@ -1500,12 +1595,15 @@ async def _merge(repo: str, pr_url: str, base: str, log: RunLog) -> MergeAttempt
             green, why, failed = await github.checks_green(
                 repo, sha, timeout=settings.merge_check_timeout
             )
+            ci_log = await _record_ci(
+                repo, issue, branch, cycle, pr_url, sha, green, why, failed, started_at, log
+            )
         if not green:
             log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
-            return MergeAttempt(False, why if failed else None, why, sha)
+            return MergeAttempt(False, why if failed else None, why, sha, ci_log)
         await github.merge_pr(repo, pr_number, sha=sha)
         log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
-        return MergeAttempt(True, None, why, sha)
+        return MergeAttempt(True, None, why, sha, ci_log)
     except Exception as exc:  # noqa: BLE001
         # Keep the reason. GitHub nearly always says what was wrong, and throwing that away
         # left a human with an unmerged pull request and nothing to go on.
@@ -1970,7 +2068,12 @@ async def _execute(
                 # already contains this issue's work.
                 if not criteria:
                     log.write("[factory] issue carries no acceptance criteria; skipping review")
-                merged = (await _merge(repo, pr_url, base, log)).merged
+                merged = (
+                    await _merge(
+                        repo, pr_url, base, log,
+                        issue=issue, branch=branch, cycle=review_cycle,
+                    )
+                ).merged
             await db.update_run(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
@@ -2122,7 +2225,9 @@ async def _execute_review(
         if approved:
             merge_attempt = MergeAttempt(False, None, "auto-merge is off")
             if settings.auto_merge:
-                merge_attempt = await _merge(repo, pr_url, base, log)
+                merge_attempt = await _merge(
+                    repo, pr_url, base, log, issue=issue, branch=branch, cycle=cycle
+                )
             outcome = merge_outcome(
                 settings.auto_merge, merge_attempt.merged, merge_attempt.ci_failure
             )
@@ -2151,15 +2256,15 @@ async def _execute_review(
                 )
                 return
 
-            # Fetch the failing job's log now, while we still know which commit CI judged, and
-            # hand it to the fix run. Without it the next agent is told only that a check named
-            # `gates` failed, which is equally true of a broken test and of a registry timeout.
+            # Hand the failing job's log to the fix run. Without it the next agent is told
+            # only that a check named `gates` failed, which is equally true of a broken test
+            # and of a registry timeout.
             # Tagged with which of the three things went wrong — see REVIEW_CI_RED.
             await db.update_run(run_id, error=f"{REVIEW_CI_RED}{merge_attempt.ci_failure}")
-            ci_log = "(head commit unknown, could not fetch logs)"
-            if merge_attempt.head_sha:
-                ci_log = await github.failing_check_logs(repo, merge_attempt.head_sha)
-            log.write(f"[factory] fetched {len(ci_log)} chars of failing check log")
+            # Already fetched, on the commit the checks actually judged, while the CI phase
+            # was being recorded. Fetching it again here would ask about whatever the head is
+            # by now — a different question with a plausible-looking answer.
+            ci_log = merge_attempt.ci_log or "(no failing check log could be read)"
             await _fix_cycle(
                 repo,
                 number,
