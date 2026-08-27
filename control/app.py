@@ -227,10 +227,12 @@ class StartRun(BaseModel):
     repo: str
     issue_number: int
     # 'build', 'review' (of a pull request a build already opened), 'provision' (warm this
-    # repo's golden), or 'plan' (compare the repo against its goal now, without waiting for
-    # the poller's cadence). All four are runs on a restored VM, which is why one endpoint
-    # starts any of them. Provision and plan ignore `issue_number`; there is no issue behind
-    # either — making issues is the plan run's job.
+    # repo's golden), 'plan' (compare the repo against its goal now, without waiting for the
+    # poller's cadence), or 'learn' (read the window's telemetry and propose improvements
+    # now, without waiting for FACTORY_LEARN_EVERY issues to finish). All five are runs on a
+    # restored VM, which is why one endpoint starts any of them. Provision, plan and learn
+    # ignore `issue_number`; there is no issue behind any of them — making issues is what the
+    # plan and learn runs do.
     kind: str = "build"
     pr_url: str | None = None
     branch: str | None = None
@@ -281,6 +283,13 @@ async def api_start_run(body: StartRun):
             run_id = await provision.create(repo)
         elif body.kind == "plan":
             run_id = await plan.create(repo)
+        elif body.kind == "learn":
+            # Deliberately not gated on `FACTORY_LEARN`. That switch governs the *poller* —
+            # whether the factory decides on its own to spend money reading its own history.
+            # A human asking for one run now is the same override as hand-starting a build,
+            # and it is what makes the recommended rollout possible: read a cycle or two of
+            # proposals before letting the cadence and the queue label loose.
+            run_id = await runner.create_learn(repo)
         else:
             raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001

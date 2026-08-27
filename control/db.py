@@ -565,6 +565,23 @@ async def has_active_run(repo: str) -> bool:
             return await cur.fetchone() is not None
 
 
+async def run_ids_since(repo: str, since: str) -> set[str]:
+    """Every run id this repo has had since `since`.
+
+    What a learning run's proposals are allowed to cite, and the reason it is a query rather
+    than a filter over `list_runs`: that call is capped, newest-first and fleet-wide, so once
+    the factory has more runs in its recent history than the cap, this repo's older in-window
+    runs fall off the end. The failure would be silent and would look like the agent citing
+    runs that do not exist — the loop rejecting its own best-evidenced proposals, more often
+    the busier the factory got.
+    """
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT id FROM runs WHERE repo = ? AND created_at >= ?", (repo, since)
+        ) as cur:
+            return {row["id"] for row in await cur.fetchall()}
+
+
 async def issues_since_last_learn(repo: str) -> int:
     """How many distinct issues this repo has finished since its last learning run.
 

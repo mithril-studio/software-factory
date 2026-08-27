@@ -2092,9 +2092,7 @@ async def create(
     # first attempt of the first cycle: a retry is the same proposal still being built, and
     # `building` → `building` is not an edge the ledger defines.
     if attempt == 1 and review_cycle == 1:
-        await advance_improvement(
-            repo, issue_number, "building", RunLog(Path(log_path))
-        )
+        await advance_improvement(repo, issue_number, "building")
 
     task = asyncio.create_task(
         _guarded(
@@ -2198,6 +2196,15 @@ async def _guarded_learn(run_id: str, repo: str) -> None:
         await db.update_run(
             run_id, status="failed", error=f"learn: {exc}", finished_at=db.utcnow()
         )
+    finally:
+        # Backstop the ledger entry the same way every other agent run does: a run that
+        # timed out or crashed still spent what it spent, and the per-call rows are already
+        # written, so the cost is recoverable even when the run never reported it.
+        await _salvage_usage(run_id, log)
+        # `RunLog` holds an open file handle. Every other guard in this system closes its
+        # own; this one did not, which is one descriptor per learning run held until the
+        # process restarts.
+        log.close()
 
 
 async def _execute_learn(run_id: str, repo: str, log: RunLog) -> None:
@@ -2207,16 +2214,12 @@ async def _execute_learn(run_id: str, repo: str, log: RunLog) -> None:
     evidence = await digest.build(repo=repo, days=window)
     ledger = await db.list_improvements(repo=repo)
 
-    # Which runs a proposal may cite. Built here, from the same window the digest was, so the
-    # check is against what the agent was actually shown rather than against all of history.
-    known_runs = {
-        r["id"] for r in await db.list_runs(limit=2000)
-        if r.get("repo") == repo and r.get("created_at", "") >= evidence["window"]["since"]
-    }
+    # Which runs a proposal may cite: this repo's, over the same window the digest covers, so
+    # the check is against what the agent was actually shown rather than against all history.
+    known_runs = await db.run_ids_since(repo, evidence["window"]["since"])
 
     boxd = client()
     machine = None
-    reaped = False
     try:
         await db.update_run(run_id, status="forking", started_at=db.utcnow())
         vm_name = f"{LEARN_PREFIX}{run_id[:8]}"
@@ -2254,16 +2257,26 @@ async def _execute_learn(run_id: str, repo: str, log: RunLog) -> None:
         env[DIGEST_ENV] = json.dumps(evidence)
         env[LEDGER_ENV] = json.dumps(ledger, default=str)
 
-        exit_code, _usage, manifest = await asyncio.wait_for(
+        exit_code, usage, manifest = await asyncio.wait_for(
             _stream(boxd, machine.id, env, log, run_id, script=LEARN_SCRIPT),
             timeout=settings.run_timeout,
         )
         log.write(f"[factory] analyst exited {exit_code}")
         payload = await _read_json_file(boxd, machine.id, PROPOSALS_PATH, log)
         await _salvage_transcript(boxd, machine.id, run_id, log, manifest)
+        # A learning run spends real tokens on a real VM, so it owes the ledger the same
+        # entry every other agent run makes. Discarding this was how `learn` became the one
+        # kind whose spend was invisible — precisely the gap the trace layer was built to
+        # close, reopened by the loop that reads it.
+        await db.update_run(
+            run_id,
+            exit_code=exit_code,
+            tokens_in=usage.get("tokens_in"),
+            tokens_out=usage.get("tokens_out"),
+            cost_usd=usage.get("cost_usd"),
+        )
     finally:
-        if machine is not None and not reaped:
-            await reap(boxd, machine, log, failed=False)
+        await reap(boxd, machine, log, keep=settings.keep_failed)
         await boxd.close()
 
     await _grade(payload, ledger, log)
@@ -2361,7 +2374,7 @@ async def _file_proposals(
 
 
 async def advance_improvement(
-    repo: str, issue_number: int, to_status: str, log: RunLog, **fields
+    repo: str, issue_number: int, to_status: str, log: RunLog | None = None, **fields
 ) -> None:
     """Move the proposal behind this issue along, if this issue came from one.
 
@@ -2370,17 +2383,29 @@ async def advance_improvement(
     log. An invalid transition is — it means the ledger and the factory disagree about what
     has happened to something, and that is the one condition under which the grader's input
     stops being trustworthy.
+
+    `log` is optional because one caller has no run log to write to. Dispatch happens before
+    the run that owns that file has started, and opening a `RunLog` there to report a
+    transition that almost never happens leaked a descriptor on every build the factory
+    dispatched. With no run to attribute it to, the control plane's own logger is the honest
+    place for it anyway.
     """
+    def note(line: str) -> None:
+        if log is not None:
+            log.write(f"[factory] {line}")
+        else:
+            _log.info("%s", line)
+
     try:
         row = await db.improvement_for_issue(repo, issue_number)
         if row is None:
             return
         await db.transition_improvement(row["id"], to_status, **fields)
-        log.write(f"[factory] improvement {row['id']} → {to_status}")
+        note(f"improvement {row['id']} → {to_status}")
     except ValueError as exc:
-        log.write(f"[factory] could not advance improvement for #{issue_number}: {exc}")
+        note(f"could not advance improvement for #{issue_number}: {exc}")
     except Exception as exc:  # noqa: BLE001 - bookkeeping must never fail a run
-        log.write(f"[factory] improvement bookkeeping failed: {exc!r}")
+        note(f"improvement bookkeeping failed: {exc!r}")
 
 
 def _proposal_body(proposal: dict, run_id: str) -> str:
