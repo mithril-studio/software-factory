@@ -11,9 +11,9 @@ when nothing is watched yet, for the same reason: the list it reads can change u
 The contract with whoever files work (a human today, a composer later) is a single label:
 drop `agent:queued` on an open issue and the factory builds it. Issues are claimed lowest
 number first, and a repo runs one issue at a time — so a numbered sequence executes in
-order without any dependency graph. Postgres, not the issue label, is the source of truth
-for what is already running (`db.has_active_run`), so a slow label write can never cause a
-double dispatch.
+order without any dependency graph. The database, not the issue label, is the source of
+truth for what is already running (`db.has_active_run`), so a slow label write can never
+cause a double dispatch.
 """
 
 from __future__ import annotations

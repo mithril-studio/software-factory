@@ -191,9 +191,10 @@ async def api_run_telemetry(run_id: str):
 async def api_telemetry():
     """The fleet view.
 
-    Four questions the run table alone could not answer: where the money goes by token
-    class, what it is costing over time, which tools eat the wall clock, and what a
-    merged pull request actually costs. All derived from the event rows — nothing here
+    Five questions the run table alone could not answer: where the money goes by token
+    class, what it is costing over time, which tools eat the wall clock, what a merged
+    pull request actually costs, and whether memory is being read. All derived from the
+    event rows — nothing here
     is a stored aggregate, so any of it can be re-cut without a migration.
     """
     return {
