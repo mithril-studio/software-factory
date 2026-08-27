@@ -365,9 +365,7 @@ async def _execute(run_id: str, repo: str, goal: str, run_log: runner.RunLog) ->
             timeout=settings.run_timeout,
         )
         run_log.write(f"[factory] planner exited {exit_code}")
-        verdict = await runner._read_verdict(
-            boxd, machine.id, run_log, path=PLAN_VERDICT_PATH
-        )
+        verdict = await runner._read_json_file(boxd, machine.id, PLAN_VERDICT_PATH, run_log)
         await runner._salvage_transcript(boxd, machine.id, run_id, run_log, manifest)
 
         goal_met, claimed, summary = parse_plan_verdict(verdict)

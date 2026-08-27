@@ -138,6 +138,50 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
 );
 CREATE INDEX IF NOT EXISTS memory_candidates_repo_idx ON memory_candidates (repo);
 CREATE INDEX IF NOT EXISTS memory_candidates_status_idx ON memory_candidates (status);
+
+-- What the improvement loop changed, and why it thought so at the time.
+--
+-- The loop edits the things that decide how agents behave — a repo's skills, its
+-- `.factory.md`, its `.mem/`. Those changes arrive as ordinary pull requests and are reviewed
+-- like code, so git already records *what* changed. What git cannot record is the reasoning:
+-- which runs were the evidence, which number the change was supposed to move, and what that
+-- number actually did afterwards. Without that, a rule merged six weeks ago is indistinguishable
+-- from one somebody typed on a hunch, and the only safe thing to do with an unattributable rule
+-- is leave it there forever. This table is what makes deletion possible.
+--
+-- Three readers, and each needs a different column. A human auditing what the loop has been
+-- doing reads `rationale` and `evidence`. The grader reads `metric` and `baseline`, and writes
+-- `observed`. The next learning run reads the whole history, including the failures — without
+-- it the loop re-proposes what it already tried and reverted, and oscillates forever.
+--
+-- It lives in `control` rather than `telemetry` because it records decisions, not traces:
+-- telemetry observes what happened, this says what the factory chose to do about it.
+CREATE TABLE IF NOT EXISTS improvements (
+    id          TEXT PRIMARY KEY,
+    repo        TEXT NOT NULL,
+    run_id      TEXT NOT NULL,
+    artifact    TEXT NOT NULL,
+    target      TEXT,
+    action      TEXT NOT NULL,
+    rationale   TEXT NOT NULL,
+    evidence    TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    baseline    REAL,
+    issue_url   TEXT,
+    -- The issue this proposal became, as a number rather than only inside `issue_url`. It is
+    -- the join back: the factory advances a proposal by noticing that the issue it filed got
+    -- built and merged, and matching on a substring of a URL to do that would break the first
+    -- time GitHub changed a path.
+    issue_number INTEGER,
+    pr_url      TEXT,
+    status      TEXT NOT NULL DEFAULT 'proposed',
+    observed    REAL,
+    graded_at   TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS improvements_repo_idx ON improvements (repo);
+CREATE INDEX IF NOT EXISTS improvements_status_idx ON improvements (status);
 """
 
 # Additive migrations for databases created before a column existed. Each is tried once at
@@ -185,10 +229,18 @@ MIGRATIONS = (
     # build has been dispatched inside its cycle, `cycle` is which pass over the pull
     # request it belongs to.
     "ALTER TABLE runs ADD COLUMN cycle INTEGER NOT NULL DEFAULT 1",
-    # The goal loop: a repo may carry an endstate description, and a fifth run kind — 'plan',
+    # The commit the run branched from. Three of the things that decide how an agent behaves
+    # — `.mem/`, `.factory.md`, and a repo's own skills — are files in the repo rather than
+    # anything this plane sends, so without the base commit there is no way to say which
+    # version of them a run actually had. That makes "did this change help?" unanswerable:
+    # you can see that a rule was merged and that runs got better, and never establish that
+    # the runs which got better were the ones carrying the rule. Nullable, because every run
+    # recorded before this column existed genuinely has no answer.
+    "ALTER TABLE runs ADD COLUMN base_sha TEXT",
+    # The goal loop: a repo may carry an endstate description, and a run kind — 'plan',
     # an agent that compares the repo against it when the queue runs dry — files the next
     # issues or declares it met. No `runs` change: `kind` is a plain string column and 'plan'
-    # is just a fifth value of it. See the repos table comment in SCHEMA for what each of
+    # is just another value of it. See the repos table comment in SCHEMA for what each of
     # these four holds.
     "ALTER TABLE repos ADD COLUMN goal TEXT",
     "ALTER TABLE repos ADD COLUMN goal_state TEXT NOT NULL DEFAULT 'none'",
@@ -198,6 +250,14 @@ MIGRATIONS = (
 
 # Terminal states. Anything else means the run is still in flight.
 TERMINAL = ("succeeded", "failed", "cancelled")
+
+# Kinds that claim no issue, and so must not gate a repo's dispatch queue. Both are runs in
+# every other sense — a VM, a streamed log, a cancel button — but neither is working on an
+# issue, so treating them as "this repo is busy" stops the repo for the duration of something
+# that was never in the way. `provision` learned this by stopping repos for a whole install;
+# `learn` is here from the start for the same reason, and because a learning run reads a
+# window of finished work that builds keep extending underneath it.
+UNCLAIMED_KINDS = ("provision", "learn")
 
 
 def utcnow() -> str:
@@ -487,7 +547,7 @@ async def has_active_run(repo: str) -> bool:
     issue at a time (lowest number first) and a slow label write can never cause a double
     dispatch — the database, not the issue label, decides what is already in flight.
 
-    Provisioning runs are excluded. They are runs in every other sense — a VM, a streamed
+    `UNCLAIMED_KINDS` are excluded. They are runs in every other sense — a VM, a streamed
     log, a cancel button — but they claim no issue, and counting them here made connecting a
     repo stop it: `POST /api/repos` starts a warm-up immediately, so a repo arriving with
     queued issues sat idle for the whole install. Nothing about a golden gates dispatch, and
@@ -495,13 +555,46 @@ async def has_active_run(repo: str) -> bool:
     and installs for itself, including while its own snapshot is being built.
     """
     marks = ", ".join("?" for _ in TERMINAL)
+    kind_marks = ", ".join("?" for _ in UNCLAIMED_KINDS)
     async with connect() as conn:
         async with conn.execute(
-            f"SELECT 1 FROM runs WHERE repo = ? AND kind != 'provision' "
+            f"SELECT 1 FROM runs WHERE repo = ? AND kind NOT IN ({kind_marks}) "
             f"AND status NOT IN ({marks}) LIMIT 1",
-            (repo, *TERMINAL),
+            (repo, *UNCLAIMED_KINDS, *TERMINAL),
         ) as cur:
             return await cur.fetchone() is not None
+
+
+async def issues_since_last_learn(repo: str) -> int:
+    """How many distinct issues this repo has finished since its last learning run.
+
+    The trigger is volume rather than a clock because evidence, not time, is what a learning
+    run consumes. A repo that shipped nothing this week has produced nothing new to read, and
+    dispatching over the same window twice costs a VM and an agent to reach the same
+    conclusions — or worse, different ones, from noise.
+
+    Counts issues rather than runs so a single issue that took four retries counts once. Four
+    dispatches at one problem is one piece of evidence about that problem, and counting them
+    separately would make the flakiest repo learn most often on the least new information.
+
+    A repo that has never had a learning run counts its whole history, which is what makes the
+    first one fire as soon as there is anything worth reading.
+    """
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT MAX(created_at) AS last FROM runs WHERE repo = ? AND kind = 'learn'",
+            (repo,),
+        ) as cur:
+            row = await cur.fetchone()
+        since = (row["last"] if row else None) or ""
+        async with conn.execute(
+            "SELECT COUNT(DISTINCT issue_number) AS n FROM runs "
+            "WHERE repo = ? AND kind = 'build' AND issue_number > 0 "
+            "AND status IN ('succeeded', 'failed') AND created_at > ?",
+            (repo, since),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row["n"] if row else 0)
 
 
 async def stats_by_repo() -> dict[str, dict]:
@@ -666,3 +759,216 @@ async def transition_candidate(candidate_id: str, to_status: str) -> dict:
     candidate["status"] = to_status
     candidate["updated_at"] = now
     return candidate
+
+
+# --------------------------------------------------------------------------- improvements
+
+# The life of a proposal, as edges rather than a status column anybody may set.
+#
+# `merged` is deliberately not terminal. A change that reached main is not finished, it is
+# *live*, and the question it was created to answer — did the number move — cannot be asked
+# until runs have happened under it. `kept` and `reverted` are the two answers, and they are
+# the only reason this table earns its place: without a state after `merged`, the ledger would
+# record what the loop did and never what it was worth, which is the failure mode that makes a
+# self-improving system accumulate rules nobody dares delete.
+IMPROVEMENT_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "proposed": ("building", "rejected", "abandoned"),
+    "building": ("merged", "rejected"),
+    "merged": ("kept", "reverted"),
+}
+
+IMPROVEMENT_INITIAL_STATUS = "proposed"
+
+# What the loop is allowed to change. Two of these are here to be *recorded* rather than
+# built, because what they change lives outside the fence the loop may open queued work
+# against — a row exists so the insight is kept, read by a human, and seen by the next
+# learning run so it stops rediscovering the same thing.
+#
+# `harness` is the dispatch flags, prompt templates and runner in this control plane.
+#
+# `compose` is the issue itself, and it is the highest-leverage of the lot. A builder can
+# only be as good as what it was asked for: an ambiguous scope or an unverifiable acceptance
+# criterion produces a rejection that looks exactly like an agent doing poor work, and every
+# fix derived from that reading lands on the wrong thing — a skill teaching the builder to
+# compensate for a badly-written issue, paid for on every future run, while the issues go on
+# being written the same way. `FACTORY_MAX_REVIEW_CYCLES` already encodes this belief: two
+# cycles, because a third failure means the issue is wrong rather than the code.
+IMPROVEMENT_ARTIFACTS = frozenset({
+    "skill", "factory_md", "mem", "candidate", "harness", "compose",
+})
+
+# Artifacts whose fix is not in the repo being learned about, so a proposal about one is
+# filed for a human and never labelled `agent:queued` — queuing it would point the factory at
+# its own control plane, or at the skill that writes its work orders.
+IMPROVEMENT_UNBUILDABLE = frozenset({"harness", "compose"})
+
+# `revert` is an action rather than a status because it is a change like any other: it needs
+# its own issue, its own review, and its own row saying what it undid and why.
+IMPROVEMENT_ACTIONS = frozenset({"add", "edit", "delete", "revert"})
+
+# Closed for the same reason `CANDIDATE_COLUMNS` is: these values arrive from a file an agent
+# wrote inside a VM, and column *names* are interpolated into the statement because SQL has no
+# placeholder for an identifier.
+IMPROVEMENT_COLUMNS = frozenset({
+    "id", "repo", "run_id", "artifact", "target", "action", "rationale", "evidence",
+    "metric", "baseline", "issue_url", "issue_number", "pr_url", "status", "observed",
+    "graded_at", "created_at", "updated_at",
+})
+
+# Every proposal has to say what it is for and what would show it worked. Enforced here rather
+# than trusted to the prompt, because these are exactly the fields a model under pressure to
+# produce three proposals will leave blank, and a proposal with no metric can never be graded —
+# it would enter the ledger already immune to deletion.
+IMPROVEMENT_REQUIRED = ("repo", "run_id", "artifact", "action", "rationale", "evidence", "metric")
+
+
+async def create_improvement(**fields: Any) -> None:
+    """Record a proposed change. Re-recording the same id leaves the original alone.
+
+    Raises `ValueError` on an unknown column, a missing justification field, an artifact or
+    action outside the closed sets, or any status other than `proposed` — a proposal that
+    could name its own status could arrive `merged` having never been built.
+    """
+    fields = {"status": IMPROVEMENT_INITIAL_STATUS, **fields}
+    unknown = sorted(set(fields) - IMPROVEMENT_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown improvements column(s): {', '.join(unknown)}")
+    if fields["status"] != IMPROVEMENT_INITIAL_STATUS:
+        raise ValueError(
+            f"an improvement is created {IMPROVEMENT_INITIAL_STATUS}, not {fields['status']!r}; "
+            f"use transition_improvement"
+        )
+    missing = [k for k in IMPROVEMENT_REQUIRED if not str(fields.get(k) or "").strip()]
+    if missing:
+        raise ValueError(f"improvement is missing: {', '.join(missing)}")
+    if fields["artifact"] not in IMPROVEMENT_ARTIFACTS:
+        raise ValueError(
+            f"unknown artifact {fields['artifact']!r}; "
+            f"expected one of {', '.join(sorted(IMPROVEMENT_ARTIFACTS))}"
+        )
+    if fields["action"] not in IMPROVEMENT_ACTIONS:
+        raise ValueError(
+            f"unknown action {fields['action']!r}; "
+            f"expected one of {', '.join(sorted(IMPROVEMENT_ACTIONS))}"
+        )
+    now = utcnow()
+    fields.setdefault("created_at", now)
+    fields.setdefault("updated_at", now)
+    cols = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    async with connect() as conn:
+        await conn.execute(
+            f"INSERT OR IGNORE INTO improvements ({cols}) VALUES ({marks})",
+            tuple(fields.values()),
+        )
+        await conn.commit()
+
+
+async def get_improvement(improvement_id: str) -> dict | None:
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM improvements WHERE id = ?", (improvement_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_improvements(
+    repo: str | None = None, status: str | None = None, limit: int = 200
+) -> list[dict]:
+    """The ledger, newest first, optionally scoped.
+
+    Newest first because both readers want the recent end: a human is auditing what just
+    happened, and a learning run needs what it most recently tried before it proposes again.
+
+    `rowid` breaks ties, and it is not decoration. `utcnow()` has second granularity and a
+    learning run files its proposals in a loop, so a batch shares a timestamp — ordering on
+    `created_at` alone leaves them in whatever order the query planner felt like, and "the
+    most recent thing this loop tried" becomes a different answer each time it is asked.
+    """
+    clauses = []
+    params: list[Any] = []
+    if repo is not None:
+        clauses.append("repo = ?")
+        params.append(repo)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    async with connect() as conn:
+        async with conn.execute(
+            f"SELECT * FROM improvements{where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (*params, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def improvement_for_issue(repo: str, issue_number: int) -> dict | None:
+    """The proposal that became this issue, if it was one.
+
+    Most issues are not: the factory is mostly doing work a human asked for, and this returns
+    None for all of it. It exists so the few that *are* the loop's own output can be followed
+    from "filed" through to "merged", which is the only way a change ever becomes gradeable.
+    """
+    if not issue_number:
+        return None
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM improvements WHERE repo = ? AND issue_number = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (repo, issue_number),
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def transition_improvement(
+    improvement_id: str,
+    to_status: str,
+    observed: float | None = None,
+    **fields: Any,
+) -> dict:
+    """Move a proposal along an allowed edge, optionally recording what it turned out to be worth.
+
+    `observed` is accepted here rather than in a separate write because grading *is* the
+    transition: `merged` becomes `kept` or `reverted` precisely by measuring, and letting the
+    number be written without moving the status would allow a graded row that still claims to
+    be ungraded.
+
+    Extra `fields` carry the facts that only exist once the change is under way — `issue_url`
+    when it is picked up, `pr_url` when one opens. Same closed column set as creation.
+    """
+    unknown = sorted(set(fields) - IMPROVEMENT_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown improvements column(s): {', '.join(unknown)}")
+    improvement = await get_improvement(improvement_id)
+    if improvement is None:
+        raise ValueError(f"no such improvement: {improvement_id}")
+    current = improvement["status"]
+    allowed = IMPROVEMENT_TRANSITIONS.get(current, ())
+    if to_status not in allowed:
+        raise ValueError(
+            f"cannot transition improvement {improvement_id} from {current} to {to_status}"
+        )
+    now = utcnow()
+    updates: dict[str, Any] = {"status": to_status, "updated_at": now, **fields}
+    if observed is not None:
+        updates["observed"] = observed
+        updates["graded_at"] = now
+    sets = ", ".join(f"{k} = ?" for k in updates)
+    async with connect() as conn:
+        # Guarded on the status read above, for the reason `transition_candidate` gives: two
+        # writers both seeing `merged` must not both succeed with the slower silently winning.
+        cursor = await conn.execute(
+            f"UPDATE improvements SET {sets} WHERE id = ? AND status = ?",
+            (*updates.values(), improvement_id, current),
+        )
+        await conn.commit()
+        if not cursor.rowcount:
+            raise ValueError(
+                f"cannot transition improvement {improvement_id} from {current} to "
+                f"{to_status}: it changed underneath this request"
+            )
+    improvement.update(updates)
+    return improvement

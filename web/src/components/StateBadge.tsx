@@ -23,6 +23,18 @@ const VARIANT: Record<string, "ok" | "warn" | "bad" | "muted" | "default"> = {
   blocked: "warn",
   none: "muted",
   error: "bad",
+  // improvement-ledger states. `merged` is warn rather than ok on purpose: the change is
+  // live and *ungraded*, which is a state that wants attention, not a green tick. `kept` is
+  // the only outcome that earned one, and `reverted` is not a failure — it is the loop
+  // deleting something that did not pay for itself, which is the half that keeps context
+  // from growing forever.
+  proposed: "muted",
+  building: "warn",
+  merged: "warn",
+  kept: "ok",
+  reverted: "muted",
+  rejected: "bad",
+  abandoned: "muted",
 }
 
 /** The colour one state carries, for the places that need the hue without the badge —

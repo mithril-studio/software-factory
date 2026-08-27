@@ -182,6 +182,32 @@ class Settings:
     # on purpose: the factory builds sequentially and plans again when these are done, and a
     # plan written against today's code beats a backlog written all at once.
     plan_max_issues: int = int(os.environ.get("FACTORY_PLAN_MAX_ISSUES", "6"))
+    # --- the improvement loop
+    #
+    # Periodically, an agent reads what the last N issues actually cost in rejections and
+    # failures and proposes changes to the things that shape agent behaviour: a repo's skills,
+    # its `.factory.md`, its `.mem/`. Off by default. It is the one part of this system that
+    # edits its own inputs, so it starts switched off and is turned on per deployment.
+    learn_enabled: bool = os.environ.get("FACTORY_LEARN", "0") == "1"
+    # How many issues a repo must finish before its next learning run. Volume rather than a
+    # clock: a repo that shipped nothing this week has produced no new evidence, and a
+    # learning run over the same window it already read is spend with no possible finding.
+    learn_every: int = int(os.environ.get("FACTORY_LEARN_EVERY", "5"))
+    # How far back the digest looks. Wider than the trigger on purpose — a change is judged
+    # against what happened before it, so the window has to contain both sides.
+    learn_window_days: int = int(os.environ.get("FACTORY_LEARN_WINDOW_DAYS", "30"))
+    # Proposals one learning run may file. Small deliberately. The scarce resource is not the
+    # agent's ideas, it is the review capacity to check them and the context budget to hold
+    # what gets merged — and a loop allowed ten changes a cycle would spend both on its own
+    # output. Three forces the run to rank rather than to list.
+    learn_max_proposals: int = int(os.environ.get("FACTORY_LEARN_MAX_PROPOSALS", "3"))
+    # Whether a filed proposal is labelled `agent:queued` — which is what makes the factory
+    # build it — or left as a plain issue for a human to trigger. Off means the loop still
+    # runs, still reasons, still files fully-formed issues, and stops one step short of
+    # changing anything. That is the setting to start on: read a cycle or two of proposals
+    # before letting them merge into the repos the factory works on.
+    learn_autoqueue: bool = os.environ.get("FACTORY_LEARN_AUTOQUEUE", "0") == "1"
+
     # Issue polling. The repos this deployment starts up watching — see `_repos()`.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"

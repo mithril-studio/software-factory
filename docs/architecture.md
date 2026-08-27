@@ -79,8 +79,8 @@ the VM name carries the first 8. It is the join key across every layer.
 OTEL_RESOURCE_ATTRIBUTES=run.id=<id>,issue=<owner/repo#123>,repo=<owner/repo>,vm=<box-name>
 ```
 
-Review runs append `,kind=review`. That line is the entire producer contract — no OTLP
-endpoint, exporter, or token is set today.
+Any run that is not a build appends `,kind=<kind>`. That line is the entire producer
+contract — no OTLP endpoint, exporter, or token is set today.
 
 ### §3.2 The adapter — the model-agnostic boundary
 
@@ -111,7 +111,62 @@ factory itself touches memory in three deterministic ways:
   for human triage. Accepting a candidate records a verdict; it never writes `.mem/` — a
   future agent does that, with the store's own tools.
 
-### §3.4 The golden launch contract
+### §3.4 The improvement loop
+
+The factory is already an engine that turns an issue into a reviewed pull request. The loop
+adds no second engine: a `learn` run reads what the last few issues cost in rejections and
+failures, and files ordinary issues. Everything after that is the pipeline in §4.
+
+Four pieces, and each is deliberately dull:
+
+- **Attribution.** `runs.base_sha` is the commit a build branched from — which is what fixes
+  the version of the three things that shape agent behaviour and live in the repo: `.mem/`,
+  `.factory.md`, and the repo's own `.claude/skills/`. Without it, "did that change help?"
+  cannot be asked, because there is no way to say which runs carried the change.
+- **The digest** (`telemetry/digest.py`, `GET /api/digest`). Passive SQL over the shared
+  database: review rejections, runs that shipped nothing, clustered failures, failing tool
+  calls, what memory was retrieved, which skills were loaded, the pending candidate queue,
+  and cost. Every section is capped and every cap reports what it dropped. `kind='learn'`
+  rows are excluded, so the loop cannot read its own behaviour back as evidence.
+- **The ledger** (`improvements`, `GET /api/improvements`). One row per proposal: the
+  rationale, the runs cited, the metric it promised to move and its baseline, then the issue,
+  the PR, and finally what the metric actually did. `merged` is not terminal — `kept` and
+  `reverted` are — because a change that reached main is live, not finished, and a ledger with
+  no state after `merged` records what the loop did and never what it was worth.
+- **The learn run.** An agent in a VM, holding the digest, the ledger and the checkout. It
+  grades what already merged before it proposes anything new, and files at most
+  `FACTORY_LEARN_MAX_PROPOSALS` issues.
+
+Two fences are mechanical rather than prompted, on the principle in `discussion.md`: things
+that cost money when ignored belong in harness behaviour, not in prose.
+
+- **Citations are verified.** The agent writes proposals to a file; `control` checks each
+  cited `run_id` against the runs the digest was built from and discards any proposal whose
+  evidence does not exist. This is why proposals come back as a file rather than as issues
+  the agent opens itself.
+- **`agent:queued` is added by `control` or not at all.** `FACTORY_LEARN_AUTOQUEUE` off means
+  the loop runs, reasons, files fully-formed issues, and stops one step short of changing
+  anything. `harness` and `compose` proposals are recorded and never queued whatever that
+  setting says, because what they change is not in the repo being learned about.
+
+The loop's first question about any rejection is **whether the issue was the problem**, not
+what the agent should have known. An agent can only be as good as its work order, and the
+two readings of the same rejection are not equally cheap to get wrong: blaming the agent
+produces a skill teaching every future builder to compensate for a badly-written issue —
+context, loaded on runs that never needed it, paid for forever — while the issues go on being
+written the same way. `FACTORY_MAX_REVIEW_CYCLES` already encodes the belief (two cycles,
+because a third failure means the issue is wrong rather than the code); the `compose`
+artifact is where that diagnosis gets recorded.
+
+Skills are repo-scoped for the same reason. A skill in the repo ships inside the pull request
+and is reviewed like code, exactly as `.mem/` already is, so the blast radius of a bad one is
+one repository rather than every golden in the fleet. The shared
+[agent-skills](https://github.com/mithril-studio/agent-skills) repo stays for universal
+capability; the loop never writes to it.
+
+Off by default (`FACTORY_LEARN`). It is the one part of this system that edits its own inputs.
+
+### §3.5 The golden launch contract
 
 A golden announces itself with two files: `/usr/local/bin/factory-agent` (the launch command)
 and `/etc/factory/agent.json` (the manifest — agent name, transcript glob, event format).
@@ -131,6 +186,7 @@ transition on that row:
 | `ci` | none | Record what the PR's checks decided — no agent, no tokens |
 | `provision` | `prov-*` | Build a repo's warm golden |
 | `plan` | `plan-*` | Compare the repo against its goal; file the next issues or declare it met |
+| `learn` | `learn-*` | Read the window's telemetry and file proposals to improve the repo |
 
 Two budgets, deliberately separate:
 

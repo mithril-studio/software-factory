@@ -335,6 +335,32 @@ async def pr_head_sha(repo: str, number: int) -> str:
     return resp.json()["head"]["sha"]
 
 
+async def ref_sha(repo: str, ref: str) -> str | None:
+    """The commit `ref` points at right now, or None when it cannot be resolved.
+
+    This is the attribution key for everything the agent reads out of the repo rather than
+    out of the prompt: `.mem/`, `.factory.md`, and `.claude/skills/` are all files at a
+    commit, so the commit the run branched from is the one fact that says which version of
+    each of them was in play. Recorded per run precisely so "did that change help?" can be
+    answered by segmenting runs on it instead of by remembering when something merged.
+
+    A failure here is not worth failing a dispatch over — an unattributed run is a run whose
+    context version is unknown, which is exactly what every run before this column already
+    was — so the caller gets None and the run proceeds.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{API}/repos/{repo}/commits/{ref}",
+                headers={**_headers(), "Accept": "application/vnd.github.sha"},
+            )
+            resp.raise_for_status()
+        sha = resp.text.strip()
+        return sha or None
+    except Exception:  # noqa: BLE001 - attribution is observability, never a dispatch gate
+        return None
+
+
 async def merge_base_sha(repo: str, base: str, head_sha: str) -> str:
     """The commit a branch actually diverged from.
 
@@ -625,6 +651,30 @@ async def add_comment(repo: str, number: int, body: str) -> None:
             json={"body": body},
         )
         resp.raise_for_status()
+
+
+async def create_issue(
+    repo: str, title: str, body: str, labels: list[str] | None = None
+) -> dict:
+    """Open an issue. Returns the created issue object.
+
+    Labels are passed at creation rather than added afterwards, and that matters for exactly
+    one of them: `agent:queued` is what the poller acts on, so an issue that exists for a
+    moment without it and gains it later is an issue the poller can see half-formed. One call,
+    one state.
+
+    This is the only way the improvement loop reaches GitHub. The agent proposing a change
+    writes a file; the control plane files it. That is deliberate — an allowlist enforced in
+    a prompt is a request, and the same rule enforced here is a rule.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            f"{API}/repos/{repo}/issues",
+            headers=_headers(),
+            json={"title": title, "body": body, "labels": labels or []},
+        )
+        resp.raise_for_status()
+    return resp.json()
 
 
 async def ensure_labels(repo: str) -> None:

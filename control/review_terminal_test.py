@@ -109,6 +109,24 @@ run(db.create_run(id="p1", repo=REPO, issue_number=0, status="running",
                   kind="provision", created_at=db.utcnow()))
 check("a warm-up in flight still does not claim the repo", run(db.has_active_run(REPO)), False)
 
+# A learning run is excluded for the same reason and one of its own. It claims no issue, so
+# counting it would stop the repo for the duration of something that was never in the way —
+# and it reads a window of *finished* work, so the builds it would be blocking are the ones
+# that extend the window it is summarising. Blocking them buys nothing and costs a queue.
+run(db.create_run(id="l1", repo=REPO, issue_number=0, status="running",
+                  kind="learn", created_at=db.utcnow()))
+check("a learning run does not claim the repo either", run(db.has_active_run(REPO)), False)
+
+# Both exclusions come from one list rather than two `!=` clauses that drifted apart.
+check("the excluded kinds are named in one place", sorted(db.UNCLAIMED_KINDS),
+      ["learn", "provision"])
+
+# A build alongside them still claims it. Without this the previous two checks would also
+# pass if the guard had simply stopped working.
+run(db.create_run(id="b3", repo=REPO, issue_number=73, status="running",
+                  kind="build", created_at=db.utcnow()))
+check("a build alongside them still claims the repo", run(db.has_active_run(REPO)), True)
+
 
 tmp.cleanup()
 print()
