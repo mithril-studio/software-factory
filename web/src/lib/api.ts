@@ -53,6 +53,11 @@ export function runOutcome(r: Run): string {
   // Say what it actually is, in the same words the review path already uses for it, so the
   // phase and the review that reports it do not describe one event two ways.
   if (r.kind === "ci") return r.status === "failed" ? "ci red" : r.status
+  // A plan run that completed without filing issues or declaring the goal met records
+  // `succeeded` with the reason tagged in `error` — the same status/outcome split as a
+  // review that requested changes, read the same way.
+  if (r.kind === "plan" && r.status === "succeeded" && r.error?.startsWith("planned nothing: "))
+    return "planned nothing"
   if (r.kind !== "review" || r.status !== "succeeded" || !r.error) return r.status
   for (const [prefix, outcome] of REVIEW_OUTCOME) {
     if (r.error.startsWith(prefix)) return outcome
@@ -130,6 +135,18 @@ export type Project = {
   failed: number
   active: number
   last_run: string | null
+  /** The endstate this repo is being built toward, or null when nobody has set one. */
+  goal: string | null
+  /** Where the goal loop stands: `none` (no goal), `active` (planning may fire when the
+   *  queue runs dry), `met` (a plan run verified the endstate against an empty queue), or
+   *  `stalled` (consecutive fruitless plans — a human decides what happens next). */
+  goal_state: "none" | "active" | "met" | "stalled"
+  /** Consecutive fruitless plan runs. Meaningful mostly beside `stalled`. */
+  plan_stalls: number
+  last_planned_at: string | null
+  /** Whether this deployment runs the goal loop at all (FACTORY_PLAN). A goal set while
+   *  this is false is a note on the register, and the UI should say so. */
+  plan_enabled: boolean
 }
 
 /** One preflight question and its answer.
@@ -321,6 +338,19 @@ export async function del<T>(url: string): Promise<T> {
   return resp.json()
 }
 
+export async function patch<T>(url: string, body: unknown): Promise<T> {
+  const resp = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!resp.ok) {
+    if (resp.status === 401) onUnauthorized()
+    throw new Error(await detail(resp))
+  }
+  return resp.json()
+}
+
 // ---- repos ----
 
 /** One repo the control plane's GitHub token can see. For the connect picker only — what a
@@ -368,6 +398,17 @@ export function warmGolden(repo: string): Promise<{ run_id: string }> {
 /** Drop this repo's golden. Its runs fall back to the base and install for themselves. */
 export function dropGolden(repo: string): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/api/repos/${repo}/golden`)
+}
+
+/** Set, change or clear a repo's goal. Empty or null clears it; new text activates the
+ *  loop; unchanged text is a server-side no-op, so saving twice cannot wake a met goal. */
+export function setGoal(repo: string, goal: string | null): Promise<{ goal_state: string }> {
+  return patch<{ goal_state: string }>(`/api/repos/${repo}`, { goal })
+}
+
+/** Put a `met` or `stalled` goal back to `active`, so the next dry poll tick plans again. */
+export function replan(repo: string): Promise<{ goal_state: string }> {
+  return post<{ goal_state: string }>(`/api/repos/${repo}/replan`)
 }
 
 // ---- auth ----

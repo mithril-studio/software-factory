@@ -95,13 +95,15 @@ def provision_semaphore() -> asyncio.Semaphore:
 
 
 # Every VM a run creates is named from its run id with one of these prefixes: `run-` for a
-# build, `rev-` for a review, `prov-` for warming a repo's golden. Reconcile and the fleet view
-# both key off them, so they live here rather than being spelled out at each site — a prefix
-# known to one and not the other is a VM nobody reaps and nobody recognises.
+# build, `rev-` for a review, `prov-` for warming a repo's golden, `plan-` for a goal-loop
+# planning run. Reconcile and the fleet view both key off them, so they live here rather than
+# being spelled out at each site — a prefix known to one and not the other is a VM nobody
+# reaps and nobody recognises.
 RUN_PREFIX = "run-"
 REVIEW_PREFIX = "rev-"
 PROVISION_PREFIX = "prov-"
-VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX)
+PLAN_PREFIX = "plan-"
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, PLAN_PREFIX)
 
 
 def is_run_vm(name: str) -> bool:
@@ -110,7 +112,7 @@ def is_run_vm(name: str) -> bool:
 
 
 def vm_role(name: str) -> str:
-    """What a machine in the fleet is: `run`, `review`, `provision`, or `other`.
+    """What a machine in the fleet is: `run`, `review`, `provision`, `plan`, or `other`.
 
     Read off the same prefixes `is_run_vm` sweeps on, so the fleet view and the reaper can
     never disagree about what belongs to the factory. `other` covers everything the factory
@@ -122,6 +124,8 @@ def vm_role(name: str) -> str:
         return "review"
     if name.startswith(PROVISION_PREFIX):
         return "provision"
+    if name.startswith(PLAN_PREFIX):
+        return "plan"
     if name.startswith(RUN_PREFIX):
         return "run"
     return "other"
@@ -1165,15 +1169,16 @@ def dispatch_env(
         # the dispatch contract later.
         "OTEL_RESOURCE_ATTRIBUTES": (
             f"run.id={run_id},issue={repo}#{number},repo={repo},vm={vm_name}"
-            + (",kind=review" if kind == "review" else "")
+            + (f",kind={kind}" if kind != "build" else "")
         ),
     }
     if resume is not None:
         env["FACTORY_RESUME"] = "1" if resume else "0"
-    if kind != "review":
+    if kind == "build":
         # Where to propose learnings, read back before the VM is reaped. Set only on the path
         # that asks for it and reads it: an environment variable naming a file nobody collects
-        # is an invitation to write into a void, and the review prompt makes no such promise.
+        # is an invitation to write into a void, and neither the review prompt nor the plan
+        # prompt makes such a promise.
         env[MEMORY_CANDIDATE_ENV] = MEMORY_CANDIDATE_PATH
     if settings.github_token:
         env["GH_TOKEN"] = settings.github_token
@@ -2345,11 +2350,15 @@ async def _execute_review(
         await boxd.close()
 
 
-async def _read_verdict(boxd: AsyncBoxd, machine_id: str, log: RunLog) -> dict | None:
-    """Read the verdict file out of the VM. Any failure returns None, which `decide` treats
-    as "not approved" — a reviewer that produced nothing readable has approved nothing."""
+async def _read_verdict(
+    boxd: AsyncBoxd, machine_id: str, log: RunLog, path: str = VERDICT_PATH
+) -> dict | None:
+    """Read a verdict file out of the VM. Any failure returns None, which every caller treats
+    as "nothing decided" — a reviewer that produced nothing readable has approved nothing,
+    and a planner that produced nothing readable has planned nothing. `path` defaults to the
+    review verdict; a plan run reads its own file through the same salvage."""
     try:
-        result = await boxd.machines.exec(machine_id, f"cat {VERDICT_PATH}", timeout=30)
+        result = await boxd.machines.exec(machine_id, f"cat {path}", timeout=30)
         raw = getattr(result, "stdout", None) or ""
         if inspect.isawaitable(raw):  # pragma: no cover - SDK shape drift
             raw = await raw

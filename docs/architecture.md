@@ -130,6 +130,7 @@ transition on that row:
 | `review` | `rev-*` | Judge the PR against the issue's acceptance criteria; record a verdict |
 | `ci` | none | Record what the PR's checks decided — no agent, no tokens |
 | `provision` | `prov-*` | Build a repo's warm golden |
+| `plan` | `plan-*` | Compare the repo against its goal; file the next issues or declare it met |
 
 Two budgets, deliberately separate:
 
@@ -146,6 +147,18 @@ tested sha, and repairs a merge conflict once by merging base into the branch.
 State mirrors to the issue as five labels — `agent:queued|running|blocked|done|failed` — the
 whole human-facing contract. An open `agent:failed` or `agent:blocked` issue halts that
 repo's queue (`FACTORY_HALT_ON_FAILURE`), so the factory never builds on top of a failure.
+
+**The goal loop** (`FACTORY_PLAN`, off by default) is what makes the pipeline self-serving.
+A watched repo can carry a *goal* — prose describing the project's endstate, set through the
+API and stored on the register. When the queue runs dry for a repo whose goal is `active`,
+the poller dispatches a `plan` run: an agent on a VM that reads the repo as it is, judges the
+gap against the goal, and either files the next increment of issues (factory-compose format,
+labelled `agent:queued`, at most `FACTORY_PLAN_MAX_ISSUES` per pass) or declares the goal
+met. The control plane verifies rather than trusts: `met` requires the verdict *and* an
+empty queue on GitHub, a queued issue outranks any claim, and `FACTORY_PLAN_MAX_STALLS`
+consecutive fruitless plans park the goal as `stalled` for a human. A cooldown
+(`FACTORY_PLAN_COOLDOWN`) bounds the cadence, and the hook sits below the halt check — a
+halted repo never plans. `control/plan.py` holds the whole loop.
 
 ## §5 What it deliberately does not have
 

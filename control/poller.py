@@ -8,12 +8,17 @@ Which repos it watches comes from `repos.watched()`, not from configuration, so 
 connected through the API is picked up on the next tick without a restart. The loop runs even
 when nothing is watched yet, for the same reason: the list it reads can change under it.
 
-The contract with whoever files work (a human today, a composer later) is a single label:
-drop `agent:queued` on an open issue and the factory builds it. Issues are claimed lowest
-number first, and a repo runs one issue at a time — so a numbered sequence executes in
-order without any dependency graph. The database, not the issue label, is the source of
-truth for what is already running (`db.has_active_run`), so a slow label write can never
-cause a double dispatch.
+The contract with whoever files work (a human, the factory-compose skill, or a plan run —
+see `control/plan.py`) is a single label: drop `agent:queued` on an open issue and the
+factory builds it. Issues are claimed lowest number first, and a repo runs one issue at a
+time — so a numbered sequence executes in order without any dependency graph. The database,
+not the issue label, is the source of truth for what is already running
+(`db.has_active_run`), so a slow label write can never cause a double dispatch.
+
+When the queue is dry the loop no longer necessarily stops: a repo with an active goal gets
+a plan run, which files the next issues toward that goal or declares it met. That hook
+lives at the bottom of `_poll_repo`, after every guard above it, and is a no-op unless the
+deployment opted in.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import db, github, repos, runner
+from . import db, github, plan, repos, runner
 from .config import settings
 
 log = logging.getLogger("factory.poller")
@@ -70,6 +75,11 @@ async def _poll_repo(repo: str) -> None:
                 return
     issues = await github.list_issues_with_label(repo, github.LABEL_QUEUED)
     if not issues:
+        # The queue is dry — the seam the goal loop hangs off. A no-op unless FACTORY_PLAN
+        # is on and this repo carries an active goal whose cooldown has elapsed; see
+        # `plan.should_plan`. Deliberately after the active-run and halt checks above, so a
+        # plan run can never overlap other work and never fires on a halted repo.
+        await plan.maybe_plan(repo)
         return
     issue = issues[0]  # lowest number
     log.info("dispatching %s#%s", repo, issue["number"])
