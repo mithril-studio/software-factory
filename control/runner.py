@@ -1112,6 +1112,15 @@ rules get written that never fire:
    itself in a particular situation → a repo skill in `.claude/skills/`
    (`"artifact": "skill"`). Loaded on demand, so it costs nothing on the runs that do not
    need it.
+
+   **Before proposing one, run `ls ~/.claude/skills` and make sure the name is not already
+   there.** A personal skill overrides a project one — that direction, which is the opposite
+   of what "more specific wins" would suggest — and this VM has the shared skills installed
+   personally. So a repo skill that reuses a global name is not overridden loudly, it is
+   silently never loaded: the issue merges, the file sits in the repo, no run ever reads it,
+   and the next learning run sees a skill with zero loads and proposes deleting it. Nothing
+   in that sequence looks like a mistake. Pick a name that does not collide, and say in the
+   issue body which names you checked against.
 5. **Must it be known from turn 0, on every single run?** Only then `.factory.md`
    (`"artifact": "factory_md"`). That file is spliced into every prompt this repo ever runs,
    so a line added there is paid for forever, whether or not it is relevant. The bar is high
@@ -1136,7 +1145,10 @@ promoting one is often a better-evidenced proposal than anything you would deriv
 **Deleting is proposing.** Compare the skills in `.claude/skills/` against the digest's
 `skills` list, which is every skill the window's runs actually loaded. A skill in the repo and
 absent from that list was not read — that is an observation, not an opinion, and a `delete`
-proposal is the correct response to it. Deletions count against your {max_proposals} the same
+proposal is the correct response to it. One check first, because it is the one case where the
+observation is misleading: if a skill of the same name exists in `~/.claude/skills`, the repo
+one was shadowed rather than ignored, and the fix is to rename it rather than to delete it.
+Deletions count against your {max_proposals} the same
 as additions. They are usually the highest-value thing you can do: everything in `.factory.md`
 and every loaded skill is context, context is cache reads, and cache reads are most of what a
 run costs.

@@ -111,6 +111,13 @@ run(seed_runs([
     # reading its own behaviour back as evidence about how the factory builds software.
     r("l1", issue=0, kind="learn", status="failed",
       error="crashed: the learning run itself fell over"),
+    # Excluded for the more general reason: neither is an attempt at an issue. `plan` is the
+    # case that proves the allowlist earns its keep — it was added to the factory after this
+    # digest shipped, and a denylist would have admitted it silently.
+    r("p1", issue=0, kind="plan", status="failed",
+      error="crashed: the planner fell over"),
+    r("pr1", issue=0, kind="provision", status="failed",
+      error="crashed: the golden never came up"),
     # Excluded: outside the window.
     r("old", issue=9, status="failed", days=90, error="ancient history"),
     # A second repo, so scoping has something to get wrong.
@@ -159,6 +166,18 @@ d = run(digest.build(days=30))
 sigs = " ".join(f["signature"] for f in d["failures"])
 check("the learning run's own crash is not evidence", "learning run" in sigs, False)
 check("nor is anything outside the window", "ancient history" in sigs, False)
+
+# The regression the allowlist exists for. `plan` arrived after this digest shipped; under
+# the original denylist it would have been counted, and a learning run reading a planner
+# crash as a build failure would propose repo skills to fix the planner.
+check("a planning run's crash is not evidence either", "planner" in sigs, False)
+check("nor a failed provisioning run", "golden never came up" in sigs, False)
+check("only the phases of an attempt at an issue are counted",
+      sorted(digest.COUNTED_KINDS), ["build", "ci", "review"])
+# Stated as a property rather than a list, so a kind added later is excluded by default and
+# this assertion is what notices somebody widening it.
+check("neither loop's own run kind is counted",
+      set(digest.COUNTED_KINDS) & {"learn", "plan", "provision"}, set())
 skills = [s["skill"] for s in d["skills"]]
 check("a skill only the learning run loaded is not counted", "digest-reading" in skills, False)
 check("a skill a build loaded is", "verify-before-pr" in skills, True)

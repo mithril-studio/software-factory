@@ -158,11 +158,22 @@ written the same way. `FACTORY_MAX_REVIEW_CYCLES` already encodes the belief (tw
 because a third failure means the issue is wrong rather than the code); the `compose`
 artifact is where that diagnosis gets recorded.
 
-Skills are repo-scoped for the same reason. A skill in the repo ships inside the pull request
-and is reviewed like code, exactly as `.mem/` already is, so the blast radius of a bad one is
-one repository rather than every golden in the fleet. The shared
-[agent-skills](https://github.com/mithril-studio/agent-skills) repo stays for universal
-capability; the loop never writes to it.
+Skills the loop writes are repo-scoped for the same reason. A skill at `.claude/skills/` in
+the target repo ships inside the pull request and is reviewed like code, exactly as `.mem/`
+already is, so the blast radius of a bad one is one repository rather than every golden in the
+fleet. The shared [agent-skills](https://github.com/mithril-studio/agent-skills) repo stays
+for universal capability and the loop never writes to it — which is also why a *global* skill
+must not be vendored into a repo (`e337dea` removed exactly that: the memory skill has one
+home).
+
+**Name collisions are silent, and in the direction that surprises people.** A personal skill
+in `~/.claude/skills` overrides a project one of the same name — personal beats project, not
+the other way round — and a golden installs the shared skills personally. So a repo skill that
+reuses a global name is never loaded rather than loudly overridden: it merges, sits in the
+repo unread, and then reads as unused to the eviction query, which proposes deleting it. No
+step in that sequence looks like a mistake. The learning run is told to check
+`ls ~/.claude/skills` before proposing a name, and to read a shadowed skill as needing a
+rename rather than a delete.
 
 Off by default (`FACTORY_LEARN`). It is the one part of this system that edits its own inputs.
 
