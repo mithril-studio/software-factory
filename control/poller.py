@@ -70,10 +70,31 @@ async def _poll_repo(repo: str) -> None:
                 return
     issues = await github.list_issues_with_label(repo, github.LABEL_QUEUED)
     if not issues:
+        # Nothing queued is the only moment a learning run may start. It is not urgent — the
+        # evidence it reads is finished work and will still be there in half an hour — and
+        # taking a concurrency slot ahead of an issue somebody is waiting on would make the
+        # loop compete with the work it exists to improve.
+        await _maybe_learn(repo)
         return
     issue = issues[0]  # lowest number
     log.info("dispatching %s#%s", repo, issue["number"])
     await runner.create(repo, issue["number"])
+
+
+async def _maybe_learn(repo: str) -> None:
+    """Start a learning run if this repo has finished enough issues since its last one.
+
+    Volume rather than a clock, because evidence is what a learning run consumes: a repo that
+    has shipped nothing has produced nothing new to read, and a second pass over the same
+    window costs a VM to reach the same conclusions — or different ones, from noise.
+    """
+    if not settings.learn_enabled:
+        return
+    finished = await db.issues_since_last_learn(repo)
+    if finished < settings.learn_every:
+        return
+    log.info("%s: %s issues since the last learning run, dispatching one", repo, finished)
+    await runner.create_learn(repo)
 
 
 async def _tick() -> None:

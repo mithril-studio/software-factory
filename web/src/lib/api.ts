@@ -251,6 +251,31 @@ export type Telemetry = {
   economics: Economics[]
 }
 
+/** One thing the improvement loop changed, and what it turned out to be worth.
+ *
+ *  `status` is the whole story in one field, and `merged` deliberately is not the end of
+ *  it: a change that reached main is live, not finished, and `kept`/`reverted` are the two
+ *  answers to the question it was created to ask. `observed` is null until it is graded. */
+export type Improvement = {
+  id: string
+  repo: string
+  run_id: string
+  artifact: "skill" | "factory_md" | "mem" | "candidate" | "harness" | "compose"
+  target: string | null
+  action: "add" | "edit" | "delete" | "revert"
+  rationale: string
+  evidence: { run_ids?: string[]; signature?: string; raw?: string }
+  metric: string
+  baseline: number | null
+  issue_url: string | null
+  issue_number: number | null
+  pr_url: string | null
+  status: "proposed" | "building" | "merged" | "kept" | "reverted" | "rejected" | "abandoned"
+  observed: number | null
+  graded_at: string | null
+  created_at: string
+}
+
 export type RunTelemetry = {
   totals: {
     calls?: number

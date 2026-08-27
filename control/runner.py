@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 import yaml
 from boxd import AsyncBoxd, _mappers as _boxd_mappers
 
+from telemetry import digest
 from telemetry import store as telemetry_store
 from telemetry.recorder import Recorder
 
@@ -101,7 +102,8 @@ def provision_semaphore() -> asyncio.Semaphore:
 RUN_PREFIX = "run-"
 REVIEW_PREFIX = "rev-"
 PROVISION_PREFIX = "prov-"
-VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX)
+LEARN_PREFIX = "learn-"
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, LEARN_PREFIX)
 
 
 def is_run_vm(name: str) -> bool:
@@ -1001,6 +1003,181 @@ anything on GitHub — writing that file is the entirety of your output.
 """
 
 
+# --------------------------------------------------------------------------- learning
+
+# Where the learning run reads its evidence and writes its conclusions. Files rather than a
+# prompt, for the reason the memory candidate queue uses one: the digest is a document the
+# agent will want to grep and re-read, and a proposal is a paragraph with citations attached.
+DIGEST_ENV = "FACTORY_DIGEST"
+DIGEST_PATH = "/tmp/factory-digest.json"
+LEDGER_ENV = "FACTORY_LEDGER"
+LEDGER_PATH = "/tmp/factory-ledger.json"
+PROPOSALS_PATH = "/tmp/factory-proposals.json"
+
+# The numbers a proposal is allowed to promise to move. Closed, because "which metric" is the
+# question that decides whether the change can ever be graded, and an open string field would
+# fill up with one-off phrasings that no query can evaluate — at which point every row in the
+# ledger is permanent by default.
+LEARN_METRICS = (
+    "review_rejection_rate",
+    "ship_nothing_rate",
+    "retry_rate",
+    "cost_per_shipped_issue",
+)
+
+LEARN_PROMPT_TEMPLATE = """You are improving how agents work in one repository, by reading what \
+actually happened the last time they tried.
+
+Repository: {repo}
+You are checked out on `{base}`, read-only. You will not commit anything.
+
+Two files hold everything you are reasoning from:
+
+- `{digest_path}` — what went wrong in the last {days} days: reviews that sent work back, runs
+  that shipped nothing, failures clustered by signature, failing tool calls, what memory was
+  read, which skills were loaded, what it cost. Every cluster names the runs behind it.
+- `{ledger_path}` — what this loop has already changed in this repo, including what was
+  rejected and what was merged and later reverted.
+
+Read the ledger first, and read all of it. Proposing something that was tried and reverted is
+the characteristic way a loop like this wastes a cycle, and the ledger is the only thing that
+remembers.
+
+--- your first job: grade what is already merged ---
+
+For each `merged` row in the ledger that has no `observed` value, decide whether it worked.
+The digest is segmented so you can compare: `outcomes` carries `context_versions`, and runs
+before and after a change carry different `base_sha`. Say `kept` if the metric it named moved
+in the right direction, `reverted` if it did not.
+
+Be willing to say `reverted` about a change that sounds sensible. A rule that reads well and
+changed nothing is not harmless — it is permanent context, paid for on every run, in the
+budget that is already three quarters of what this factory spends. If the evidence is genuinely
+too thin to say, leave it ungraded and say so in `why`; do not guess `kept` to be polite.
+
+--- your second job: propose at most {max_proposals} changes ---
+
+Rank ruthlessly. You are not listing what could be improved, you are choosing the few things
+most worth a review cycle each. Fewer, better-evidenced proposals are the right answer, and
+zero is a legitimate answer when nothing in the window justifies one.
+
+**Ask this before anything else: was the issue the problem?**
+
+An agent can only be as good as what it was asked for. Read the actual issues behind the
+rejections and the fix cycles — `gh issue view <n> --repo {repo}` — before you conclude
+anything about the agent that worked on them. Look for:
+
+- an acceptance criterion that could not be verified as written, or that a reasonable reading
+  would satisfy without doing the work;
+- scope that spans two changes, so the review had to judge a diff nobody could have kept tidy;
+- a `## Task` that describes an outcome but not where it goes, leaving the builder to guess
+  and the reviewer to call the guess scope creep;
+- an issue that took two cycles. This factory allows two deliberately, because a third
+  failure means the issue is wrong rather than the code. An issue that used both is evidence
+  about how it was written.
+
+When the issue was the defect, say so with `"artifact": "compose"` and describe what the
+work order should have said. That is recorded for a human and never queued — the skill that
+writes issues is not in this repository — but it is the most valuable thing you can find,
+and here is why it is worth a proposal slot: the alternative reading of the same evidence
+produces a skill that teaches every future builder to compensate for a badly-written issue.
+That skill is context, loaded on runs that did not need it, paid for forever, and the issues
+go on being written the same way. Fixing the work order fixes every issue after it.
+
+Prefer this diagnosis when the evidence is ambiguous. The 2026-08-12 analysis of this factory
+found no lazy or careless agent behaviour at all — no force-pushes, no skipped tests, no
+`--no-verify` — and concluded that the agent's judgment was sound and everything around it
+leaked the time and money. Assume that still holds until the runs in front of you say
+otherwise.
+
+**Where a learning goes.** This is the judgment that matters most, and getting it wrong is why
+rules get written that never fire:
+
+1. **Was the work order wrong?** Then no amount of teaching the builder fixes it —
+   `"artifact": "compose"`, per the section above. Ask this first, every time.
+2. **Would ignoring it hang the run or burn money?** Then it is a harness invariant and prose
+   cannot fix it — it needs a flag, an env var, or a change to the dispatch script. File it
+   with `"artifact": "harness"`. It will be recorded and shown to a human, not built. A skill
+   cannot prevent a hang, because the agent only reads a skill if it thinks to.
+3. **Is it a fact about this repo?** Where something lives, what a module is for, a failure
+   and its resolution → a `.mem/` record (`"artifact": "mem"`).
+4. **Is it a way of working in this repo?** A procedure the agent should follow when it finds
+   itself in a particular situation → a repo skill in `.claude/skills/`
+   (`"artifact": "skill"`). Loaded on demand, so it costs nothing on the runs that do not
+   need it.
+5. **Must it be known from turn 0, on every single run?** Only then `.factory.md`
+   (`"artifact": "factory_md"`). That file is spliced into every prompt this repo ever runs,
+   so a line added there is paid for forever, whether or not it is relevant. The bar is high
+   and most things do not clear it.
+
+**The failure this repository's data is best at revealing.** Check for it explicitly. Take each
+recurring cluster in the digest and look in `.mem/` for a record that already documents it. If
+one exists and the failure kept happening, the record is not the problem — *retrieval* is. Do
+not propose writing the learning again. Look at the record's entry in `.mem/index.jsonl`: its
+`files` list is the only thing priming matches against, so a path missing from it takes the
+record out of range entirely. Propose fixing the index entry, or moving the learning to a place
+that does not depend on retrieval at all. A second copy of a record nobody found is two records
+nobody will find.
+
+**The candidate queue is already written evidence.** The digest's `candidates` section holds
+learnings earlier agents noticed but were not confident enough to commit. Nothing writes them
+into `.mem/` — accepting one records a verdict and stops there, deliberately, because the thing
+that writes it is a later agent. You are that agent. A candidate filed repeatedly by different
+runs is the repo stating something about itself more plainly than any single failure does;
+promoting one is often a better-evidenced proposal than anything you would derive yourself.
+
+**Deleting is proposing.** Compare the skills in `.claude/skills/` against the digest's
+`skills` list, which is every skill the window's runs actually loaded. A skill in the repo and
+absent from that list was not read — that is an observation, not an opinion, and a `delete`
+proposal is the correct response to it. Deletions count against your {max_proposals} the same
+as additions. They are usually the highest-value thing you can do: everything in `.factory.md`
+and every loaded skill is context, context is cache reads, and cache reads are most of what a
+run costs.
+
+--- the rules your proposals must satisfy ---
+
+**Evidence or nothing.** Every proposal cites `run_ids` from the digest. These are checked
+against the database before anything is filed, and a proposal citing a run that does not exist
+in this repo is discarded — so cite runs you actually read, and do not reconstruct an id from
+memory.
+
+**Falsifiable.** Every proposal names one `metric` from this list — {metrics} — and the
+`baseline` it stands at now, from the digest. If you cannot say what would show the change
+worked, you do not understand the problem well enough to propose a fix for it yet.
+
+**Buildable.** `body` is a complete issue for another agent who has not seen any of this. It
+must state the change, where it goes, and end with an `## Acceptance criteria` block in the
+same YAML shape this repo's other issues use, so the change is reviewed like any other. Write
+criteria that can be executed, not admired.
+
+--- output ---
+
+Write `{proposals_path}` and nothing else. No commits, no branches, no issues — the control
+plane files these. Exactly this shape, raw JSON, no fence:
+
+{{
+  "gradings": [
+    {{"id": "<ledger row id>", "verdict": "kept" | "reverted",
+      "observed": <number>, "why": "<one sentence, citing what moved>"}}
+  ],
+  "proposals": [
+    {{"artifact": "compose" | "skill" | "mem" | "factory_md" | "harness",
+      "action": "add" | "edit" | "delete" | "revert",
+      "target": "<path the change lands in>",
+      "title": "<issue title>",
+      "body": "<the full issue, ending in ## Acceptance criteria>",
+      "rationale": "<why this, in one or two sentences a human will read in six weeks>",
+      "evidence": {{"run_ids": ["..."], "signature": "<the cluster this came from>"}},
+      "metric": "<one of the metrics above>",
+      "baseline": <the number now>}}
+  ]
+}}
+
+An empty `proposals` list is a real answer and a better one than a padded list. If the window
+holds nothing worth changing, say so by writing `{{"gradings": [...], "proposals": []}}`.
+"""
+
+
 # The setup both dispatch scripts open with: get a checkout of the assigned repo, make git
 # willing to work in a directory it did not create, say who is committing, and get the remote
 # refs. It lives in one constant because both scripts need it identical — a review VM that
@@ -1162,18 +1339,22 @@ def dispatch_env(
         "BASH_DEFAULT_TIMEOUT_MS": str(settings.bash_default_timeout * 1000),
         "BASH_MAX_TIMEOUT_MS": str(settings.bash_max_timeout * 1000),
         # Correlation key: every run carries its id so traces can attach without changing
-        # the dispatch contract later.
+        # the dispatch contract later. Anything that is not a build says which kind it is —
+        # written from the argument rather than as one hard-coded `review` case, so a kind
+        # added later is labelled without anyone remembering to come back here.
         "OTEL_RESOURCE_ATTRIBUTES": (
             f"run.id={run_id},issue={repo}#{number},repo={repo},vm={vm_name}"
-            + (",kind=review" if kind == "review" else "")
+            + (f",kind={kind}" if kind != "build" else "")
         ),
     }
     if resume is not None:
         env["FACTORY_RESUME"] = "1" if resume else "0"
-    if kind != "review":
+    if kind == "build":
         # Where to propose learnings, read back before the VM is reaped. Set only on the path
         # that asks for it and reads it: an environment variable naming a file nobody collects
-        # is an invitation to write into a void, and the review prompt makes no such promise.
+        # is an invitation to write into a void, and neither the review nor the learn prompt
+        # makes that promise — a learning run proposes through its own file, which the control
+        # plane validates, and `_collect_memory_candidates` runs on the build path alone.
         env[MEMORY_CANDIDATE_ENV] = MEMORY_CANDIDATE_PATH
     if settings.github_token:
         env["GH_TOKEN"] = settings.github_token
@@ -1276,6 +1457,88 @@ command -v factory-agent >/dev/null 2>&1 || { claude -p "$FACTORY_PROMPT" \
 echo "FACTORY-MANIFEST $(tr -d '\n' < /etc/factory/agent.json 2>/dev/null)"
 exec factory-agent
 """
+
+
+# Learning runs read the base branch and change nothing on it. Same shape as the reviewer for
+# the same reason: a run with no reason to push must not be able to.
+#
+# The digest and ledger arrive as environment variables and are written to disk here. They
+# could have been spliced into the prompt, but they are documents — the agent greps them,
+# re-reads them, and cites out of them — and a document pasted into a prompt is one the agent
+# can only remember rather than consult.
+LEARN_SCRIPT = PRELUDE + r"""
+rm -f /tmp/factory-proposals.json
+echo "FACTORY: checking out $FACTORY_BASE to learn from"
+git checkout -B "$FACTORY_BASE" "origin/$FACTORY_BASE" || { echo "FACTORY: checkout failed" >&2; exit 92; }
+printf '%s' "$FACTORY_DIGEST" > /tmp/factory-digest.json || { echo "FACTORY: could not write digest" >&2; exit 93; }
+printf '%s' "$FACTORY_LEDGER" > /tmp/factory-ledger.json || { echo "FACTORY: could not write ledger" >&2; exit 93; }
+unset FACTORY_DIGEST FACTORY_LEDGER
+""" + NODE_GUARD + r"""
+echo "FACTORY: starting analyst"
+command -v factory-agent >/dev/null 2>&1 || { claude -p "$FACTORY_PROMPT" \
+  --effort "$FACTORY_AGENT_EFFORT" \
+  --disallowed-tools Agent Task ScheduleWakeup \
+  --dangerously-skip-permissions \
+  --output-format stream-json --verbose < /dev/null; exit $?; }
+echo "FACTORY-MANIFEST $(tr -d '\n' < /etc/factory/agent.json 2>/dev/null)"
+exec factory-agent
+"""
+
+
+def valid_proposals(payload: dict | None, known_runs: set[str], limit: int) -> list[dict]:
+    """The proposals in `payload` that are complete, well-formed and actually cited.
+
+    Pure and total: anything malformed is dropped rather than raised on, because this reads a
+    file an agent wrote and the failure mode to avoid is one bad entry costing the whole run's
+    output.
+
+    `known_runs` is what makes "evidence or nothing" a rule instead of a request. The prompt
+    asks for run ids; this checks them against the runs the digest was actually built from, so
+    a citation the agent reconstructed from memory — or invented — cannot enter the ledger.
+    That check is the whole reason proposals come back as a file for the control plane to file,
+    rather than as issues the agent opens itself: a fence in a prompt is a suggestion.
+
+    Trimmed to `limit` after filtering, not before, so a run that files one malformed proposal
+    does not lose a good one to the cap.
+    """
+    if not isinstance(payload, dict):
+        return []
+    out = []
+    for item in payload.get("proposals") or []:
+        if not isinstance(item, dict):
+            continue
+        artifact = str(item.get("artifact") or "")
+        action = str(item.get("action") or "")
+        metric = str(item.get("metric") or "")
+        title = str(item.get("title") or "").strip()
+        body = str(item.get("body") or "").strip()
+        rationale = str(item.get("rationale") or "").strip()
+        if artifact not in db.IMPROVEMENT_ARTIFACTS or action not in db.IMPROVEMENT_ACTIONS:
+            continue
+        if metric not in LEARN_METRICS or not title or not body or not rationale:
+            continue
+        evidence = item.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        cited = [str(r) for r in (evidence.get("run_ids") or []) if str(r) in known_runs]
+        if not cited:
+            continue
+        baseline = item.get("baseline")
+        out.append({
+            "artifact": artifact,
+            "action": action,
+            "target": str(item.get("target") or "")[:300] or None,
+            "title": title[:250],
+            "body": body,
+            "rationale": rationale[:2000],
+            "evidence": json.dumps({
+                "run_ids": cited,
+                "signature": str(evidence.get("signature") or "")[:300],
+            }),
+            "metric": metric,
+            "baseline": float(baseline) if isinstance(baseline, (int, float)) else None,
+        })
+    return out[:limit]
 
 
 def decide(verdict: dict | None, criteria: list[dict]) -> tuple[bool, str, list[str]]:
@@ -1621,6 +1884,13 @@ async def _merge(
                     raise
                 continue
             log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
+            # If this issue was the improvement loop's own proposal, it is now live. Recorded
+            # here for the reason the CI verdict is: this is the one place the factory learns a
+            # merge happened, and a transition written into one branch of one caller is one the
+            # other caller silently skips.
+            await advance_improvement(
+                repo, issue.get("number") or 0, "merged", log, pr_url=pr_url
+            )
             return MergeAttempt(True, None, why, sha, ci_log)
         # Unreachable — the second pass returns or raises — and spelled out anyway, because
         # falling out of the loop would return None into code that reads `.merged` off it.
@@ -1776,6 +2046,13 @@ async def create(
     log_path = settings.log_dir / f"{run_id}.log"
     log_path.touch()
 
+    # Which commit this work starts from, recorded now rather than derived later. Only build
+    # runs resolve it: a review judges the branch a build pushed and a CI row has no checkout
+    # at all, so both belong to the build's base by way of the attempt they share, and giving
+    # them their own would be a second answer to a question already answered. Two API calls
+    # against a run that lasts twenty minutes.
+    base_sha = await github.ref_sha(repo, await github.default_branch(repo))
+
     await db.create_run(
         id=run_id,
         repo=repo,
@@ -1786,9 +2063,18 @@ async def create(
         attempt=attempt,
         cycle=review_cycle,
         agent=agents.DEFAULT_AGENT,
+        base_sha=base_sha,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )
+
+    # A proposal the factory has started building is no longer merely proposed. Only on the
+    # first attempt of the first cycle: a retry is the same proposal still being built, and
+    # `building` → `building` is not an edge the ledger defines.
+    if attempt == 1 and review_cycle == 1:
+        await advance_improvement(
+            repo, issue_number, "building", RunLog(Path(log_path))
+        )
 
     task = asyncio.create_task(
         _guarded(
@@ -1838,6 +2124,264 @@ async def create_review(
     _tasks[run_id] = task
     task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
     return run_id
+
+
+async def create_learn(repo: str) -> str:
+    """Register and schedule a learning run for `repo`.
+
+    Carries `issue_number=0` like a provisioning run does, and for the same reason: it is work
+    about a repo rather than work on an issue. `db.UNCLAIMED_KINDS` keeps it from blocking that
+    repo's queue while it reads.
+    """
+    run_id = uuid.uuid4().hex
+    log_path = settings.log_dir / f"{run_id}.log"
+    log_path.touch()
+
+    await db.create_run(
+        id=run_id,
+        repo=repo,
+        issue_number=0,
+        issue_title=f"learning from the last {settings.learn_window_days} days",
+        status="queued",
+        kind="learn",
+        attempt=1,
+        cycle=1,
+        agent=agents.DEFAULT_AGENT,
+        log_path=str(log_path),
+        created_at=db.utcnow(),
+    )
+
+    task = asyncio.create_task(_guarded_learn(run_id, repo))
+    _tasks[run_id] = task
+    task.add_done_callback(lambda _t: _tasks.pop(run_id, None))
+    return run_id
+
+
+async def _guarded_learn(run_id: str, repo: str) -> None:
+    """Run the analyst and own its terminal state, whatever happens.
+
+    A learning run has no issue to label and nothing downstream waiting on it, so unlike a
+    build its failure is nobody else's problem — which is exactly why it must still be marked
+    terminal here. A learning run stuck in `running` is a row the reconciler will chase a VM
+    for, and a repo whose next learning run never fires because the last one never finished.
+    """
+    log = RunLog(Path(settings.log_dir / f"{run_id}.log"))
+    try:
+        async with semaphore():
+            await _execute_learn(run_id, repo, log)
+        await db.update_run(run_id, status="succeeded", finished_at=db.utcnow())
+    except asyncio.CancelledError:
+        await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
+        raise
+    except Exception as exc:  # noqa: BLE001 - the loop failing must not take the factory with it
+        log.write(f"[factory] learning run failed: {exc!r}")
+        await db.update_run(
+            run_id, status="failed", error=f"learn: {exc}", finished_at=db.utcnow()
+        )
+
+
+async def _execute_learn(run_id: str, repo: str, log: RunLog) -> None:
+    """Read the window, ask an agent what to change, and file what it proposes."""
+    base = await github.default_branch(repo)
+    window = settings.learn_window_days
+    evidence = await digest.build(repo=repo, days=window)
+    ledger = await db.list_improvements(repo=repo)
+
+    # Which runs a proposal may cite. Built here, from the same window the digest was, so the
+    # check is against what the agent was actually shown rather than against all of history.
+    known_runs = {
+        r["id"] for r in await db.list_runs(limit=2000)
+        if r.get("repo") == repo and r.get("created_at", "") >= evidence["window"]["since"]
+    }
+
+    boxd = client()
+    machine = None
+    reaped = False
+    try:
+        await db.update_run(run_id, status="forking", started_at=db.utcnow())
+        vm_name = f"{LEARN_PREFIX}{run_id[:8]}"
+        log.write(f"[factory] learning from {window} days of {repo}")
+        await headroom(boxd, log)
+        source = await source_for(boxd, repo, log)
+        await db.update_run(run_id, golden=source)
+        log.write(f"[factory] provisioning {vm_name} from {source}")
+        machine = await _provision(boxd, source, vm_name)
+        await db.update_run(run_id, vm_name=machine.name, vm_id=machine.id)
+        await boxd.machines.wait_until_ready(machine.id, timeout=180)
+        log.write(f"[factory] {machine.name} ready ({machine.id})")
+
+        await db.update_run(run_id, status="running")
+        prompt = LEARN_PROMPT_TEMPLATE.format(
+            repo=repo,
+            base=base,
+            days=window,
+            digest_path=DIGEST_PATH,
+            ledger_path=LEDGER_PATH,
+            proposals_path=PROPOSALS_PATH,
+            max_proposals=settings.learn_max_proposals,
+            metrics=", ".join(LEARN_METRICS),
+        )
+        env = dispatch_env(
+            repo=repo,
+            branch=base,
+            base=base,
+            prompt=prompt,
+            run_id=run_id,
+            number=0,
+            vm_name=machine.name,
+            kind="learn",
+        )
+        env[DIGEST_ENV] = json.dumps(evidence)
+        env[LEDGER_ENV] = json.dumps(ledger, default=str)
+
+        exit_code, _usage, manifest = await asyncio.wait_for(
+            _stream(boxd, machine.id, env, log, run_id, script=LEARN_SCRIPT),
+            timeout=settings.run_timeout,
+        )
+        log.write(f"[factory] analyst exited {exit_code}")
+        payload = await _read_json_file(boxd, machine.id, PROPOSALS_PATH, log)
+        await _salvage_transcript(boxd, machine.id, run_id, log, manifest)
+    finally:
+        if machine is not None and not reaped:
+            await reap(boxd, machine, log, failed=False)
+        await boxd.close()
+
+    await _grade(payload, ledger, log)
+    await _file_proposals(run_id, repo, payload, known_runs, log)
+
+
+async def _grade(payload: dict | None, ledger: list[dict], log: RunLog) -> None:
+    """Record the analyst's verdict on changes that already merged.
+
+    Only rows the ledger actually holds as `merged` can be graded, and only once —
+    `db.transition_improvement` enforces both. An id the agent invented, or one it graded a
+    second time, raises there and is logged rather than allowed to move anything.
+    """
+    if not isinstance(payload, dict):
+        return
+    gradeable = {r["id"] for r in ledger if r.get("status") == "merged"}
+    for item in payload.get("gradings") or []:
+        if not isinstance(item, dict):
+            continue
+        row_id = str(item.get("id") or "")
+        verdict = str(item.get("verdict") or "")
+        if row_id not in gradeable or verdict not in ("kept", "reverted"):
+            continue
+        observed = item.get("observed")
+        try:
+            await db.transition_improvement(
+                row_id, verdict,
+                observed=float(observed) if isinstance(observed, (int, float)) else None,
+            )
+            log.write(f"[factory] graded {row_id}: {verdict} — {item.get('why') or ''}")
+        except ValueError as exc:
+            log.write(f"[factory] could not grade {row_id}: {exc}")
+
+
+async def _file_proposals(
+    run_id: str, repo: str, payload: dict | None, known_runs: set[str], log: RunLog
+) -> None:
+    """Turn validated proposals into issues and ledger rows.
+
+    Two fences live here rather than in the prompt, because a fence in a prompt is a request:
+
+    - **Where.** Every issue is opened on the repo the learning run was dispatched for. The
+      agent does not choose a destination, so it cannot propose a change to somebody else's
+      repository, to the skills every repo shares, or to this control plane.
+    - **Whether it builds.** `agent:queued` is what the poller acts on, and it is added here
+      or not at all. `FACTORY_LEARN_AUTOQUEUE` off means the loop still runs, still reasons,
+      and stops one step short of changing anything.
+
+    `db.IMPROVEMENT_UNBUILDABLE` proposals never carry the label whatever that setting says.
+    A `harness` change is to this control plane and a `compose` change is to the skill that
+    writes work orders; neither lives in the repository being learned about, so queuing one
+    would point the factory at itself or at its own instructions.
+    """
+    proposals = valid_proposals(payload, known_runs, settings.learn_max_proposals)
+    if not proposals:
+        log.write("[factory] no usable proposals — nothing filed")
+        return
+
+    for index, proposal in enumerate(proposals):
+        buildable = (
+            settings.learn_autoqueue
+            and proposal["artifact"] not in db.IMPROVEMENT_UNBUILDABLE
+        )
+        labels = [github.LABEL_QUEUED] if buildable else []
+        try:
+            issue = await github.create_issue(
+                repo, proposal["title"], _proposal_body(proposal, run_id), labels
+            )
+        except Exception as exc:  # noqa: BLE001 - one failed file must not lose the others
+            log.write(f"[factory] could not file {proposal['title']!r}: {exc!r}")
+            continue
+        try:
+            await db.create_improvement(
+                id=f"imp_{run_id[:8]}_{index}",
+                repo=repo,
+                run_id=run_id,
+                artifact=proposal["artifact"],
+                target=proposal["target"],
+                action=proposal["action"],
+                rationale=proposal["rationale"],
+                evidence=proposal["evidence"],
+                metric=proposal["metric"],
+                baseline=proposal["baseline"],
+                issue_url=issue.get("html_url"),
+                issue_number=issue.get("number"),
+            )
+        except ValueError as exc:
+            log.write(f"[factory] filed #{issue.get('number')} but could not record it: {exc}")
+            continue
+        log.write(
+            f"[factory] filed #{issue.get('number')} "
+            f"({proposal['artifact']}/{proposal['action']}, "
+            f"{'queued' if buildable else 'for review'})"
+        )
+
+
+async def advance_improvement(
+    repo: str, issue_number: int, to_status: str, log: RunLog, **fields
+) -> None:
+    """Move the proposal behind this issue along, if this issue came from one.
+
+    Best-effort and silent about the ordinary case: nearly every issue the factory builds was
+    written by a human and has no ledger row, so "no proposal here" is not worth a line in the
+    log. An invalid transition is — it means the ledger and the factory disagree about what
+    has happened to something, and that is the one condition under which the grader's input
+    stops being trustworthy.
+    """
+    try:
+        row = await db.improvement_for_issue(repo, issue_number)
+        if row is None:
+            return
+        await db.transition_improvement(row["id"], to_status, **fields)
+        log.write(f"[factory] improvement {row['id']} → {to_status}")
+    except ValueError as exc:
+        log.write(f"[factory] could not advance improvement for #{issue_number}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must never fail a run
+        log.write(f"[factory] improvement bookkeeping failed: {exc!r}")
+
+
+def _proposal_body(proposal: dict, run_id: str) -> str:
+    """The issue as a builder reads it, with the reasoning kept above the work.
+
+    The provenance block is not decoration. Six weeks from now the question about any rule in
+    a repo is "who decided this and on what", and an issue that cannot answer it produces a
+    rule nobody dares delete.
+    """
+    evidence = json.loads(proposal["evidence"])
+    runs = ", ".join(f"`{r}`" for r in evidence.get("run_ids", []))
+    return (
+        f"{proposal['body']}\n\n"
+        f"---\n\n"
+        f"*Filed by a learning run ({run_id[:8]}) from telemetry, not by a human.*\n\n"
+        f"- **Why:** {proposal['rationale']}\n"
+        f"- **Evidence:** {runs}\n"
+        f"- **Expected to move:** `{proposal['metric']}` "
+        f"(currently {proposal['baseline']})\n"
+        f"- **Target:** `{proposal['target'] or 'unspecified'}`\n"
+    )
 
 
 async def _salvage_usage(run_id: str, log: RunLog) -> None:
@@ -2345,28 +2889,40 @@ async def _execute_review(
         await boxd.close()
 
 
-async def _read_verdict(boxd: AsyncBoxd, machine_id: str, log: RunLog) -> dict | None:
-    """Read the verdict file out of the VM. Any failure returns None, which `decide` treats
-    as "not approved" — a reviewer that produced nothing readable has approved nothing."""
+async def _read_json_file(
+    boxd: AsyncBoxd, machine_id: str, path: str, log: RunLog
+) -> dict | None:
+    """Read one JSON file out of the VM before it is reaped. None on any failure.
+
+    Every caller treats None as "the agent produced nothing usable", and every caller is
+    right to: a reviewer that wrote no verdict has approved nothing, and an analyst that
+    wrote no proposals has proposed nothing. Failing closed is the same answer in both cases,
+    which is why they share this.
+    """
     try:
-        result = await boxd.machines.exec(machine_id, f"cat {VERDICT_PATH}", timeout=30)
+        result = await boxd.machines.exec(machine_id, f"cat {path}", timeout=30)
         raw = getattr(result, "stdout", None) or ""
         if inspect.isawaitable(raw):  # pragma: no cover - SDK shape drift
             raw = await raw
         text = raw.strip()
         if not text:
-            log.write("[factory] reviewer wrote no verdict file")
+            log.write(f"[factory] nothing written to {path}")
             return None
         # The agent sometimes wraps JSON in a ``` fence despite being asked not to.
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\n|\n```$", "", text.strip())
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        log.write(f"[factory] verdict file is not valid JSON: {exc}")
+        log.write(f"[factory] {path} is not valid JSON: {exc}")
         return None
     except Exception as exc:  # noqa: BLE001
-        log.write(f"[factory] could not read verdict: {exc!r}")
+        log.write(f"[factory] could not read {path}: {exc!r}")
         return None
+
+
+async def _read_verdict(boxd: AsyncBoxd, machine_id: str, log: RunLog) -> dict | None:
+    """The reviewer's verdict, or None — which `decide` treats as "not approved"."""
+    return await _read_json_file(boxd, machine_id, VERDICT_PATH, log)
 
 
 async def _stream(

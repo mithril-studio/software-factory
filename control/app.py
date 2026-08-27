@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
 from . import agents, auth, db, github, goldens, poller, preflight, provision, repos, runner
@@ -204,6 +205,22 @@ async def api_telemetry():
         "economics": await telemetry.unit_economics(),
         "memory": await telemetry.memory_metrics_by_repo(),
     }
+
+
+@app.get("/api/digest")
+async def api_digest(repo: str | None = None, days: int = 14):
+    """What went wrong lately, ordered by what the improvement loop optimises.
+
+    The same evidence a learning run is handed, served to whoever asks. That is deliberate:
+    the loop must not be the only reader of its own inputs, or the first sign that it is
+    reasoning from a broken query is a proposal nobody can account for.
+
+    `days` is clamped rather than validated. A digest is a bounded document by construction
+    (`telemetry.digest` caps every section and reports what it dropped), so an absurd window
+    is a slow query, not an unsafe one — and refusing it would be the API deciding which
+    questions are worth asking.
+    """
+    return await telemetry_digest.build(repo=repo, days=max(1, min(days, 365)))
 
 
 class StartRun(BaseModel):
@@ -561,11 +578,15 @@ async def api_projects():
 # workflow — conflating the two would make the accept button a commit to someone else's repo.
 
 
-def _candidate_out(row: dict) -> dict:
-    """A candidate as the UI reads it, with its evidence decoded back into an object.
+def _with_evidence(row: dict) -> dict:
+    """Any row carrying an `evidence` column, with that column decoded back into an object.
 
     Stored as a JSON string because SQLite has no object column; handing that string to a
     caller would make every consumer parse it again and one of them would forget.
+
+    Named for the column rather than the table because two tables have one — a memory
+    candidate and an improvement are both "a claim with the runs that back it", and the
+    decoding is the same job in both cases.
     """
     out = dict(row)
     try:
@@ -581,7 +602,7 @@ def _candidate_out(row: dict) -> dict:
 @app.get("/api/memory/candidates")
 async def api_memory_candidates(repo: str | None = None, status: str | None = None):
     """Pending learnings, oldest first, optionally scoped to one repo and/or one status."""
-    return [_candidate_out(row) for row in await db.list_candidates(repo=repo, status=status)]
+    return [_with_evidence(row) for row in await db.list_candidates(repo=repo, status=status)]
 
 
 @app.get("/api/memory/candidates/{candidate_id}")
@@ -589,7 +610,7 @@ async def api_memory_candidate(candidate_id: str):
     row = await db.get_candidate(candidate_id)
     if row is None:
         raise HTTPException(404, f"no such memory candidate: {candidate_id}")
-    return _candidate_out(row)
+    return _with_evidence(row)
 
 
 @app.post("/api/memory/candidates/{candidate_id}/{decision}")
@@ -608,7 +629,29 @@ async def api_memory_candidate_decision(candidate_id: str, decision: str):
         row = await db.transition_candidate(candidate_id, f"{decision}ed")
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return _candidate_out(row)
+    return _with_evidence(row)
+
+
+# --------------------------------------------------------------------------- improvements
+
+# What the loop changed and why, served so that its reasoning is auditable without reading a
+# database by hand. Read-only on purpose: a proposal's status is moved by the factory as work
+# actually happens to it, so an endpoint that let a status be set would be a way to mark
+# something `merged` that never merged, and the ledger's only value is that it is true.
+
+
+@app.get("/api/improvements")
+async def api_improvements(repo: str | None = None, status: str | None = None):
+    """The improvement ledger, newest first, optionally scoped."""
+    return [_with_evidence(row) for row in await db.list_improvements(repo=repo, status=status)]
+
+
+@app.get("/api/improvements/{improvement_id}")
+async def api_improvement(improvement_id: str):
+    row = await db.get_improvement(improvement_id)
+    if row is None:
+        raise HTTPException(404, f"no such improvement: {improvement_id}")
+    return _with_evidence(row)
 
 
 # --------------------------------------------------------------------------- goldens / fleet

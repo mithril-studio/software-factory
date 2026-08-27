@@ -29,6 +29,16 @@ HINT_KEYS = ("command", "file_path", "pattern", "skill", "url", "query", "descri
 HINT_MAX = 200
 ERROR_MAX = 500
 
+# What the runtime calls the tool that loads a skill, and — because `skill` is a `HINT_KEYS`
+# entry and none of the keys ahead of it appear in that tool's input — the guarantee that a
+# skill load already lands in `tool_calls` as (tool=SKILL_TOOL, detail=<skill name>).
+#
+# It lives here rather than beside the query that reads it because this module is the only
+# place allowed to know a runtime's names for things (`docs/architecture.md` §3.2). No table
+# names a runtime; a query that needed the string imports it from the adapter instead, so
+# when a second runtime calls this something else there is one line to change.
+SKILL_TOOL = "Skill"
+
 
 @dataclass(frozen=True)
 class LlmCall:

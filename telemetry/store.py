@@ -20,7 +20,7 @@ from typing import Any
 import aiosqlite
 
 from . import config
-from .normalize import LlmCall, ToolCall
+from .normalize import SKILL_TOOL, LlmCall, ToolCall
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_calls (
@@ -482,6 +482,46 @@ async def tool_leaderboard(limit: int = 15) -> list[dict]:
         GROUP BY tool ORDER BY duration_ms DESC LIMIT ?
         """,
         (limit,),
+    )
+
+
+async def skill_loads_by_repo(since: str | None = None) -> list[dict]:
+    """Which skills each repo's runs actually loaded, and how recently.
+
+    There is no skills receipt and there does not need to be one. A skill load is a tool
+    call, and tool calls are already a row each — so the question "was this skill ever
+    used?" was answerable from the day the trace layer shipped, by anything that thought to
+    ask. `SKILL_TOOL` and the `skill` entry in `HINT_KEYS` are what make the join safe.
+
+    This is the eviction signal, and it is the half of a self-improving loop that is easy to
+    leave out. A loop that only adds context grows the thing that is already 73.5% of spend,
+    so deletion has to be as evidence-backed as addition: a skill that exists in a repo and
+    appears in no row here across a window has not been judged unhelpful, it has been
+    observed unused, which is a fact rather than an opinion and can be acted on without one.
+
+    Counts loads, not runs that benefited — a loaded skill that made things worse looks
+    exactly like one that helped. Pair it with outcomes before concluding anything warmer
+    than "this was read".
+    """
+    where = "WHERE tc.tool = ? AND tc.detail IS NOT NULL AND tc.detail != ''"
+    params: list[Any] = [SKILL_TOOL]
+    if since:
+        where += " AND tc.ts >= ?"
+        params.append(since)
+    return await _rows(
+        f"""
+        SELECT r.repo,
+               tc.detail                  AS skill,
+               COUNT(*)                   AS loads,
+               COUNT(DISTINCT tc.run_id)  AS runs,
+               MAX(tc.ts)                 AS last_loaded
+        FROM tool_calls tc
+        JOIN runs r ON r.id = tc.run_id
+        {where}
+        GROUP BY r.repo, tc.detail
+        ORDER BY r.repo, loads DESC
+        """,
+        tuple(params),
     )
 
 
