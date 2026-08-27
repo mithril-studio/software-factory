@@ -204,22 +204,32 @@ def parse_plan_verdict(raw: dict | None) -> tuple[bool, list[int], str]:
 
 
 def plan_outcome(
-    goal_met: bool, queued_now: bool, stalls: int, max_stalls: int
+    goal_met: bool, queued_now: bool, stalls: int, max_stalls: int, filed: bool = False
 ) -> tuple[str, int]:
     """Where a finished plan run leaves the repo's goal: (next state, next stall count).
 
     `queued_now` is what GitHub showed after the run, not what the verdict claimed, and it
-    outranks the verdict in both directions. Issues queued means the loop continues whatever
-    the planner said about the goal — a "goal met" beside freshly filed work is a
-    contradiction that must fail toward building, never toward premature completion. No
-    issues and no goal-met is a fruitless pass: the stall count rises, and at the cap the
-    goal parks as `stalled` for a human instead of burning a VM every cooldown forever.
+    outranks the verdict on the question of completion: a "goal met" beside queued work is a
+    contradiction that must fail toward building, never toward premature completion.
+
+    `filed` is the narrower question — did *this* planner's own issues end up queued — and it
+    is what the stall count answers to. The two were one argument until the improvement loop
+    started filing `agent:queued` issues of its own. With both loops on, any proposal sitting
+    in the queue made every plan run look productive, so the stall counter reset forever and
+    `FACTORY_PLAN_MAX_STALLS` could never fire: a planner that filed nothing, every cooldown,
+    burning a VM each time, with the fence that exists to stop exactly that held open by
+    another loop's output. A planner is productive when its own work is queued; someone
+    else's queued issue means there is work to do, not that this run did any.
     """
-    if queued_now:
+    if filed:
         return repos.GOAL_ACTIVE, 0
+    stalls += 1
+    if queued_now:
+        # Work exists, so the goal is not met and the repo keeps going — but this pass
+        # contributed nothing to it and is counted as the fruitless pass it was.
+        return (repos.GOAL_STALLED if stalls >= max_stalls else repos.GOAL_ACTIVE), stalls
     if goal_met:
         return repos.GOAL_MET, 0
-    stalls += 1
     return (repos.GOAL_STALLED if stalls >= max_stalls else repos.GOAL_ACTIVE), stalls
 
 
@@ -277,21 +287,28 @@ async def create(repo: str) -> str:
     return run_id
 
 
+def _stall_note(state: str, stalls: int, reason: str) -> str:
+    """How a fruitless pass reads in the run log. One wording, both callers."""
+    if state == repos.GOAL_STALLED:
+        return (
+            f"[factory] goal stalled after {stalls} fruitless plans ({reason}); "
+            "a human re-activates it from the Projects page"
+        )
+    return f"[factory] fruitless plan {stalls}/{settings.plan_max_stalls} ({reason})"
+
+
 async def _record_stall(repo: str, run_log: runner.RunLog, reason: str) -> None:
-    """Count a fruitless or crashed plan against the repo, parking it at the cap."""
+    """Count a crashed plan against the repo, parking it at the cap.
+
+    The crash path only. A run that died produced nothing by definition — no issues filed, no
+    verdict read — so `filed` and `queued_now` are both false here as facts rather than as
+    defaults. `_execute` decides its own outcome from what it actually observed.
+    """
     row = repos.row(repo) or {}
     stalls = int(row.get("plan_stalls") or 0)
     state, next_stalls = plan_outcome(False, False, stalls, settings.plan_max_stalls)
     await repos.record_plan_outcome(repo, state, next_stalls)
-    if state == repos.GOAL_STALLED:
-        run_log.write(
-            f"[factory] goal stalled after {next_stalls} fruitless plans ({reason}); "
-            "a human re-activates it from the Projects page"
-        )
-    else:
-        run_log.write(
-            f"[factory] fruitless plan {next_stalls}/{settings.plan_max_stalls} ({reason})"
-        )
+    run_log.write(_stall_note(state, next_stalls, reason))
 
 
 async def _guarded(run_id: str, repo: str, goal: str) -> None:
@@ -385,30 +402,41 @@ async def _execute(run_id: str, repo: str, goal: str, run_log: runner.RunLog) ->
         # What is true is what GitHub shows, not what the verdict says. A claimed issue that
         # never appears with the label is a plan that did not happen; a queued issue outranks
         # a "goal met". The check costs one list call the poller was about to make anyway.
-        queued_now = bool(await github.list_issues_with_label(repo, github.LABEL_QUEUED))
+        #
+        # Two facts out of it, not one. `queued_now` is "there is work", which decides whether
+        # the goal may be called met. `filed` is "this planner made some of it", which is what
+        # the stall count answers to — the improvement loop also files `agent:queued` issues,
+        # and counting those as this run's output holds the runaway fence open forever.
+        queued = {i["number"] for i in await github.list_issues_with_label(repo, github.LABEL_QUEUED)}
+        queued_now = bool(queued)
+        filed = bool(queued & set(claimed))
         if claimed:
             run_log.write(
                 f"[factory] planner filed {', '.join(f'#{n}' for n in claimed)}"
-                + ("" if queued_now else " — but none of them are queued")
+                + ("" if filed else " — but none of them are queued")
             )
         if summary:
             run_log.write(f"[factory] planner: {summary}")
 
-        if queued_now or goal_met:
-            row = repos.row(repo) or {}
-            state, stalls = plan_outcome(
-                goal_met, queued_now, int(row.get("plan_stalls") or 0),
-                settings.plan_max_stalls,
-            )
-            await repos.record_plan_outcome(repo, state, stalls)
-            if state == repos.GOAL_MET:
-                run_log.write("[factory] goal met; this repo is done until its goal changes")
-            else:
-                run_log.write("[factory] issues queued; the poller dispatches the lowest next tick")
+        # One decision, taken once. This used to branch first and then compute the outcome in
+        # two places — the productive branch here and `_record_stall` in the other — which is
+        # how the fruitless path came to pass a hardcoded `queued_now=False` that no longer
+        # matched what had just been observed.
+        row = repos.row(repo) or {}
+        state, stalls = plan_outcome(
+            goal_met, queued_now, int(row.get("plan_stalls") or 0),
+            settings.plan_max_stalls, filed=filed,
+        )
+        await repos.record_plan_outcome(repo, state, stalls)
+
+        if filed:
+            run_log.write("[factory] issues queued; the poller dispatches the lowest next tick")
+        elif state == repos.GOAL_MET:
+            run_log.write("[factory] goal met; this repo is done until its goal changes")
         else:
             reason = summary or "no issues filed and the goal not declared met"
             await db.update_run(run_id, error=f"{PLAN_FRUITLESS}{reason[:300]}")
-            await _record_stall(repo, run_log, reason[:120])
+            run_log.write(_stall_note(state, stalls, reason[:120]))
     finally:
         if not reaped:
             await runner.reap(boxd, machine, run_log, keep=settings.keep_failed)

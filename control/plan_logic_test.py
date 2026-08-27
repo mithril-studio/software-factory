@@ -87,10 +87,10 @@ check("summary carried through",
 
 # ---------- plan_outcome: GitHub outranks the verdict, both directions
 
-check("issues queued -> keep building, stalls reset",
-      plan_outcome(False, True, 1, 2), ("active", 0))
-check("goal met beside queued issues is a contradiction -> keep building",
-      plan_outcome(True, True, 0, 2), ("active", 0))
+check("this planner's issues are queued -> keep building, stalls reset",
+      plan_outcome(False, True, 1, 2, filed=True), ("active", 0))
+check("goal met beside its own queued issues is a contradiction -> keep building",
+      plan_outcome(True, True, 0, 2, filed=True), ("active", 0))
 check("goal met, queue empty -> met, stalls reset",
       plan_outcome(True, False, 1, 2), ("met", 0))
 check("fruitless below the cap -> active, counted",
@@ -99,6 +99,24 @@ check("fruitless at the cap -> stalled, exactly then",
       plan_outcome(False, False, 1, 2), ("stalled", 2))
 check("a cap of one stalls on the first fruitless pass",
       plan_outcome(False, False, 0, 1), ("stalled", 1))
+
+# ---------- the fence another loop could hold open
+#
+# `queued_now` and `filed` were one argument until the improvement loop began filing
+# `agent:queued` issues of its own. With both loops on, any proposal sitting in the queue made
+# every plan run look productive: stalls reset forever, FACTORY_PLAN_MAX_STALLS could never
+# fire, and a planner that filed nothing would burn a VM every cooldown indefinitely — with
+# the fence built to stop exactly that held open by something else's output.
+
+check("someone else's queued issue does not count as this planner's work",
+      plan_outcome(False, True, 0, 2, filed=False), ("active", 1))
+check("and cannot hold the stall counter open at the cap",
+      plan_outcome(False, True, 1, 2, filed=False), ("stalled", 2))
+# The half that must still hold: queued work outranks a "goal met" whoever filed it, because
+# declaring a project finished beside work waiting to be built is the one wrong answer that
+# cannot be walked back by another pass.
+check("a goal is not met while any work is queued, even work this run did not file",
+      plan_outcome(True, True, 0, 2, filed=False)[0], "active")
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

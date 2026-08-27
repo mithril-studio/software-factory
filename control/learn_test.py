@@ -218,6 +218,18 @@ run(seed([dict(id="b9", repo=REPO, issue_number=9, status="succeeded", kind="bui
 check("and counts only what happened after it", run(db.issues_since_last_learn(REPO)), 1)
 
 # Off by default: this is the one part of the system that edits its own inputs.
+# What a proposal may cite, as a query rather than a filter over the capped, fleet-wide
+# `list_runs`. Past that cap this repo's older in-window runs fell off the end, so valid
+# citations would start being rejected as invented — silently, and more often the busier the
+# factory got, which is the worst possible direction for a check on evidence.
+cited = run(db.run_ids_since(REPO, "2000-01-01T00:00:00+00:00"))
+check("every one of the repo's runs is citable", {"b1", "b2", "b3"} <= cited, True)
+check("another repo's runs are not", "other" in cited, False)
+check("nor anything before the window starts",
+      run(db.run_ids_since(REPO, LATER_STILL)), {"b9"})
+check("and a window past everything cites nothing at all",
+      run(db.run_ids_since(REPO, "2099-06-01T00:00:00+00:00")), set())
+
 check("the loop ships switched off", settings.learn_enabled, False)
 check("and does not queue what it files until told to", settings.learn_autoqueue, False)
 poll_src = inspect.getsource(poller._maybe_learn)
@@ -270,8 +282,17 @@ run(runner.advance_improvement(REPO, 42, "building", LOG))
 check("an impossible transition is logged, not raised",
       run(db.get_improvement("imp_live"))["status"], "merged")
 
-# A retry is the same proposal still being built, and `building → building` is not an edge.
 create_src = inspect.getsource(runner.create)
+
+# Advancing at dispatch must not open a file. `create` runs for every build the factory
+# dispatches, and it opened a `RunLog` there purely to report a transition that almost never
+# happens — one descriptor leaked per build, on the hottest path in the system.
+check("dispatch does not open a run log to say nothing",
+      "RunLog(" in create_src, False)
+check("advance_improvement works without one",
+      inspect.signature(runner.advance_improvement).parameters["log"].default, None)
+
+# A retry is the same proposal still being built, and `building → building` is not an edge.
 check("only a first attempt advances a proposal",
       "attempt == 1 and review_cycle == 1" in create_src, True)
 # Recorded where the factory learns a merge happened, so both callers of `_merge` get it.
