@@ -378,6 +378,9 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `FACTORY_HALT_ON_FAILURE` | Halt a repo's queue on an open `agent:failed`/`agent:blocked` issue. On by default. |
 | `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
 | `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
+| `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |
+| `FACTORY_LEARN_EVERY` | Issues a repo must finish before its next learning run (5). |
+| `FACTORY_LEARN_AUTOQUEUE` | Label what the loop files `agent:queued`, so the factory builds it. Off by default. |
 | `FACTORY_LOG_LEVEL` | Control-plane log verbosity. |
 
 ## API surface
@@ -392,6 +395,10 @@ exhaustive list is `control/app.py`.
   `GET .../stream` (SSE), `GET .../telemetry`.
 - **Work** — `GET /api/attempts` (build → CI → review grouped per attempt),
   `GET /api/issues`, `GET /api/config`, `GET /api/telemetry`
+- **The improvement loop** — `GET /api/digest?repo=&days=` is what went wrong lately, the
+  same evidence a learning run is handed. `GET /api/improvements` and
+  `GET /api/improvements/{id}` are the ledger of what the loop changed and why — read-only,
+  because a status is moved by the factory as work actually happens to it.
 - **Repos & goldens** — `POST`/`DELETE /api/repos`, `GET /api/github/repos`,
   `GET /api/preflight?repo=`, `POST`/`DELETE /api/repos/{owner}/{name}/golden`,
   `POST /api/goldens/refresh`, `GET /api/goldens`, `GET /api/machines`,
