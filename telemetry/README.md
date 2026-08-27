@@ -8,7 +8,7 @@ without parsing a transcript after the fact.
 this layer is to see what the agent is doing, in your own database, regardless of which
 model or agent runtime produced the work.
 
-> Contract with the rest of the system: `../README.md` §3.
+> Contract with the rest of the system: `../docs/architecture.md` §3.
 
 ---
 
@@ -29,12 +29,12 @@ and spend on runs that shipped nothing.
 ## §2 Architecture
 
 ```
-                       ┌── recorder.py ──┐
-agent VM ──stream──► control._stream ────┼──► adapter.feed() ──► SQLite
-                                         │         ▲
-transcript on disk ──► backfill.py ──────┘         │
-                                                   │
-             (later) agent VM ──OTLP/HTTP──► ingest┘
+                              ┌── recorder.py ──┐
+agent VM ──stream──► control.runner._stream ────┼──► adapter.feed() ──► SQLite
+                                                │         ▲
+transcript on disk ──► backfill.py ─────────────┘         │
+                                                          │
+             (later) agent VM ──OTLP/HTTP──► ingest ──────┘
 ```
 
 **Producers.** Two today, both feeding the same normalizer. `recorder.py` rides the event
@@ -43,7 +43,7 @@ stream the control plane already parses, in process, with the `run_id` in hand.
 producer, not a second implementation.
 
 > **Why not OTLP first, as this spec originally said.** The facts telemetry wants — every
-> model call and every tool call — already stream through `control._stream()`, structured,
+> model call and every tool call — already stream through `control.runner._stream()`, structured,
 > with the correlation key attached. Routing them out of the VM over OTLP to get them back
 > would add an HTTP server, protobuf, ingest auth, a second network path out of an
 > ephemeral machine, and the flush-timing data loss in §5.1 — to deliver the same rows. So
@@ -72,21 +72,23 @@ stream and a replayed transcript, and what makes `normalize_test.py` possible.
 Which adapter a run uses comes from the `events` string in the golden's manifest
 (`control/README.md` §2.3), handed to `Recorder(run_id, events)` or to `recorder.use()`
 when the manifest arrives — before the first event, since an adapter is stateful over the
-stream it reads.
+stream it reads. A missing manifest or an absent `events` key defaults to `claude-code`;
+`backfill.py` does not consult the manifest at all — it replays every transcript through
+`ClaudeCodeAdapter`, and a replay is authoritative (`clear_run` first, then rewrite).
 
 `summary()` lives on the adapter for the same reason `feed()` does: Claude Code reports a
 run's own token and cost figures on a final event it calls `result`, and that sentence is
 one runtime's vocabulary. The control plane asks every event and keeps whatever comes
 back, so it never has to know the word.
 
-**An agent with no adapter still runs.** An `events` string this layer does not recognise
-selects `NullAdapter`, whose every answer is empty: no rows, no figures, no exception.
+**An agent with no adapter still runs.** A non-empty `events` string this layer does not
+recognise selects `NullAdapter`, whose every answer is empty: no rows, no figures, no exception.
 Telemetry is a consumer of a run and never a precondition for one, so the first run of a
 new agent records nothing and works — and reports no cost rather than a wrong one, with
 `runner._salvage_usage` filling the ledger from rows wherever there are any. Writing the
 adapter comes after, against events recorded from that real run rather than invented.
 
-**Storage** is SQLite alongside `control`'s, same reasoning as `control/db.py`: plain SQL,
+**Storage** is `control`'s own SQLite file, same reasoning as `control/db.py`: plain SQL,
 so Postgres is a driver swap rather than a rewrite. Revisit when event volume reaches
 millions of rows; partition by day before reaching for ClickHouse.
 
@@ -99,13 +101,15 @@ import is the producer knowing its sink, and it disappears when OTLP arrives.
 
 | Table | Owner | Contents |
 |---|---|---|
-| `runs` | `exec` | Run lifecycle. This layer reads it, never writes it. |
+| `runs` | `control` | Run lifecycle. This layer reads it, never writes it. |
 | `llm_calls` | `telemetry` | `run_id`, `turn`, model, in/out/cache-read/cache-write tokens, ts, `parent_call_id` |
-| `tool_calls` | `telemetry` | `run_id`, `turn`, tool, ok, duration, error, detail, ts, `parent_call_id` |
+| `tool_calls` | `telemetry` | `run_id`, `turn`, tool, ok, `duration_ms`, error, detail, ts, `parent_call_id` |
 | `model_prices` | `telemetry` | Per-million rates for every token class, per model, with `valid_from` |
+| `memory_reads` | `telemetry` | One row per memory record a run opened while priming (§3.3) |
+| `memory_receipts` | `telemetry` | One row per run: what its `FACTORY_MEMORY` receipt reported (§3.3) |
 
-`exec` and `telemetry` never call each other. They share the database and the `run.id`
-resource attribute, and that is the entire coupling.
+The coupling with `control` is the one-way import described in §2 plus the shared database
+and `run.id`.
 
 ### §3.1 The correlation hierarchy
 
@@ -125,7 +129,7 @@ Without it a failure reads *"run 6f2eb679 failed, exit 1, $14"*. With it: *"issu
 attempt 2, turn 41, Bash, no result — the run died inside a command."*
 
 **`parent_call_id` is empty today, by design.** Nested agents are disabled in the runner
-(`--disallowed-tools Agent Task`), so nothing populates it. The column exists now because
+(`--disallowed-tools Agent Task ScheduleWakeup`), so nothing populates it. The column exists now because
 the field is native to the event envelope (`parent_tool_use_id`), so re-enabling subagents
 needs no migration — but whether their events reach the parent stream at all is unverified,
 and closing that blind spot properly is what OTLP is for.
@@ -137,6 +141,21 @@ priced differently — 1.25x input against 2x. The agent runtime requests 1-hour
 collapsing them would understate the second-largest component of a run's bill by ~40%. A
 payload that reports only a combined figure is attributed to the cheaper tier: an unknown
 split may never inflate a derived cost.
+
+### §3.3 Memory telemetry
+
+Whether memory retrieval is happening is a claim worth checking against rows, not receipts
+taken on faith — so the control plane parses the run's `FACTORY_MEMORY` line
+(`../docs/architecture.md` §3.3) and writes it through this layer: one `memory_reads` row per
+record the run opened, one `memory_receipts` row per run saying what it indexed and which
+domains it drew from. `usage_for_run` returns both under `memory` / `memory_receipt`, and
+`memory_metrics_by_repo` is the fifth key of `GET /api/telemetry`. `clear_run` clears these
+tables too, so a backfill stays idempotent.
+
+Two properties of the producer worth knowing: the `Recorder` never raises — every failure
+increments a `dropped` counter surfaced in the run log — and `Recorder.totals()` is what
+`runner._salvage_usage` reads to fill a dead run's ledger entry from the rows already
+written.
 
 ## §4 Tokens are the unit, not dollars
 
@@ -163,12 +182,12 @@ All are consequences of fork → run → destroy, and all silently lose data if 
 
 **§5.1 Flush timing.** OTel's default log export interval is 5s, metrics 60s. If the VM is
 destroyed the instant the agent exits, the tail of every run is lost — traces that stop just
-before the interesting part. Mitigation is on the `exec` side: set
-`OTEL_LOGS_EXPORT_INTERVAL=1000` and drain briefly before `box.destroy()`. *(Deferred with
-the ingest: the in-process recorder has no export interval to lose the tail to.)*
+before the interesting part. The mitigation — a short export interval and a drain before the
+VM is deleted — is deferred with the ingest: the in-process recorder has no export interval
+to lose the tail to. The runner still drains the stream briefly before reaping.
 
 **§5.2 The transcript is the backstop.** The live stream will have holes. The agent runtime
-writes a complete session JSONL to the VM's disk; `exec` salvages it before reaping, and
+writes a complete session JSONL to the VM's disk; `control` salvages it before reaping, and
 stores it as the durable artifact for the run. The stream is for watching; the transcript is
 for replaying — `backfill.py` reads exactly that file through the same normalizer.
 
@@ -187,32 +206,25 @@ one saves the agent's work; this one saves the record of what happened.
 
 ## §6 Producer configuration
 
-`exec` sets these when dispatching an agent. Recorded here because this layer defines the
-contract; see `../README.md` §3.1.
+The producer contract is one variable, set by `runner.dispatch_env`:
 
 ```bash
-CLAUDE_CODE_ENABLE_TELEMETRY=1
-OTEL_LOGS_EXPORTER=otlp
-OTEL_METRICS_EXPORTER=otlp
-OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-OTEL_EXPORTER_OTLP_ENDPOINT=https://<control-plane-host>/otel
-OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <ingest-token>
-OTEL_LOGS_EXPORT_INTERVAL=1000
-OTEL_RESOURCE_ATTRIBUTES=run.id=<uuid>,issue=<owner/repo#N>,repo=<owner/repo>,vm=<box-name>
+OTEL_RESOURCE_ATTRIBUTES=run.id=<id>,issue=<owner/repo#N>,repo=<owner/repo>,vm=<box-name>
 ```
 
-The first line is runtime-specific and belongs to the producer, not to this layer. Every
-other line is standard OTel.
+Review runs append `,kind=review`. See `../docs/architecture.md` §3.1. The OTLP exporter
+block (endpoint, protocol, ingest token, export interval) arrives with the ingest and not
+before — nothing sets it today.
 
 ## §7 V0 scope — shipped
 
 | | File |
 |---|---|
 | `ClaudeCodeAdapter` — pure, testable, both producers | `normalize.py` |
-| `llm_calls`, `tool_calls`, `model_prices` + seed prices, and every read query | `store.py` |
+| All six tables (§3) + seed prices, and every read query | `store.py` |
 | Live recorder, flushed per turn | `recorder.py` |
 | Transcript replay, idempotent | `backfill.py` |
-| Cases against real captured events | `normalize_test.py` |
+| Cases against real captured events, the store, the recorder | `normalize_test.py`, `store_test.py`, `recorder_test.py` |
 | `GET /api/runs/{id}/telemetry`, `GET /api/telemetry` | `control/app.py` |
 | Telemetry page and per-run trace panel | `web/src/pages/` |
 
@@ -235,9 +247,9 @@ any second adapter, subagent visibility (§3.1).
       Correcting `model_prices` was the other half: these runs were Sonnet 5 billed at the
       standard $3/$15, not the published introductory $2/$10 — which is precisely the
       cross-check §4 keeps `cost_usd` for.
-- [ ] **Deploy, then run `python -m telemetry.backfill` on the control-plane VM.** The
-      analysis above was done by replaying its transcripts locally; its own database has no
-      telemetry tables yet.
+- [ ] **Run `.venv/bin/python -m telemetry.backfill` on the control-plane VM** to replay its
+      salvaged transcripts into rows. (The tables themselves exist — `store.init()` runs on
+      every boot.) A single run replays with `... -m telemetry.backfill <run_id>`.
 - [ ] Reconcile resumed sessions. One run (`937b51a7`) reports $24.40 against $1.86 derived
       while its token counts match exactly — the runtime's `total_cost_usd` looks cumulative
       across a resumed session, where the rows are per-run. 10 of 47 runs have no salvaged

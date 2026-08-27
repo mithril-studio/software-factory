@@ -1,32 +1,8 @@
-# Software Factory
+# Operations
 
-GitHub issues in, pull requests out.
-
-A control plane watches a repo for work, forks an isolated [boxd](https://boxd.sh) VM per
-task, runs a coding agent inside it, and reaps the VM when it's done. You watch it happen
-live in a web UI and can start runs yourself.
-
-The control plane is deterministic and contains no LLM. All intelligence lives in the agent,
-inside the VM.
-
-> **Status:** V0, in progress. Second attempt — the first failed on scope, see
-> `../learnings.md`. The governing constraint of this build is *smallness*.
-
----
-
-## Layout
-
-One repo, one deployable, one Postgres later. Each layer gets a folder so it can be split
-out once it has earned its own release cycle — not before.
-
-| Folder | Layer | State |
-|---|---|---|
-| `control/` | Control plane: watch issues, fork VMs, dispatch agents, reap, and the UI | **working** |
-| `telemetry/` | Trace layer: one row per model call and tool call, priced and joined to outcomes | **working** |
-| `docs/` | Architecture and the contracts between layers | — |
-
-The folder is `control/` rather than `exec/` because `exec` is a Python keyword and cannot
-be an importable package name.
+How to run the Software Factory: deploy it, build goldens, connect repos, configure it.
+What it is and how it is designed live in the [README](../README.md) and
+[architecture.md](architecture.md).
 
 Skills the agent uses live in a separate repo,
 [mithril-studio/agent-skills](https://github.com/mithril-studio/agent-skills). They ship
@@ -43,13 +19,15 @@ agent-skills, because two would drift.
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python -e .
-cp .env.example .env               # fill in BOXD_API_KEY and FACTORY_REPOS
+cp .env.example .env   # set BOXD_API_KEY and FACTORY_AUTH_EMAIL/PASSWORD;
+                       # leave FACTORY_REPOS empty — connect repos in the UI
 npm --prefix web install && npm --prefix web run build   # build the UI once
 .venv/bin/uvicorn control.app:app --port 8765 --reload
 ```
 
-Then open <http://localhost:8765>. `GITHUB_TOKEN` is optional locally — it falls back to
-`gh auth token`.
+Then open <http://localhost:8765> and log in with the credentials you set — auth ships with
+no defaults, so an unset `FACTORY_AUTH_EMAIL`/`FACTORY_AUTH_PASSWORD` means nobody can log
+in. `GITHUB_TOKEN` is optional locally — it falls back to `gh auth token`.
 
 For UI work, run the Vite dev server alongside uvicorn so the SPA hot-reloads (it proxies
 `/api` back to :8765):
@@ -63,7 +41,7 @@ npm --prefix web run dev        # then open the URL Vite prints (:5173)
 The control plane lives on a **Hetzner** VM — a plain checkout under `~/software-factory`
 running uvicorn under systemd, not a container, behind Caddy for TLS. It moved off boxd on
 2026-08-19, after that VM's root filesystem corrupted and took the run history with it: the
-thing the factory forks VMs *from* should not also be the thing that remembers what it did.
+thing the factory boots VMs *from* should not also be the thing that remembers what it did.
 
 boxd is still where every run VM comes from. The Hetzner box reaches it purely over the API,
 so it needs `BOXD_API_KEY` and nothing else — but it does not inherit the two things boxd
@@ -95,18 +73,49 @@ that layer existed:
 .venv/bin/python -m telemetry.backfill      # replays every salvaged transcript
 ```
 
+The box built itself from `scripts/provision-hetzner.sh` and can again — it writes the
+systemd unit, the Caddyfile, and enables unattended upgrades, because rebuilding is fast and
+recovering is impossible. An external monitor, `scripts/factory-health.sh`, runs from a
+GitHub Actions cron every 10 minutes and opens (and closes) an alert issue when `/healthz`
+stops answering.
+
 ## What a run does
 
 1. Fetch the issue from GitHub
-2. Restore a VM from the golden snapshot (~0.2s), with idle-suspend disabled and a self-destruct timer set
-3. Clone the assigned repo (or reuse a checkout the golden already has), then `git fetch` and
-   check out `factory/issue-<n>` from the default branch
-4. Run `claude -p` with the issue as the prompt, streaming its event log back live
-5. Look for the PR the agent opened; salvage the session transcript
+2. Restore a VM from the golden snapshot (~0.2s), with idle-suspend disabled and a
+   self-destruct timer set
+3. Clone the assigned repo (or reuse the warm golden's checkout), then check out
+   `factory/issue-<n>` from the default branch — a retry or fix cycle **resumes** that
+   branch rather than resetting it
+4. Run the agent — `factory-agent`, the launch line the golden carries
+   (`../control/README.md` §2.3; `claude -p` is the legacy fallback) — with the issue as the
+   prompt, streaming its event log back live
+5. Find the PR the agent opened; salvage the session transcript; harvest memory candidates
 6. Destroy the VM
+7. When the issue carries acceptance criteria: dispatch a **review run** on a fresh VM and
+   record its verdict, record what **CI** decided, and — with auto-merge on — squash-merge
+   pinned to the tested sha, repairing a conflict once by merging base into the branch. A
+   rejecting review or red CI starts a fix cycle back at step 2.
 
 Every step is a status transition on a row in `runs`, which is what makes the reconciler
-possible: fleet state lives in a table, not in an agent's context window.
+possible: fleet state lives in a table, not in an agent's context window. The state machine
+— run kinds, budgets, criteria — is [architecture.md](architecture.md) §4.
+
+## Retry, halt, and labels
+
+The issue mirrors the factory's state as five labels — `agent:queued`, `agent:running`,
+`agent:blocked`, `agent:done`, `agent:failed`. Dropping `agent:queued` on an open issue is
+how work enters; everything else the factory writes.
+
+Two budgets: a crashed build retries on a fresh VM up to `FACTORY_MAX_ATTEMPTS` times, and a
+rejecting review or red CI re-dispatches up to `FACTORY_MAX_REVIEW_CYCLES` fix cycles.
+When either runs out the issue is labelled `agent:failed`, and an open `agent:failed` or
+`agent:blocked` issue **halts that repo's queue** (`FACTORY_HALT_ON_FAILURE`) so the factory
+never builds on top of a failure. Unblock by fixing the issue and relabelling it
+`agent:queued`, or closing it.
+
+For a post-mortem, `FACTORY_KEEP_FAILED=1` keeps a failed run's VM around to SSH into
+instead of reaping it.
 
 ## The golden VM
 
@@ -158,7 +167,7 @@ Creates a machine from the `factory-base` snapshot, installs that agent's CLI, t
 [agent-skills](https://github.com/mithril-studio/agent-skills), `fnm` and `jq`, warms the
 package-manager download caches (node versions, pnpm/yarn, CPython — toolchains, never a
 project's packages), writes the two files a golden owes the control plane
-(`/usr/local/bin/factory-agent` and `/etc/factory/agent.json`, see `control/README.md` §2.3),
+(`/usr/local/bin/factory-agent` and `/etc/factory/agent.json`, see `../control/README.md` §2.3),
 runs its checks while the machine is still alive, saves `golden-copy`, and destroys the
 machine.
 
@@ -226,8 +235,8 @@ The setup command is never guessed. It is `--setup`, or the command in the repo'
   tier. Each run clones the repo it was assigned into `$HOME/work/<name>` (`FACTORY_WORKDIR`
   moves that), and reuses a checkout already there when it is the right repo
 - `/usr/local/bin/factory-agent` and `/etc/factory/agent.json` — the launch contract, see
-  `control/README.md` §2.3
-- the agent authenticated (inherited by every fork; expires)
+  `../control/README.md` §2.3
+- the agent authenticated (inherited by every restore; expires)
 - `gh` authenticated, as the fallback for a deployment that sets no `GITHUB_TOKEN`
 - skills installed from [agent-skills](https://github.com/mithril-studio/agent-skills)
 
@@ -280,7 +289,7 @@ re-snapshot it under the same name.
    can be done without guessing how the project installs. Adding a `## Setup` section and
    rebuilding bakes the install in too.
 
-   `FACTORY_REPOS` is now the *seed* for that register: entries are added on boot if they are
+   `FACTORY_REPOS` is the *seed* for that register: entries are added on boot if they are
    not already there, and removing one does not unwatch the repo.
 3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
    without checks, auto-merge can never pass its gate and every pull request waits for a
@@ -348,7 +357,61 @@ section, as warnings. Neither blocks a run; both cost it turns.
 
 Keep harness invariants out of it. Anything that would hang or corrupt *any* run (do not
 background long commands, commit and push as you go) belongs in the prompt, not here; see
-`discussion.md` §"Where rules live".
+`../discussion.md` §"Where rules live".
+
+## Configuration
+
+The ~12 variables an operator actually decides about. Every variable, with its default and
+the reasoning behind it, is annotated in `../.env.example`; defaults live in
+`control/config.py`.
+
+| Variable | |
+|---|---|
+| `BOXD_API_KEY` | **Required.** Run VMs come from boxd. |
+| `FACTORY_AUTH_EMAIL` / `FACTORY_AUTH_PASSWORD` | **Required.** UI login. No defaults: unset means nobody can log in. |
+| `GITHUB_TOKEN` | Required on a server (`repo` + `workflow` scopes); falls back to `gh auth token` locally. |
+| `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | Durable agent auth; set one for unattended operation. |
+| `FACTORY_AUTO_MERGE` | Squash-merge a passing PR. Off by default. |
+| `FACTORY_REVIEW` | Dispatch a review run per PR. **On by default.** |
+| `FACTORY_MAX_REVIEW_CYCLES` | Fix cycles per issue (2). |
+| `FACTORY_MAX_ATTEMPTS` | Crash retries per issue (3). |
+| `FACTORY_HALT_ON_FAILURE` | Halt a repo's queue on an open `agent:failed`/`agent:blocked` issue. On by default. |
+| `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
+| `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
+| `FACTORY_LOG_LEVEL` | Control-plane log verbosity. |
+
+## API surface
+
+All under `/api`, all behind the session auth gate except `/api/login` and `/healthz`. The
+exhaustive list is `control/app.py`.
+
+- **Auth** — `POST /api/login`, `POST /api/logout`, `GET /api/me`
+- **Runs** — `POST /api/runs` starts one by repo + issue number; the body also takes `kind`,
+  `pr_url`, `branch`, `attempt`, which is the documented way to hand-start a review or retry
+  a blocked issue. `GET /api/runs`, `GET /api/runs/{id}`, `POST .../cancel`,
+  `GET .../stream` (SSE), `GET .../telemetry`.
+- **Work** — `GET /api/attempts` (build → CI → review grouped per attempt),
+  `GET /api/issues`, `GET /api/config`, `GET /api/telemetry`
+- **Repos & goldens** — `POST`/`DELETE /api/repos`, `GET /api/github/repos`,
+  `GET /api/preflight?repo=`, `POST`/`DELETE /api/repos/{owner}/{name}/golden`,
+  `POST /api/goldens/refresh`, `GET /api/goldens`, `GET /api/machines`,
+  `POST /api/reconcile`
+- **Memory** — `GET /api/memory/candidates`, `POST /api/memory/candidates/{id}/accept`
+  or `.../reject` — the triage queue for learnings the agent proposed. No UI consumer yet;
+  it is curl territory.
+- **Health** — `GET /healthz`, unauthenticated, for the external monitor
+
+## Scripts
+
+| Script | |
+|---|---|
+| `verify.sh` | Every CI gate, in CI's order — ruff, all tests, the memory validator. The local pre-push command; CI runs this exact file. |
+| `deploy.sh` | Pull, rebuild what moved, restart. `--ref` deploys a branch or tag. |
+| `build-golden.sh` | Build the `golden-copy` base image (above). |
+| `refresh-golden.sh` | Refresh a repo's warm golden in place (above). |
+| `factory-health.sh` | External monitor; runs from a GitHub Actions cron every 10 minutes and manages an alert issue. |
+| `provision-hetzner.sh` | Build the control-plane box from nothing: systemd unit, Caddy, unattended upgrades. |
+| `planner-setup.sh` | Provision the `planner` box that runs `factory-compose`. |
 
 ## The UI
 
@@ -365,9 +428,9 @@ change them there, not in a component.
   number that *is* the headline is serif.
 - **No border radius.** `--radius: 0px`, and the `radius-*` scale is pinned to zero so a
   stray `rounded-lg` cannot reintroduce a soft corner.
-- **Hard shadows, never blur.** `shadow-hard` / `-sm` / `-accent` are solid offsets. The
-  accent (terracotta) shadow marks the one thing on a screen worth acting on — the lead stat
-  tile, the sign-in card — and nothing else.
+- **Hard shadows, never blur.** `shadow-hard` / `-sm` / `-lg` / `-accent` are solid offsets.
+  The accent (terracotta) shadow marks the one thing on a screen worth acting on — the lead
+  stat tile, the sign-in card — and nothing else.
 - **Two border weights.** Black `border-border` frames anything that is its own object;
   grey `border-subtle` divides rows inside one.
 - **Warm neutrals.** Paper, not screen: the ground is a warm off-white, the sidebar a slab of
@@ -394,27 +457,12 @@ change them there, not in a component.
   its telemetry adapter, and whether a run has ever proved its credentials. What *is* running:
   the boxd machines (`/api/machines`), by role, orphans flagged, with a reconcile button.
 - **Telemetry** — where the money and the time go: cost by token class (cache reads are most
-  of the bill), spend by day, tools by wall time, and cost per shipped issue against spend on
-  runs that shipped nothing.
-
-## What V0 deliberately does not have
-
-Named so they stay unbuilt until something proves they are needed:
-
-- No test agent or review agent. One agent, a few skills.
-- No warm VM pool — forks are ~0.2s.
-- No `mem` binary. Memory is a skill writing JSONL; extraction comes once the format is
-  proven against real records.
-- No `ExecutionBackend` abstraction. The control plane talks to boxd concretely; the
-  interface gets extracted when a second backend exists.
-- No queue broker, no webhooks.
-- No second agent. One base image, and which agent it runs is what the image announces about
-  itself. A second agent needs a second base image and a way to choose between them; neither
-  exists until something needs it.
+  of the bill), spend by day, tools by wall time, cost per shipped issue against spend on
+  runs that shipped nothing, and whether runs are reading memory.
 
 ## Docs
 
-- `docs/architecture.md` — layers, topology, and the contracts between them
-- `control/README.md` — control plane design notes
-- `telemetry/README.md` — trace layer design notes
+- [architecture.md](architecture.md) — layers, topology, the pipeline, and the contracts
+- [../control/README.md](../control/README.md) — control plane design notes
+- [../telemetry/README.md](../telemetry/README.md) — trace layer design notes
 - [agent-skills](https://github.com/mithril-studio/agent-skills) — the skills the in-VM agent loads
