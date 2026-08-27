@@ -146,6 +146,20 @@ check("the prompt asks whether the issue was the problem before anything else",
 check("and tells the analyst to actually read the issues",
       "gh issue view" in learn_prompt, True)
 
+# The silent failure this guards. Claude Code resolves same-named skills personal-over-project
+# — the opposite of most-specific-wins — and a golden installs the shared skills personally.
+# So a repo skill reusing a global name is never loaded rather than loudly overridden: it
+# merges, sits unread, reads as zero-loads to the eviction query, and gets proposed for
+# deletion. Every step looks correct, which is why it has to be prompted against explicitly.
+check("the analyst is told to check for a shadowing global skill",
+      "ls ~/.claude/skills" in learn_prompt, True)
+check("and to read a shadowed skill as a rename rather than a delete",
+      "rename it rather than to delete it" in learn_prompt, True)
+check("the eviction query warns its caller about the same trap",
+      "shadowed" in inspect.getsource(
+          __import__("telemetry.store", fromlist=["skill_loads_by_repo"]).skill_loads_by_repo
+      ), True)
+
 # The env var is only set on the path that reads it back.
 env = runner.dispatch_env(repo="a/b", branch="main", base="main", prompt="p",
                           run_id="x", number=0, vm_name="vm", kind="learn")

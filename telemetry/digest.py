@@ -47,10 +47,20 @@ SECTION_LIMIT = 20
 EVIDENCE_RUNS = 5
 REASON_MAX = 300
 
-# Runs the digest never counts. A learning run's own cost, tools and failures are not evidence
-# about how the factory builds software, and feeding them back in would let the loop react to
-# itself — the cheapest way to make a self-improving system oscillate.
-EXCLUDED_KINDS = ("learn",)
+# The only runs this digest counts: the phases of an attempt at an issue.
+#
+# An allowlist rather than a list of exclusions, and that is the whole point. This started as
+# `EXCLUDED_KINDS = ("learn",)` — correct on the day it was written and wrong the moment
+# `plan` was added, because a denylist admits every kind nobody thought to name. A planning
+# run's crashes would have arrived here as evidence about how the factory *builds software*,
+# and the learning run reading them would have proposed repo skills to fix the planner.
+#
+# So a new kind is invisible to the digest until somebody adds it here on purpose. That is the
+# safe direction to fail in: a missing section is noticed, silent contamination is not.
+#
+# `learn` is absent for a second reason on top of not being issue work — it is this loop's own
+# output, and feeding that back is the cheapest way to make a self-improving system oscillate.
+COUNTED_KINDS = ("build", "review", "ci")
 
 # Volatile fragments of an error string, removed before two errors are called the same thing.
 # Without this every failure is unique — run ids, shas, ports, durations and tmp paths differ
@@ -92,9 +102,9 @@ def _window(repo: str | None, days: int) -> tuple[str, list[Any]]:
     since = (
         dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     ).isoformat(timespec="seconds")
-    marks = ", ".join("?" for _ in EXCLUDED_KINDS)
-    sql = f"r.created_at >= ? AND COALESCE(r.kind, 'build') NOT IN ({marks})"
-    params: list[Any] = [since, *EXCLUDED_KINDS]
+    marks = ", ".join("?" for _ in COUNTED_KINDS)
+    sql = f"r.created_at >= ? AND COALESCE(r.kind, 'build') IN ({marks})"
+    params: list[Any] = [since, *COUNTED_KINDS]
     if repo:
         sql += " AND r.repo = ?"
         params.append(repo)

@@ -502,6 +502,13 @@ async def skill_loads_by_repo(since: str | None = None) -> list[dict]:
     Counts loads, not runs that benefited — a loaded skill that made things worse looks
     exactly like one that helped. Pair it with outcomes before concluding anything warmer
     than "this was read".
+
+    One trap for the caller acting on an absence. A skill in a repo's `.claude/skills/` is
+    overridden by one of the same name in `~/.claude/skills`, which is where a golden installs
+    the shared skills — *personal beats project*, the opposite of the usual precedence. A
+    shadowed repo skill therefore never loads and shows up here as absent, indistinguishable
+    from one nobody needed. Check the name against the globally installed set before reading
+    an absence as "unused": the fix for a shadowed skill is a rename, not a delete.
     """
     where = "WHERE tc.tool = ? AND tc.detail IS NOT NULL AND tc.detail != ''"
     params: list[Any] = [SKILL_TOOL]
