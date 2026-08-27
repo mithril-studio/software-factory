@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
-from . import agents, auth, db, github, goldens, poller, preflight, provision, repos, runner
+from . import agents, auth, db, github, goldens, plan, poller, preflight, provision, repos, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -226,9 +226,11 @@ async def api_digest(repo: str | None = None, days: int = 14):
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    # 'build', 'review' (of a pull request a build already opened), or 'provision' (warm this
-    # repo's golden). All three are runs on a restored VM, which is why one endpoint starts any
-    # of them. A provision ignores `issue_number`; there is no issue behind it.
+    # 'build', 'review' (of a pull request a build already opened), 'provision' (warm this
+    # repo's golden), or 'plan' (compare the repo against its goal now, without waiting for
+    # the poller's cadence). All four are runs on a restored VM, which is why one endpoint
+    # starts any of them. Provision and plan ignore `issue_number`; there is no issue behind
+    # either — making issues is the plan run's job.
     kind: str = "build"
     pr_url: str | None = None
     branch: str | None = None
@@ -277,6 +279,8 @@ async def api_start_run(body: StartRun):
             )
         elif body.kind == "provision":
             run_id = await provision.create(repo)
+        elif body.kind == "plan":
+            run_id = await plan.create(repo)
         else:
             raise ValueError(f"unknown run kind {body.kind!r}")
     except Exception as exc:  # noqa: BLE001
@@ -511,6 +515,43 @@ async def api_delete_golden(owner: str, name: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+class RepoGoal(BaseModel):
+    # Null or empty clears the goal; anything else sets it and activates the loop.
+    goal: str | None = None
+
+
+@app.patch("/api/repos/{owner}/{name}")
+async def api_set_goal(owner: str, name: str, body: RepoGoal):
+    """Set, change or clear a repo's goal — the endstate the goal loop plans toward.
+
+    The state transition rides on the write (see `repos.set_goal`): new text activates,
+    unchanged text is a no-op, empty text removes the goal. Whether anything *happens* next
+    is the poller's business — with FACTORY_PLAN off this is a note on the register and
+    nothing more, which the UI says rather than hides.
+    """
+    repo = f"{owner}/{name}"
+    try:
+        row = await repos.set_goal(repo, body.goal)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"repo": repo, "goal": row.get("goal"), "goal_state": row.get("goal_state")}
+
+
+@app.post("/api/repos/{owner}/{name}/replan")
+async def api_replan(owner: str, name: str):
+    """Put a `met` or `stalled` goal back to `active`, so the next dry tick plans again.
+
+    The way past a stall without re-typing the goal, and the way to re-open a goal the
+    factory declared met. Re-activating an already-active goal is harmlessly idempotent.
+    """
+    repo = f"{owner}/{name}"
+    try:
+        row = await repos.reactivate(repo)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"repo": repo, "goal_state": row.get("goal_state")}
+
+
 @app.delete("/api/repos/{owner}/{name}")
 async def api_disconnect_repo(owner: str, name: str):
     """Stop watching a repo. Its runs stay — they are the ledger, not the configuration.
@@ -566,6 +607,14 @@ async def api_projects():
                 # Learnings this repo's runs proposed and nobody has decided on yet. Scoped by
                 # `repo`, so one project's queue never shows up under another's.
                 "pending_candidates": pending.get(repo, 0),
+                # The goal loop: the endstate this repo is being built toward, and where the
+                # loop stands — `none`, `active`, `met`, or `stalled`. `plan_enabled` rides
+                # along so the UI can say when a goal is set but the loop is switched off.
+                "goal": row.get("goal"),
+                "goal_state": row.get("goal_state") or "none",
+                "plan_stalls": row.get("plan_stalls") or 0,
+                "last_planned_at": row.get("last_planned_at"),
+                "plan_enabled": settings.plan_enabled,
             }
         )
     return out

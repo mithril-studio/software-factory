@@ -96,14 +96,16 @@ def provision_semaphore() -> asyncio.Semaphore:
 
 
 # Every VM a run creates is named from its run id with one of these prefixes: `run-` for a
-# build, `rev-` for a review, `prov-` for warming a repo's golden. Reconcile and the fleet view
+# build, `rev-` for a review, `prov-` for warming a repo's golden, `plan-` for a goal-loop
+# planning run, `learn-` for an improvement-loop learning run. Reconcile and the fleet view
 # both key off them, so they live here rather than being spelled out at each site — a prefix
 # known to one and not the other is a VM nobody reaps and nobody recognises.
 RUN_PREFIX = "run-"
 REVIEW_PREFIX = "rev-"
 PROVISION_PREFIX = "prov-"
+PLAN_PREFIX = "plan-"
 LEARN_PREFIX = "learn-"
-VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, LEARN_PREFIX)
+VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, PLAN_PREFIX, LEARN_PREFIX)
 
 
 def is_run_vm(name: str) -> bool:
@@ -112,7 +114,8 @@ def is_run_vm(name: str) -> bool:
 
 
 def vm_role(name: str) -> str:
-    """What a machine in the fleet is: `run`, `review`, `provision`, or `other`.
+    """What a machine in the fleet is: `run`, `review`, `provision`, `plan`, `learn`, or
+    `other`.
 
     Read off the same prefixes `is_run_vm` sweeps on, so the fleet view and the reaper can
     never disagree about what belongs to the factory. `other` covers everything the factory
@@ -124,6 +127,10 @@ def vm_role(name: str) -> str:
         return "review"
     if name.startswith(PROVISION_PREFIX):
         return "provision"
+    if name.startswith(PLAN_PREFIX):
+        return "plan"
+    if name.startswith(LEARN_PREFIX):
+        return "learn"
     if name.startswith(RUN_PREFIX):
         return "run"
     return "other"
@@ -1352,9 +1359,10 @@ def dispatch_env(
     if kind == "build":
         # Where to propose learnings, read back before the VM is reaped. Set only on the path
         # that asks for it and reads it: an environment variable naming a file nobody collects
-        # is an invitation to write into a void, and neither the review nor the learn prompt
-        # makes that promise — a learning run proposes through its own file, which the control
-        # plane validates, and `_collect_memory_candidates` runs on the build path alone.
+        # is an invitation to write into a void, and no other kind's prompt makes that
+        # promise — review and plan promise nothing, and a learning run proposes through its
+        # own file, which the control plane validates; `_collect_memory_candidates` runs on
+        # the build path alone.
         env[MEMORY_CANDIDATE_ENV] = MEMORY_CANDIDATE_PATH
     if settings.github_token:
         env["GH_TOKEN"] = settings.github_token
@@ -2895,9 +2903,9 @@ async def _read_json_file(
     """Read one JSON file out of the VM before it is reaped. None on any failure.
 
     Every caller treats None as "the agent produced nothing usable", and every caller is
-    right to: a reviewer that wrote no verdict has approved nothing, and an analyst that
-    wrote no proposals has proposed nothing. Failing closed is the same answer in both cases,
-    which is why they share this.
+    right to: a reviewer that wrote no verdict has approved nothing, an analyst that wrote
+    no proposals has proposed nothing, and a planner that wrote no verdict has planned
+    nothing. Failing closed is the same answer in all cases, which is why they share this.
     """
     try:
         result = await boxd.machines.exec(machine_id, f"cat {path}", timeout=30)

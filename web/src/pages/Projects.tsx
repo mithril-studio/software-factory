@@ -6,6 +6,8 @@ import {
   disconnectRepo,
   dropGolden,
   preflight,
+  replan,
+  setGoal,
   usePoll,
   warmGolden,
   type Connected,
@@ -175,6 +177,105 @@ function Connect({ onDone, onClose }: { onDone: () => void; onClose: () => void 
   )
 }
 
+/** Where the goal loop stands for one repo, as a stamp. Nothing for `none` — an absent goal
+ *  is the ordinary state, not a status. A goal on a deployment with FACTORY_PLAN off is
+ *  labelled as such rather than shown as "active": it looks armed and is not, and the
+ *  difference is exactly what the person reading this page needs to know. */
+function GoalState({ p }: { p: Project }) {
+  if (p.goal_state === "met") return <Badge variant="ok">goal met</Badge>
+  if (p.goal_state === "stalled") return <Badge variant="warn">stalled ×{p.plan_stalls}</Badge>
+  if (p.goal_state === "active")
+    return p.plan_enabled ? (
+      <Badge variant="outline">goal active</Badge>
+    ) : (
+      <Badge variant="muted" title="Set FACTORY_PLAN=1 to let the factory plan toward this goal">
+        planning off
+      </Badge>
+    )
+  return null
+}
+
+/** Read, edit and re-arm a repo's goal — the endstate the factory plans toward when this
+ *  repo's queue runs dry. Each cell manages its own editor; the register row is small and
+ *  the 15-second projects poll refreshes the read view underneath it. */
+function GoalCell({ p, onChanged }: { p: Project; onChanged: () => void }) {
+  const [editing, setEditing] = useState(false)
+  const [text, setText] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function act(work: () => Promise<unknown>) {
+    setBusy(true)
+    setError(null)
+    try {
+      await work()
+      setEditing(false)
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (editing) {
+    return (
+      <div className="flex min-w-64 flex-col gap-2 py-1">
+        <textarea
+          className="min-h-20 w-full border border-input bg-background p-2 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          value={text}
+          disabled={busy}
+          placeholder="The endstate: what should this project be when it is done?"
+          onChange={(e) => setText(e.target.value)}
+        />
+        <div className="flex items-center gap-2">
+          <Button size="sm" disabled={busy} onClick={() => act(() => setGoal(p.repo, text))}>
+            {busy ? "Saving…" : "Save"}
+          </Button>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => setEditing(false)}>
+            Cancel
+          </Button>
+          {error && <span className="font-mono text-[10px] text-bad">{error}</span>}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <GoalState p={p} />
+      {p.goal && (
+        <span className="max-w-56 truncate text-xs text-muted-foreground" title={p.goal}>
+          {p.goal}
+        </span>
+      )}
+      <Button
+        variant="ghost"
+        size="sm"
+        title="The goal loop: when this repo's queue runs dry, a plan run compares it against this text and files the next issues or declares it met."
+        onClick={() => {
+          setText(p.goal ?? "")
+          setEditing(true)
+        }}
+      >
+        {p.goal ? "Edit" : "Set goal"}
+      </Button>
+      {(p.goal_state === "met" || p.goal_state === "stalled") && (
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={busy}
+          title="Back to active: the next dry poll tick plans against this goal again"
+          onClick={() => act(() => replan(p.repo))}
+        >
+          Replan
+        </Button>
+      )}
+      {error && <span className="font-mono text-[10px] text-bad">{error}</span>}
+    </div>
+  )
+}
+
 function Provisioning({ status }: { status: string }) {
   if (status === "ready") return <Badge variant="outline">warm</Badge>
   if (status === "running") return <Badge variant="muted">warming…</Badge>
@@ -272,6 +373,7 @@ export function Projects() {
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
                 <TableHead>Golden</TableHead>
+                <TableHead>Goal</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
                 <TableHead />
@@ -296,6 +398,9 @@ export function Projects() {
                     <span className="ml-2">
                       <Provisioning status={p.provision_status} />
                     </span>
+                  </TableCell>
+                  <TableCell>
+                    <GoalCell p={p} onChanged={refresh} />
                   </TableCell>
                   <TableCell className="text-right font-mono tabular-nums">{p.runs}</TableCell>
                   <TableCell className="text-right font-mono tabular-nums text-ok">{p.succeeded}</TableCell>

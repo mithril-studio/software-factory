@@ -80,12 +80,25 @@ CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 -- record which one a repo uses, and adding the column later is a migration for something that
 -- costs nothing now — but nothing reads it, and nothing should until a second base image
 -- exists to choose between.
+--
+-- `goal` is the endstate the repo is being built toward — prose, written by a human through
+-- the API. It is what makes the factory self-serving: when a repo's queue runs dry and its
+-- `goal_state` is 'active', the poller dispatches a plan run that compares the repo against
+-- this text and either files the next issues or declares the goal met. `goal_state` is
+-- 'none' (no goal), 'active' (planning may fire), 'met' (a plan run verified the endstate
+-- and the queue was empty), or 'stalled' (consecutive fruitless plans hit the cap — a human
+-- decides what happens next). `plan_stalls` counts those fruitless plans; `last_planned_at`
+-- is the cooldown clock between plan dispatches.
 CREATE TABLE IF NOT EXISTS repos (
     repo             TEXT PRIMARY KEY,
     added_at         TEXT NOT NULL,
     golden           TEXT,
     provision_status TEXT NOT NULL DEFAULT 'none',
-    agent            TEXT
+    agent            TEXT,
+    goal             TEXT,
+    goal_state       TEXT NOT NULL DEFAULT 'none',
+    plan_stalls      INTEGER NOT NULL DEFAULT 0,
+    last_planned_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -224,6 +237,15 @@ MIGRATIONS = (
     # the runs which got better were the ones carrying the rule. Nullable, because every run
     # recorded before this column existed genuinely has no answer.
     "ALTER TABLE runs ADD COLUMN base_sha TEXT",
+    # The goal loop: a repo may carry an endstate description, and a run kind — 'plan',
+    # an agent that compares the repo against it when the queue runs dry — files the next
+    # issues or declares it met. No `runs` change: `kind` is a plain string column and 'plan'
+    # is just another value of it. See the repos table comment in SCHEMA for what each of
+    # these four holds.
+    "ALTER TABLE repos ADD COLUMN goal TEXT",
+    "ALTER TABLE repos ADD COLUMN goal_state TEXT NOT NULL DEFAULT 'none'",
+    "ALTER TABLE repos ADD COLUMN plan_stalls INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE repos ADD COLUMN last_planned_at TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -465,6 +487,55 @@ async def set_repo_golden(repo: str, golden: str | None, status: str) -> None:
         await conn.execute(
             "UPDATE repos SET golden = ?, provision_status = ? WHERE repo = ?",
             (golden, status, repo),
+        )
+        await conn.commit()
+
+
+async def set_repo_goal(repo: str, goal: str | None, state: str, stalls: int = 0) -> None:
+    """Record a repo's goal and reset the loop's counters to match it.
+
+    One statement on purpose: a goal edit and the state it implies must land together, or a
+    poll tick between the two writes reads a new goal with the old state — and either plans
+    against a goal that was just declared met, or refuses to plan against one that was just
+    written. `last_planned_at` is cleared so a fresh goal does not wait out the cooldown a
+    previous one earned.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE repos SET goal = ?, goal_state = ?, plan_stalls = ?, "
+            "last_planned_at = NULL WHERE repo = ?",
+            (goal, state, stalls, repo),
+        )
+        await conn.commit()
+
+
+async def set_plan_state(
+    repo: str,
+    state: str | None = None,
+    stalls: int | None = None,
+    last_planned_at: str | None = None,
+) -> None:
+    """Record what the plan loop did, leaving the goal text alone.
+
+    Explicit parameters rather than `**fields` for the same reason `CANDIDATE_COLUMNS` is a
+    closed set: column names are interpolated into the statement, so the set of legal ones is
+    decided here, not by the caller. `None` means "leave it as it is".
+    """
+    sets, values = [], []
+    if state is not None:
+        sets.append("goal_state = ?")
+        values.append(state)
+    if stalls is not None:
+        sets.append("plan_stalls = ?")
+        values.append(stalls)
+    if last_planned_at is not None:
+        sets.append("last_planned_at = ?")
+        values.append(last_planned_at)
+    if not sets:
+        return
+    async with connect() as conn:
+        await conn.execute(
+            f"UPDATE repos SET {', '.join(sets)} WHERE repo = ?", (*values, repo)
         )
         await conn.commit()
 

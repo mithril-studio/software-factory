@@ -162,6 +162,26 @@ class Settings:
     # the poller stops dispatching a repo that has any open `agent:failed` issue until a
     # human clears it. Turn off if a repo's issues are independent.
     halt_on_failure: bool = os.environ.get("FACTORY_HALT_ON_FAILURE", "1") == "1"
+    # The goal loop. When a watched repo carries an active goal and its queue runs dry, the
+    # poller dispatches a plan run: an agent that compares the repo against the goal and
+    # either files the next batch of `agent:queued` issues or declares the goal met. Off by
+    # default — a planner that files issues is a factory that spends without being asked,
+    # and that is a decision each deployment makes deliberately.
+    plan_enabled: bool = os.environ.get("FACTORY_PLAN", "0") == "1"
+    # Seconds between plan dispatches for one repo. The backstop against a tight loop of
+    # plan runs when something is wrong — a planner that keeps filing nothing, a verdict
+    # that keeps failing to parse. Stamped at dispatch, not completion, so crashes count.
+    plan_cooldown: int = int(os.environ.get("FACTORY_PLAN_COOLDOWN", "900"))
+    # How many consecutive fruitless plan runs (crashed, no verdict, or claimed issues that
+    # never appeared queued) before the repo's goal is marked `stalled` and left for a
+    # human. Two, like max_review_cycles, and for the same reason: a third identical failure
+    # means the goal or the setup is wrong, not the luck.
+    plan_max_stalls: int = int(os.environ.get("FACTORY_PLAN_MAX_STALLS", "2"))
+    # The most issues one plan run may file. An instruction to the agent, enforced by
+    # observation rather than revocation — the control plane cannot un-create an issue. Small
+    # on purpose: the factory builds sequentially and plans again when these are done, and a
+    # plan written against today's code beats a backlog written all at once.
+    plan_max_issues: int = int(os.environ.get("FACTORY_PLAN_MAX_ISSUES", "6"))
     # --- the improvement loop
     #
     # Periodically, an agent reads what the last N issues actually cost in rejections and

@@ -112,3 +112,71 @@ async def record_golden(repo: str, golden: str | None, status: str) -> None:
     """Record what provisioning did for `repo`, and refresh the cached row."""
     await db.set_repo_golden(repo.strip(), golden, status)
     await load()
+
+
+# --------------------------------------------------------------------------- the goal loop
+
+# What `goal_state` may hold. The transitions live in the two functions below and in
+# `plan.plan_outcome` — this module owns the human-driven ones (a goal written, a repo
+# reactivated), `plan` owns what a plan run's verdict does.
+GOAL_NONE, GOAL_ACTIVE, GOAL_MET, GOAL_STALLED = "none", "active", "met", "stalled"
+
+
+def row(repo: str) -> dict | None:
+    """The cached register row for one repo, or None when it is not watched."""
+    return _rows.get(repo)
+
+
+async def set_goal(repo: str, goal: str | None) -> dict:
+    """Write `repo`'s goal and derive its state from the edit. Returns the fresh row.
+
+    The transition is decided here, at the only writer, which is what lets `goal_state`
+    avoid needing a hash column: unchanged text is a no-op (so saving the form twice does
+    not wake a `met` repo), changed text reactivates whatever state the old goal earned
+    (met, stalled) and resets the stall count, and empty text removes the goal entirely.
+    """
+    repo = repo.strip()
+    current = _rows.get(repo)
+    if current is None:
+        raise ValueError(f"{repo} is not watched")
+    goal = (goal or "").strip() or None
+    if goal == (current.get("goal") or None):
+        return current
+    state = GOAL_ACTIVE if goal else GOAL_NONE
+    await db.set_repo_goal(repo, goal, state, stalls=0)
+    await load()
+    return _rows[repo]
+
+
+async def reactivate(repo: str) -> dict:
+    """Put a `met` or `stalled` repo back to `active`, so the next dry tick plans again.
+
+    The way past a stall without editing the goal, and the way to re-open a met goal whose
+    endstate has since drifted. Refuses a repo with no goal — there is nothing to plan toward.
+    """
+    repo = repo.strip()
+    current = _rows.get(repo)
+    if current is None:
+        raise ValueError(f"{repo} is not watched")
+    if not (current.get("goal") or "").strip():
+        raise ValueError(f"{repo} has no goal to reactivate")
+    await db.set_repo_goal(repo, current["goal"], GOAL_ACTIVE, stalls=0)
+    await load()
+    return _rows[repo]
+
+
+async def record_plan_start(repo: str) -> None:
+    """Stamp the cooldown clock the moment a plan run is dispatched.
+
+    On dispatch rather than on completion, so a plan run that crashes still counts against
+    the cooldown — the failure mode being prevented is a tight loop of broken plan runs, and
+    stamping only successes would exempt exactly the runs that loop.
+    """
+    await db.set_plan_state(repo.strip(), last_planned_at=db.utcnow())
+    await load()
+
+
+async def record_plan_outcome(repo: str, state: str, stalls: int) -> None:
+    """Record where a finished plan run left the repo's goal."""
+    await db.set_plan_state(repo.strip(), state=state, stalls=stalls)
+    await load()
