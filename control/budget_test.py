@@ -139,10 +139,30 @@ check("over it, the repo may not", run(poller._within_budget(REPO)), False)
 object.__setattr__(settings, "max_repo_daily_cost", 0)
 check("and zero switches the ceiling off entirely", run(poller._within_budget(REPO)), True)
 
-# It gates every autonomous path, not just builds — the loops are the reason it exists.
+# It gates the loops and never the queue. An issue with `agent:queued` on it is work somebody
+# asked for; a ceiling that stops a backlog halfway because a planner had an expensive morning
+# is a ceiling the operator switches off, which is worse than not having one. The loops are
+# what dispatch unasked, so they are what a spend ceiling has any business stopping.
 poll_src = inspect.getsource(poller._poll_repo)
-check("the guard sits above the queue, the plan hook and the learning hook",
-      poll_src.index("_within_budget") < poll_src.index("list_issues_with_label"), True)
+check("the guard sits inside the dry-queue branch, below the queue check",
+      poll_src.index("list_issues_with_label(repo, github.LABEL_QUEUED)")
+      < poll_src.index("_within_budget"), True)
+check("and above both loop hooks",
+      poll_src.index("_within_budget") < poll_src.index("plan.maybe_plan")
+      and poll_src.index("_within_budget") < poll_src.index("_maybe_learn"), True)
+# The property that would be undone by moving one line, checked on nesting rather than on
+# textual order — the dry-queue branch returns, so the dispatch sits *after* the guard in the
+# source while being unreachable from it. Depth is what actually says "not under the guard".
+def indent_of(needle: str) -> int:
+    line = next(ln for ln in poll_src.splitlines() if needle in ln)
+    return len(line) - len(line.lstrip())
+
+
+check("the budget check is nested inside the dry-queue branch",
+      indent_of("if not await _within_budget(repo)") > indent_of("if not issues:"), True)
+check("while dispatching a queued issue sits at function level, under no budget check",
+      indent_of("await runner.create(repo, issue[\"number\"])"),
+      indent_of("if not issues:"))
 
 # A ceiling that cannot read the spend must not become the reason the factory stops. This is
 # the same rule the trace layer holds itself to: telemetry that can halt work is worse than
