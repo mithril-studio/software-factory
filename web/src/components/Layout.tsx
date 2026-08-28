@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom"
-import { Activity, Boxes, Bot, FolderGit2, ListChecks, BarChart3, Sprout, Sun, Moon, LogOut } from "lucide-react"
+import { Activity, Boxes, Bot, FolderGit2, ListChecks, BarChart3, ScrollText, Sprout, Sun, Moon, LogOut } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useTheme } from "@/lib/theme"
 import { logout } from "@/lib/api"
@@ -10,6 +10,7 @@ const NAV = [
   { to: "/projects", label: "Projects", icon: FolderGit2 },
   { to: "/goldens", label: "Goldens", icon: Bot },
   { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
+  { to: "/digest", label: "Digest", icon: ScrollText },
   { to: "/improvements", label: "Improvements", icon: Sprout },
 ]
 

@@ -70,21 +70,46 @@ class Recorder:
         except Exception:  # noqa: BLE001 - a wrong number must not end a run
             return {}
 
-    async def feed(self, event: dict) -> None:
-        """Normalize one runtime event and buffer whatever it produced."""
+    async def feed(self, event: dict) -> bool:
+        """Normalize one runtime event and buffer whatever it produced.
+
+        Returns True when this event closed a turn — the moment the durable record caught
+        up with the run. A caller enforcing a spend ceiling wants exactly those moments:
+        checking more often queries a number that has not moved, and checking less often
+        lets a run overshoot by however long it waited.
+        """
         self._fed = True
         try:
             rows = self.adapter.feed(event)
         except Exception:  # noqa: BLE001 - a malformed event must not end a run
             self.dropped += 1
-            return
+            return False
         if not rows:
-            return
+            return False
         self._buffer.extend(rows)
         # An LlmCall marks the end of a turn: flush there, so the durable record never
         # trails the run by more than one turn.
         if any(isinstance(r, LlmCall) for r in rows):
             await self._flush()
+            return True
+        return False
+
+    async def cost(self) -> float:
+        """Derived spend so far, in USD. 0.0 when it cannot be read.
+
+        A query rather than a running counter, because cost is a join against a price table
+        we edit and never a stored column (`store.COST_SQL`) — a counter here would be a
+        second answer that drifts from the one every report uses. It is a SUM over one
+        indexed `run_id` against a table of a few rows, run once per turn.
+
+        Fails to 0.0 for the reason everything else in this file does: a ceiling that cannot
+        read the spend must not be the thing that kills the run.
+        """
+        try:
+            usage = await store.usage_for_run(self.run_id)
+        except Exception:  # noqa: BLE001 - never raise into a live run
+            return 0.0
+        return float((usage.get("totals") or {}).get("derived_cost_usd") or 0.0)
 
     async def close(self) -> None:
         """Final flush, including tool calls the run died inside."""

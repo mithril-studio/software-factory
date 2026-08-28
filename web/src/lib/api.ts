@@ -268,6 +268,53 @@ export type Telemetry = {
   economics: Economics[]
 }
 
+/** The evidence a learning run reads, served to whoever asks.
+ *
+ *  Rendered for one reason above the others: this is the loop's input, and a proposal built
+ *  on a bad digest is wrong *and* plausible. Reading it here is how that gets caught before
+ *  it becomes a merged rule that every later run pays for.
+ *
+ *  `truncated` names each section a cap shortened and by how much, which is what separates
+ *  "nothing else happened" from "we stopped listing". */
+export type Digest = {
+  window: { days: number; since: string; repo: string | null }
+  rejections: DigestCluster[]
+  outcomes: {
+    repo: string
+    runs: number
+    issues: number
+    shipped: number
+    failed_runs: number
+    shipped_nothing: number
+    retries: number
+    max_cycle: number
+    context_versions: number
+  }[]
+  failures: DigestCluster[]
+  tool_errors: { tool: string; failures: number; runs: number; example: string | null }[]
+  retrieval: {
+    repo: string
+    outcome: "went_wrong" | "went_fine"
+    runs: number
+    primed: number
+    records_opened: number
+    avg_index_size: number
+  }[]
+  skills: { repo: string; skill: string; loads: number; runs: number; last_loaded: string | null }[]
+  cost: { repo: string; spend: number; wasted: number; shipped: number }[]
+  truncated: Record<string, number>
+}
+
+export type DigestCluster = {
+  signature: string
+  count: number
+  repos: string[]
+  issues: number[]
+  example: string
+  run_ids: string[]
+  last_seen: string | null
+}
+
 /** One thing the improvement loop changed, and what it turned out to be worth.
  *
  *  `status` is the whole story in one field, and `merged` deliberately is not the end of
