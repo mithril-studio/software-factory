@@ -111,7 +111,7 @@ class Settings:
     # run that reaches it is not expensive, it is lost — and a run aborted here is never
     # retried, because a retry is how one lost run becomes three.
     max_run_cost: float = float(os.environ.get("FACTORY_MAX_RUN_COST", "25"))
-    # What one repo may spend in a UTC day across every run, in USD. 0 switches it off.
+    # What one repo's autonomous loops may spend in a UTC day, in USD. 0 switches it off.
     #
     # This is the one that bounds a *loop*, and the per-run ceiling does not imply it: the
     # planner files up to FACTORY_PLAN_MAX_ISSUES issues, each of which builds well under $25,
@@ -119,6 +119,11 @@ class Settings:
     # expensive and nothing in it terminates except an agent deciding the goal is met. Before
     # the goal and improvement loops there was one dispatcher — a human labelling issues — and
     # this ceiling would have had nothing to stop.
+    #
+    # It stops the loops dispatching; it never refuses a queued issue. The *sum* it compares
+    # against counts every run of every kind, so the builds a planner caused still push the
+    # day toward the ceiling — the queue drains and stops growing, rather than stopping
+    # halfway through work somebody asked for.
     max_repo_daily_cost: float = float(os.environ.get("FACTORY_MAX_REPO_DAILY_COST", "100"))
     # Seconds a single shell command may run before the agent's tooling backgrounds it, and
     # the ceiling it may request for one. Both are far above any legitimate command here

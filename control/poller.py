@@ -39,18 +39,25 @@ _over_budget: dict[str, str] = {}
 
 
 async def _within_budget(repo: str) -> bool:
-    """Whether `repo` may still spend today.
+    """Whether `repo`'s autonomous loops may still start work today.
 
     The ceiling that bounds a *loop*, and the reason the per-run one does not: the planner
     files issues, those issues build for well under the per-run ceiling each, the queue
     drains, and it plans again. Nothing in that cycle is individually expensive and nothing
     in it terminates except an agent judging the goal met.
 
-    Enforced here rather than in `runner.create` so it governs only the paths that dispatch
-    without being asked. A human starting a run through the API is overriding the cadence
-    deliberately, the same way a hand-started build overrides the queue — and an operator
-    locked out of their own factory by a ceiling they set is an operator who switches the
-    ceiling off.
+    **Gates the loops, never the queue.** An issue with `agent:queued` on it is work somebody
+    asked for, and refusing to build it is the ceiling doing something nobody wanted: the
+    backlog stops halfway, the repo looks broken, and the operator switches the ceiling off —
+    which is worse than not having one. The planning and learning runs are what spend without
+    being asked, so they are what a spend ceiling has any business stopping.
+
+    That still brakes the cycle rather than only its first step, because the sum below counts
+    every kind. Builds the loops caused land on the day's total, and once the total is past
+    the ceiling nothing further is dispatched unasked — the queue finishes and stops growing.
+
+    A run started by hand through the API is never checked at all. That is a human overriding
+    the cadence, the same way a hand-started build overrides the queue.
     """
     if not settings.max_repo_daily_cost:
         return True
@@ -99,11 +106,6 @@ async def _poll_repo(repo: str) -> None:
     # #2 does not start until #1 has reached a terminal state (its retries included).
     if await db.has_active_run(repo):
         return
-    # Nothing this repo does costs money past its daily ceiling — builds, plans and learning
-    # runs alike. Checked before the halt labels rather than after, because both answers are
-    # "do not dispatch" and this one costs a local query where that one costs two API calls.
-    if not await _within_budget(repo):
-        return
     # An issue that stopped for a human blocks the ones after it in a sequential project.
     # Both states mean that: agent:failed is out of retries, agent:blocked is a review that
     # would not pass. Either way the work is not on the base branch, so the next issue would
@@ -126,6 +128,19 @@ async def _poll_repo(repo: str) -> None:
         # so it can never overlap other work and never fires on a halted repo. Learning may
         # still start beside it — a learning run reads finished work, claims no issue, and
         # deliberately does not count as "busy" (UNCLAIMED_KINDS), so the two do not race.
+        #
+        # The daily ceiling gates this branch and only this branch. An issue somebody
+        # labelled is work that was asked for, and a factory that stops building what you
+        # queued because a planner had an expensive morning is a factory you turn the
+        # ceiling off in. What the ceiling is for is the loops: they are what dispatch
+        # without being asked, and they are the only things here that can run away.
+        #
+        # It still brakes the whole cycle, because the ceiling *counts* every kind. A plan
+        # run files issues, those issues build, that build spend lands on the day's total —
+        # and once the total is past the ceiling no further plan or learning run starts. The
+        # queue drains and stops growing, rather than being frozen halfway through.
+        if not await _within_budget(repo):
+            return
         await plan.maybe_plan(repo)
         # Nothing queued is the only moment a learning run may start. It is not urgent — the
         # evidence it reads is finished work and will still be there in half an hour — and
