@@ -485,6 +485,27 @@ async def tool_leaderboard(limit: int = 15) -> list[dict]:
     )
 
 
+async def spend_since(repo: str, since: str) -> float:
+    """What `repo` has spent across every run created at or after `since`, in USD.
+
+    Counts every kind, deliberately. A ceiling that excluded planning and learning runs would
+    exempt the two things that dispatch work without being asked — which is the entire reason
+    a daily ceiling exists rather than only a per-run one.
+
+    Reads `runs`, which this layer reads and never writes.
+    """
+    rows = await _rows(
+        f"""
+        SELECT COALESCE(SUM({COST_SQL}), 0) AS spend
+        {PRICE_JOIN}
+        JOIN runs r ON r.id = c.run_id
+        WHERE r.repo = ? AND r.created_at >= ?
+        """,
+        (repo, since),
+    )
+    return float(rows[0]["spend"] if rows else 0.0)
+
+
 async def skill_loads_by_repo(since: str | None = None) -> list[dict]:
     """Which skills each repo's runs actually loaded, and how recently.
 

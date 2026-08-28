@@ -103,6 +103,17 @@ def provision_semaphore() -> asyncio.Semaphore:
 RUN_PREFIX = "run-"
 REVIEW_PREFIX = "rev-"
 PROVISION_PREFIX = "prov-"
+class BudgetExceeded(RuntimeError):
+    """A run spent more than `FACTORY_MAX_RUN_COST` and was stopped.
+
+    Its own type because of what must *not* happen next. Every other failure a build can
+    suffer is worth another attempt — a crash, a timeout, a VM that vanished — and
+    `_fail_run` retries up to `max_attempts`. This one is the opposite: the run was stopped
+    precisely because it was consuming money without converging, and retrying it twice more
+    is how one lost run costs three times the ceiling that was meant to bound it.
+    """
+
+
 PLAN_PREFIX = "plan-"
 LEARN_PREFIX = "learn-"
 VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, PLAN_PREFIX, LEARN_PREFIX)
@@ -1981,16 +1992,22 @@ async def _fail_run(
     log: RunLog,
     pr_url: str | None = None,
     review_cycle: int = 1,
+    retryable: bool = True,
 ) -> None:
     """Mark a run failed, then either schedule a retry or halt the issue.
 
     Retry ceiling is `settings.max_attempts`. The retry is created *before* this run is
     marked terminal, so the repo never looks idle to the poller in the gap — which would let
     the next issue in the sequence jump the queue.
+
+    `retryable=False` halts the issue whatever the attempt count says. A run stopped for
+    spending past its ceiling is the case that needs it: the budget exists to bound what one
+    issue can cost, and a ceiling that permits two more attempts is a ceiling of three times
+    the number written in the config.
     """
     number = issue["number"]
     scheduled = False
-    if attempt < settings.max_attempts:
+    if retryable and attempt < settings.max_attempts:
         try:
             await create(
                 repo,
@@ -2547,9 +2564,15 @@ async def _guarded(
         # happened. Name it, and fall back to the exception class for anything else silent.
         if isinstance(exc, asyncio.TimeoutError):
             reason = f"timed out after {settings.run_timeout}s"
+        elif isinstance(exc, BudgetExceeded):
+            reason = f"over budget: {exc}"
         else:
             reason = f"crashed: {str(exc)[:200] or type(exc).__name__}"
-        await _fail_run(run_id, repo, issue, attempt, reason, log, review_cycle=review_cycle)
+        await _fail_run(
+            run_id, repo, issue, attempt, reason, log, review_cycle=review_cycle,
+            # The one failure that must not buy another go at the same issue.
+            retryable=not isinstance(exc, BudgetExceeded),
+        )
     finally:
         await _salvage_usage(run_id, log)
         log.close()
@@ -3051,7 +3074,22 @@ async def _stream(
                     # one — `_salvage_usage` fills the ledger from rows where there
                     # are any.
                     usage = recorder.summary(event) or usage
-                    await recorder.feed(event)
+                    if await recorder.feed(event) and settings.max_run_cost:
+                        # A turn just closed, so the derived cost has moved and this is the
+                        # cheapest moment it can be read. The wall clock was never the right
+                        # ceiling — a run can burn the budget in twenty minutes or idle for
+                        # ninety — and the number this compares against is the same one every
+                        # report uses, not an estimate made here.
+                        spent = await recorder.cost()
+                        if spent > settings.max_run_cost:
+                            log.write(
+                                f"[factory] run stopped at ${spent:.2f}, over the "
+                                f"${settings.max_run_cost:.2f} ceiling"
+                            )
+                            raise BudgetExceeded(
+                                f"stopped at ${spent:.2f}, over the "
+                                f"${settings.max_run_cost:.2f} per-run ceiling"
+                            )
                     for formatted in stream_lines(event, line):
                         log.write(formatted)
                     better = _better_receipt(receipt, _receipt_candidates(event))

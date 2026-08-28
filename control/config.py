@@ -100,9 +100,26 @@ class Settings:
     # Hard ceiling on one agent run. Observed successful runs took 27-53 minutes, so 60
     # minutes killed work that was still going somewhere (and did it silently). 90 leaves
     # real headroom; it must stay comfortably below FACTORY_AUTO_DESTROY, which is the VM's
-    # own self-destruct. The right long-term ceiling is spend, not wall clock — see
-    # backlog.md §8.
+    # own self-destruct. The right long-term ceiling is spend, not wall clock — which is the
+    # pair below.
     run_timeout: int = int(os.environ.get("FACTORY_RUN_TIMEOUT", "5400"))
+    # What one run may spend before it is aborted, in USD. Checked at every turn boundary
+    # against the derived cost of the rows already written, so it is a threshold on a number
+    # that exists rather than an estimate. 0 switches it off.
+    #
+    # $25 is roughly twice the measured cost of a shipped issue ($11.44 across 47 runs), so a
+    # run that reaches it is not expensive, it is lost — and a run aborted here is never
+    # retried, because a retry is how one lost run becomes three.
+    max_run_cost: float = float(os.environ.get("FACTORY_MAX_RUN_COST", "25"))
+    # What one repo may spend in a UTC day across every run, in USD. 0 switches it off.
+    #
+    # This is the one that bounds a *loop*, and the per-run ceiling does not imply it: the
+    # planner files up to FACTORY_PLAN_MAX_ISSUES issues, each of which builds well under $25,
+    # and then plans again when the queue drains. Nothing in that cycle is individually
+    # expensive and nothing in it terminates except an agent deciding the goal is met. Before
+    # the goal and improvement loops there was one dispatcher — a human labelling issues — and
+    # this ceiling would have had nothing to stop.
+    max_repo_daily_cost: float = float(os.environ.get("FACTORY_MAX_REPO_DAILY_COST", "100"))
     # Seconds a single shell command may run before the agent's tooling backgrounds it, and
     # the ceiling it may request for one. Both are far above any legitimate command here
     # (the longest observed build was 153s) because a backgrounded command is what the agent

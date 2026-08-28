@@ -26,10 +26,50 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from telemetry import store as telemetry
+
 from . import db, github, plan, repos, runner
 from .config import settings
 
 log = logging.getLogger("factory.poller")
+
+# Repos already reported as over budget today, so the log says it once rather than on every
+# tick for the rest of the day. Cleared when the day rolls over.
+_over_budget: dict[str, str] = {}
+
+
+async def _within_budget(repo: str) -> bool:
+    """Whether `repo` may still spend today.
+
+    The ceiling that bounds a *loop*, and the reason the per-run one does not: the planner
+    files issues, those issues build for well under the per-run ceiling each, the queue
+    drains, and it plans again. Nothing in that cycle is individually expensive and nothing
+    in it terminates except an agent judging the goal met.
+
+    Enforced here rather than in `runner.create` so it governs only the paths that dispatch
+    without being asked. A human starting a run through the API is overriding the cadence
+    deliberately, the same way a hand-started build overrides the queue — and an operator
+    locked out of their own factory by a ceiling they set is an operator who switches the
+    ceiling off.
+    """
+    if not settings.max_repo_daily_cost:
+        return True
+    day = db.utcnow()[:10]
+    try:
+        spent = await telemetry.spend_since(repo, f"{day}T00:00:00+00:00")
+    except Exception:  # noqa: BLE001 - a ceiling that cannot read spend must not halt work
+        log.exception("could not read today's spend for %s; allowing dispatch", repo)
+        return True
+    if spent <= settings.max_repo_daily_cost:
+        _over_budget.pop(repo, None)
+        return True
+    if _over_budget.get(repo) != day:
+        _over_budget[repo] = day
+        log.warning(
+            "%s has spent $%.2f today, over the $%.2f ceiling; no further dispatches "
+            "until UTC midnight", repo, spent, settings.max_repo_daily_cost,
+        )
+    return False
 
 _task: asyncio.Task | None = None
 
@@ -58,6 +98,11 @@ async def _poll_repo(repo: str) -> None:
     # One run per repo at a time. This is what makes a numbered issue list sequential:
     # #2 does not start until #1 has reached a terminal state (its retries included).
     if await db.has_active_run(repo):
+        return
+    # Nothing this repo does costs money past its daily ceiling — builds, plans and learning
+    # runs alike. Checked before the halt labels rather than after, because both answers are
+    # "do not dispatch" and this one costs a local query where that one costs two API calls.
+    if not await _within_budget(repo):
         return
     # An issue that stopped for a human blocks the ones after it in a sequential project.
     # Both states mean that: agent:failed is out of retries, agent:blocked is a review that
