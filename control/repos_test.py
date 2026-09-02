@@ -99,7 +99,7 @@ check("seed: FACTORY_REPOS fills an empty register",
       seed("acme/api", "acme/web"), ("acme/api", "acme/web"))
 check("seed: and the rows carry everything the register knows",
       sorted(repos.rows()[0]),
-      ["added_at", "agent", "goal", "goal_state", "golden", "last_planned_at",
+      ["added_at", "agent", "goal_sha", "goal_state", "golden", "last_planned_at",
        "plan_stalls", "provision_status", "repo"])
 check("seed: a repo nobody could parse is skipped rather than watched",
       seed("acme/api", "not a repo", "acme/web"), ("acme/api", "acme/web"))

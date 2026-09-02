@@ -524,33 +524,17 @@ async def api_delete_golden(owner: str, name: str):
         raise HTTPException(400, str(exc)) from exc
 
 
-class RepoGoal(BaseModel):
-    # Null or empty clears the goal; anything else sets it and activates the loop.
-    goal: str | None = None
-
-
-@app.patch("/api/repos/{owner}/{name}")
-async def api_set_goal(owner: str, name: str, body: RepoGoal):
-    """Set, change or clear a repo's goal — the endstate the goal loop plans toward.
-
-    The state transition rides on the write (see `repos.set_goal`): new text activates,
-    unchanged text is a no-op, empty text removes the goal. Whether anything *happens* next
-    is the poller's business — with FACTORY_PLAN off this is a note on the register and
-    nothing more, which the UI says rather than hides.
-    """
-    repo = f"{owner}/{name}"
-    try:
-        row = await repos.set_goal(repo, body.goal)
-    except ValueError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    return {"repo": repo, "goal": row.get("goal"), "goal_state": row.get("goal_state")}
+# There is deliberately no set-goal endpoint anymore. The goal is `.factory/goal.md`,
+# committed in the repo itself — one file, one source of truth, and the only channel that can
+# carry the images and context a rich goal wants. The poller notices the commit within
+# `plan.GOAL_SYNC_INTERVAL` and arms the loop; nothing about that is an API write.
 
 
 @app.post("/api/repos/{owner}/{name}/replan")
 async def api_replan(owner: str, name: str):
     """Put a `met` or `stalled` goal back to `active`, so the next dry tick plans again.
 
-    The way past a stall without re-typing the goal, and the way to re-open a goal the
+    The way past a stall without editing the goal file, and the way to re-open a goal the
     factory declared met. Re-activating an already-active goal is harmlessly idempotent.
     """
     repo = f"{owner}/{name}"
@@ -616,10 +600,11 @@ async def api_projects():
                 # Learnings this repo's runs proposed and nobody has decided on yet. Scoped by
                 # `repo`, so one project's queue never shows up under another's.
                 "pending_candidates": pending.get(repo, 0),
-                # The goal loop: the endstate this repo is being built toward, and where the
+                # The goal loop: non-null means a committed `.factory/goal.md` is the goal,
+                # and this is its blob SHA as of the last sync. `goal_state` is where the
                 # loop stands — `none`, `active`, `met`, or `stalled`. `plan_enabled` rides
-                # along so the UI can say when a goal is set but the loop is switched off.
-                "goal": row.get("goal"),
+                # along so the UI can say when a goal exists but the loop is switched off.
+                "goal_sha": row.get("goal_sha"),
                 "goal_state": row.get("goal_state") or "none",
                 "plan_stalls": row.get("plan_stalls") or 0,
                 "last_planned_at": row.get("last_planned_at"),

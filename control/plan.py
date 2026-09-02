@@ -1,13 +1,22 @@
 """The goal loop: plan the next increment of a repo's backlog when its queue runs dry.
 
-A watched repo can carry a **goal** — prose describing the endstate of the project, written
-by a human through the API and stored on the register row. When the poller finds a repo with
-an active goal, no queued issues, no run in flight and its cooldown elapsed, it dispatches a
-run of this kind: an agent on a fresh VM that reads the repository as it actually is,
-compares it against the goal, and either files the next batch of `agent:queued` issues (in
-the factory-compose format, so each carries executable acceptance criteria) or declares the
-goal met. The existing pipeline then builds what was filed, and when the queue runs dry
-again the loop plans again — until a plan run finds nothing left to do.
+A watched repo can carry a **goal** — a committed file, `.factory/goal.md`, describing the
+endstate of the project in as much context as its author wants: prose, images, mockups,
+anything that can live in the repo beside it. The file is the only goal source, and it
+reaches the planner the only way pictures can reach a VM: through the checkout. This plane
+keeps just the file's blob SHA (`sync_goal_file` below, called from the poller's dry-queue
+branch): a commit that changes the file arms the loop, or re-arms it from `met`/`stalled` —
+editing the goal is asking for more — and deleting the file removes the goal.
+
+When the poller finds a repo with an active goal, no queued issues, no run in flight and its
+cooldown elapsed, it dispatches a run of this kind: an agent on a fresh VM that reads the
+goal file from its checkout, fragments it into features, and advances exactly one feature
+per pass. Each feature is a parent issue labelled `agent:feature` — structure, never
+dispatched — whose buildable sub-issues carry `agent:queued` in the factory-compose format,
+so each has executable acceptance criteria. The existing pipeline builds what was filed, and
+when the queue runs dry again the loop plans again: it closes parents whose features it can
+verify, continues an unfinished one, or opens the next — until a pass finds every fragment
+of the goal file satisfied and no parent left open.
 
 ## Why planning happens in a VM
 
@@ -37,7 +46,9 @@ fruitless plans (crashed, no verdict, or claimed issues that never appeared) mar
 `stalled` and hand it to a human. And `FACTORY_PLAN_MAX_ISSUES` caps one pass's output —
 an instruction the prompt carries and the control plane observes, since an issue cannot be
 un-created. Halt-on-failure needs no fence here: the poller checks it before it ever reaches
-the empty-queue branch this module hangs off.
+the empty-queue branch this module hangs off. One deliberate softening: a commit to the goal
+file resets the stall count, so a repeatedly edited goal can keep planning — a human editing
+the file is a human asking, and the daily spend ceiling bounds what that can cost.
 
 ## Modelled as a run
 
@@ -54,6 +65,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 
@@ -63,6 +75,17 @@ from .config import settings
 log = logging.getLogger("factory.plan")
 
 PLAN_VERDICT_PATH = "/tmp/factory-plan.json"
+
+# Where a repo keeps its goal. A fixed path like `.factory.md`'s, and deliberately a file in
+# its own directory: the images and mockups a goal references live beside it.
+GOAL_PATH = ".factory/goal.md"
+
+# Seconds between contents-API checks of one repo's goal file. In-process rather than a
+# column, like the poller's `_labelled` set: a restart just checks once more, and ~5 minutes
+# of detection latency is nothing against a 15-minute plan cooldown. No env knob — nobody
+# tunes this.
+GOAL_SYNC_INTERVAL = 300
+_goal_synced: dict[str, float] = {}  # repo -> monotonic time of the last check
 
 # Written into a fruitless plan run's `error` column, with the summary after it — the same
 # shape as runner's REVIEW_* tags, and for the same reader: a run whose status says
@@ -91,31 +114,42 @@ PLAN_PROMPT_TEMPLATE = """You are the planner for an autonomous software factory
 alone in a VM on a checkout of {repo} at its default branch (`{base}`). The factory builds
 GitHub issues labelled `agent:queued`, lowest number first, one at a time, and reviews each
 against its acceptance criteria before merging. The queue is empty. Your job is to compare
-the repository as it exists against its goal, and either declare the goal met or create the
-next batch of issues.
+the repository as it exists against its goal and advance it by exactly one feature — or
+declare the goal met.
 
 --- the goal ---
 {goal}
 --- end goal ---
 
 How to work:
-1. Learn the current state. Read the code, the README, `.factory.md` and `.mem/` if they
-   exist. Then read the history of work: `gh issue list --repo {repo} --state closed
-   --limit 200` for what has shipped, and `gh issue list --repo {repo} --state open` for
-   what is already filed. An open issue that covers work you would plan means you do not
-   file it again.
-2. Judge the gap. For each part of the goal, find evidence in the repository that it is
-   satisfied — a file you read, a command you ran, a feature that demonstrably works. Not a
-   hope: something you observed.
-3. If every part of the goal is satisfied, create nothing. Write the verdict (step 5) with
-   "goal_met": true and cite the evidence in "summary".
-4. Otherwise plan ONLY the next increment: at most {max_issues} issues that move the project
-   one coherent step toward the goal. Not the whole remaining backlog — the factory calls
-   you again when these are built, and a plan written against today's code is better than a
-   stale one written all at once. Order them by dependency and create them in that order:
-   they are built lowest issue number first, so an issue may assume everything filed before
-   it is already merged. Each issue must be independently buildable and verifiable by an
-   agent with no context beyond the issue text, and must carry these sections:
+1. Read the goal file first, and everything it references. Then learn the current state:
+   the code, the README, `.factory.md` and `.mem/` if they exist. Then the history of work:
+   `gh issue list --repo {repo} --state closed --limit 200` for what has shipped, and
+   `gh issue list --repo {repo} --state open` for what is in flight. Issues labelled
+   `agent:feature` are the plan's own structure: each is one feature of the goal, the parent
+   of the `agent:queued` sub-issues that build it. An open parent is a feature in progress;
+   a closed one is a feature done.
+2. Fragment the goal into features — one page, one functionality, one coherent capability
+   each — in dependency order. Re-derive the split every pass from the goal file and the
+   issue history; the issues are the record, there is no stored plan.
+3. Housekeeping: for each open `agent:feature` parent whose sub-issues are all closed,
+   judge the feature against the goal file — evidence in the repository, not hope: a file
+   you read, a command you ran, a feature that demonstrably works. Satisfied means you
+   close the parent with a one-line comment citing that evidence. Not satisfied means the
+   feature is unfinished, and it is the one you continue in step 5.
+4. If every fragment of the goal is satisfied and no `agent:feature` parent remains open,
+   create nothing. Write the verdict (step 6) with "goal_met": true and cite the evidence
+   in "summary".
+5. Otherwise work on exactly ONE feature: the unfinished parent from step 3 if there is
+   one, else the next unbuilt fragment. For a new fragment, first create its parent:
+     gh issue create --repo {repo} --title "<feature>" --body-file <file> --label "agent:feature"
+   — the body is the fragment's scope distilled from the goal file and what "done" looks
+   like. Never give a parent the `agent:queued` label: parents are structure, not work.
+   Then file the feature's sub-issues (for an existing parent, only the missing ones): at
+   most {max_issues}, in dependency order — they are built lowest number first, so an issue
+   may assume everything filed before it is already merged. Each must be independently
+   buildable and verifiable by an agent with no context beyond the issue text, and must
+   carry these sections:
    - `## Task` — what to build and why, self-contained.
    - `## Where this goes` — the files/directories the work is expected to land in (advisory).
    - `## Boundaries` — including a `Never:` lane for what the builder must not touch.
@@ -127,18 +161,23 @@ How to work:
      executed is a criterion that blocks the issue forever.
    If the `factory-compose` skill is installed, load it and follow its issue template
    exactly (skip its interactive approval flow — there is nobody here to approve).
-   Create each issue with:
+   Create each sub-issue with:
      gh issue create --repo {repo} --title "<title>" --body-file <file> --label "agent:queued"
-   and record the issue number each create prints.
-5. Your final act: write /tmp/factory-plan.json and nothing after it:
-   {{"goal_met": true|false, "issues_created": [<numbers in creation order>],
+   record the number each create prints, and link it under its parent:
+     gh api repos/{repo}/issues/<parent>/sub_issues -F sub_issue_id=$(gh api repos/{repo}/issues/<number> --jq .id)
+   If linking fails, list the sub-issue numbers as a task list in the parent's body instead
+   and move on — the link is bookkeeping, not the work.
+6. Your final act: write /tmp/factory-plan.json and nothing after it:
+   {{"goal_met": true|false, "issues_created": [<sub-issue numbers in creation order>],
      "summary": "<what you found, what you planned, or the evidence the goal is met>"}}
+   `issues_created` holds the `agent:queued` sub-issues you filed; a parent is not work.
 
 Hard rules:
 - Do not modify the repository. No commits, no pushes, no branches, no pull requests, no
-  editing or closing existing issues. Creating new issues and writing the verdict file is
-  the entirety of your output.
-- At most {max_issues} issues. Fewer is better; the factory loops.
+  editing or closing existing issues — with one exception: closing an `agent:feature`
+  parent whose sub-issues are all closed and whose feature you verified (step 3). Creating
+  new issues and writing the verdict file is the entirety of your other output.
+- One feature per pass, at most {max_issues} sub-issues. Fewer is better; the factory loops.
 - Run long commands in the foreground with an explicit timeout, e.g. `timeout 600 <cmd>`.
   Background tasks never deliver notifications here; a run that waits for one dies silent.
 
@@ -146,6 +185,60 @@ This project, as it describes itself:
 
 {project_notes}
 """
+
+
+# --------------------------------------------------------------------------- the goal file
+
+
+async def sync_goal_file(repo: str) -> None:
+    """Notice commits to `repo`'s goal file, arming or re-arming its goal.
+
+    The poller's other hook on the dry-queue branch, sitting *above* the budget gate because
+    one contents-API GET spends no model tokens — an over-budget repo still gets to wake up;
+    what stays gated is the planning that follows. It also has to run for `met` and
+    `stalled` repos, which `maybe_plan` never reaches: this is the only place a finished or
+    parked goal can come back to life from a commit alone.
+
+    The throttle stamp lands *before* the fetch, the same reasoning as `record_plan_start`:
+    a GitHub that errors is retried once per interval, not once per poll tick. And an error
+    makes no transition at all — "unknown" must never read as "the goal was deleted", or a
+    GitHub incident would clear every goal on the board.
+    """
+    if not settings.plan_enabled:
+        return
+    now = time.monotonic()
+    last = _goal_synced.get(repo)
+    if last is not None and now - last < GOAL_SYNC_INTERVAL:
+        return
+    _goal_synced[repo] = now
+    try:
+        sha = await github.file_sha(repo, GOAL_PATH)
+    except Exception as exc:  # noqa: BLE001 - unknown is not absent; try again next interval
+        log.warning("could not check %s's goal file: %r", repo, exc)
+        return
+    before = (repos.row(repo) or {}).get("goal_state")
+    row = await repos.apply_goal_file(repo, sha)
+    if row.get("goal_state") != before:
+        log.info(
+            "%s goal file %s: goal_state %s -> %s",
+            repo, "changed" if sha else "gone", before, row.get("goal_state"),
+        )
+
+
+def goal_prompt(sha: str) -> str:
+    """The goal slot of the plan prompt: point at the file, never splice its content.
+
+    The file reaches the planner through the checkout, which is what lets it carry images —
+    an env var cannot. It also means the agent reads the file as it is at HEAD, which may be
+    newer than the SHA the sync last recorded; that is the fresher goal, and the next sync
+    catches the register up.
+    """
+    return (
+        f"The goal is a committed file in this repository: `{GOAL_PATH}` (blob {sha} when "
+        "the factory last checked). Read it from your checkout as your very first step, and "
+        "Read any images or other files it references — they are part of the goal. The file "
+        "is authoritative: judge the repository against it, not against any summary of it."
+    )
 
 
 # --------------------------------------------------------------------------- pure decisions
@@ -180,7 +273,9 @@ def should_plan(row: dict | None, now: str, enabled: bool, cooldown: int) -> boo
         return False
     if row.get("goal_state") != repos.GOAL_ACTIVE:
         return False
-    if not (row.get("goal") or "").strip():
+    # A goal is a committed `.factory/goal.md` the sync has seen. Waking a `met` or
+    # `stalled` repo when that file changes is the sync's transition, not this gate's.
+    if not row.get("goal_sha"):
         return False
     return cooldown_elapsed(row.get("last_planned_at"), now, cooldown)
 
@@ -262,9 +357,10 @@ async def create(repo: str) -> str:
     row = repos.row(repo)
     if row is None:
         raise ValueError(f"{repo} is not watched")
-    goal = (row.get("goal") or "").strip()
-    if not goal:
-        raise ValueError(f"{repo} has no goal; set one before planning")
+    sha = row.get("goal_sha")
+    if not sha:
+        raise ValueError(f"{repo} has no goal; commit {GOAL_PATH} before planning")
+    goal = goal_prompt(sha)
 
     run_id = uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"

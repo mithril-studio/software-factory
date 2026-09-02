@@ -15,10 +15,12 @@ time — so a numbered sequence executes in order without any dependency graph. 
 not the issue label, is the source of truth for what is already running
 (`db.has_active_run`), so a slow label write can never cause a double dispatch.
 
-When the queue is dry the loop no longer necessarily stops: a repo with an active goal gets
-a plan run, which files the next issues toward that goal or declares it met. That hook
-lives at the bottom of `_poll_repo`, after every guard above it, and is a no-op unless the
-deployment opted in.
+When the queue is dry the loop no longer necessarily stops. First the goal-file sync
+(`plan.sync_goal_file`) checks whether `.factory/goal.md` changed in the repo — the commit
+that arms a goal, or re-arms a met or stalled one. Then a repo with an active goal gets a
+plan run, which files the next feature's issues toward that goal or declares it met. Both
+hooks live at the bottom of `_poll_repo`, after every guard above them, and are no-ops
+unless the deployment opted in.
 """
 
 from __future__ import annotations
@@ -139,6 +141,11 @@ async def _poll_repo(repo: str) -> None:
         # run files issues, those issues build, that build spend lands on the day's total —
         # and once the total is past the ceiling no further plan or learning run starts. The
         # queue drains and stops growing, rather than being frozen halfway through.
+        # Before the budget gate, not behind it: syncing the goal file is one GitHub GET
+        # (throttled inside) and spends no model tokens, and it must run even for repos the
+        # ceiling has stopped and for goals in `met` or `stalled` — this is the only seam
+        # where a commit to `.factory/goal.md` can arm or re-arm a goal.
+        await plan.sync_goal_file(repo)
         if not await _within_budget(repo):
             return
         await plan.maybe_plan(repo)

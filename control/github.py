@@ -33,6 +33,10 @@ LABEL_RUNNING = "agent:running"
 LABEL_BLOCKED = "agent:blocked"
 LABEL_DONE = "agent:done"
 LABEL_FAILED = "agent:failed"
+# Not a lifecycle state: a feature tracking issue the planner files as the parent of its
+# `agent:queued` sub-issues. Never dispatched — the poller only reads LABEL_QUEUED — and
+# closed by a later plan run once every sub-issue under it is done and verified.
+LABEL_FEATURE = "agent:feature"
 
 # name -> (hex color, description), used by ensure_labels to create them if absent.
 LIFECYCLE_LABELS = {
@@ -41,6 +45,7 @@ LIFECYCLE_LABELS = {
     LABEL_BLOCKED: ("b48ead", "Factory: blocked, needs a human"),
     LABEL_DONE: ("4ec9a5", "Factory: finished, pull request opened"),
     LABEL_FAILED: ("f2777a", "Factory: run failed"),
+    LABEL_FEATURE: ("6f42c1", "Factory: feature tracking issue, parent of queued sub-issues"),
 }
 
 
@@ -144,6 +149,34 @@ async def file(repo: str, path: str, ref: str) -> str | None:
     if resp.status_code != 200:
         return None
     return resp.text
+
+
+async def file_sha(repo: str, path: str) -> str | None:
+    """The git blob SHA of one file on the default branch. None when there is no such file.
+
+    The goal-file sync's read: it compares SHAs across polls, so it needs the identity of the
+    content, not the content itself. JSON headers rather than `vnd.github.raw` because the
+    contents object is what carries `sha`. No `ref` parameter — omitting it makes the API
+    answer for the default branch, which saves the `default_branch` round trip.
+
+    Three answers, deliberately distinct: a SHA (the file exists and has content), None (a
+    definite "not there" — 404, a directory, or an empty file, which is no goal at all), or
+    a raised error for anything else. The caller treats "unknown" differently from "absent":
+    a GitHub 500 must not read as "the goal was deleted".
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/contents/{path}",
+            headers=_headers(),
+            follow_redirects=True,
+        )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or data.get("type") != "file" or not data.get("size"):
+        return None
+    return data.get("sha") or None
 
 
 async def repo_info(repo: str) -> dict | None:

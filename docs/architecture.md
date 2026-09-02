@@ -214,18 +214,29 @@ tested sha, and repairs a merge conflict once by merging base into the branch.
 State mirrors to the issue as five labels — `agent:queued|running|blocked|done|failed` — the
 whole human-facing contract. An open `agent:failed` or `agent:blocked` issue halts that
 repo's queue (`FACTORY_HALT_ON_FAILURE`), so the factory never builds on top of a failure.
+The planner adds a sixth, `agent:feature`, which is structure rather than state: the parent
+a feature's queued sub-issues hang under, never dispatched, closed by a later plan run once
+everything beneath it is done and verified.
 
 **The goal loop** (`FACTORY_PLAN`, off by default) is what makes the pipeline self-serving.
-A watched repo can carry a *goal* — prose describing the project's endstate, set through the
-API and stored on the register. When the queue runs dry for a repo whose goal is `active`,
-the poller dispatches a `plan` run: an agent on a VM that reads the repo as it is, judges the
-gap against the goal, and either files the next increment of issues (factory-compose format,
-labelled `agent:queued`, at most `FACTORY_PLAN_MAX_ISSUES` per pass) or declares the goal
-met. The control plane verifies rather than trusts: `met` requires the verdict *and* an
-empty queue on GitHub, a queued issue outranks any claim, and `FACTORY_PLAN_MAX_STALLS`
-consecutive fruitless plans park the goal as `stalled` for a human. A cooldown
-(`FACTORY_PLAN_COOLDOWN`) bounds the cadence, and the hook sits below the halt check — a
-halted repo never plans. `control/plan.py` holds the whole loop.
+A watched repo can carry a *goal*: a committed `.factory/goal.md` describing the project's
+endstate in whatever the file's author needs — prose, images, mockups, all living beside it
+in `.factory/` and reaching the planner through the checkout, the one channel that can carry
+pictures to a VM. The control plane keeps only the file's blob SHA (one throttled contents
+GET per repo per ~5 minutes, on the dry-queue branch above the budget gate): a commit that
+changes the file arms the goal or re-arms a `met`/`stalled` one, and deleting it clears the
+goal. When the queue runs dry for a repo whose goal is `active`, the poller dispatches a
+`plan` run: an agent on a VM that reads the goal file from its checkout, fragments it into
+features, and advances exactly one per pass — a parent issue labelled `agent:feature` as the
+chapter (structure, never dispatched), at most `FACTORY_PLAN_MAX_ISSUES` sub-issues in
+factory-compose format labelled `agent:queued` as the work. The next pass closes parents it
+can verify against the goal file and opens the next feature. The control plane verifies
+rather than trusts: `met` requires the verdict *and* an empty queue on GitHub, a queued
+issue outranks any claim, and `FACTORY_PLAN_MAX_STALLS` consecutive fruitless plans park
+the goal as `stalled` for a human — though an edit to the goal file resets that count, since
+a human editing the goal is a human asking, with the daily spend ceiling bounding the cost.
+A cooldown (`FACTORY_PLAN_COOLDOWN`) bounds the cadence, and the hook sits below the halt
+check — a halted repo never plans. `control/plan.py` holds the whole loop.
 
 ## §5 What it deliberately does not have
 

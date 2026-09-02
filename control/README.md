@@ -23,10 +23,11 @@ poll GitHub issues
                   └─► salvage transcript, harvest memory candidates, destroy VM
                       └─► review run ─► CI ─► merge   (fix cycles loop back)
 
-queue dry + active goal (FACTORY_PLAN)
-  └─► plan run              (agent on a VM: repo vs goal)
-      └─► files the next `agent:queued` issues ──► the loop above
-          or declares the goal met ──► repo idles until its goal changes
+queue dry (FACTORY_PLAN)
+  └─► sync `.factory/goal.md` by SHA   (a commit arms the goal, or re-arms met/stalled)
+      └─► plan run          (agent on a VM: repo vs the goal file, one feature per pass)
+          └─► files an `agent:feature` parent + `agent:queued` sub-issues ──► the loop above
+              or declares the goal met ──► repo idles until its goal file changes
 ```
 
 Every phase of an issue is a `runs` row of its own `kind` — `build`, `review`, `ci`,
@@ -44,7 +45,7 @@ One module per concern:
 | `agents` | Snapshot resolution: `golden-<repo-slug>` → `golden-copy` |
 | `goldens` | Periodic re-list of golden snapshots into the `snapshots` table |
 | `provision` | Build a repo's warm golden, as a run of `kind='provision'` |
-| `plan` | The goal loop: plan the next issues toward a repo's goal when its queue runs dry |
+| `plan` | The goal loop: sync `.factory/goal.md`, plan the next feature toward it when the queue runs dry |
 | `preflight` | Is a repo ready? Labels, token scopes, golden — boots nothing |
 | `github` | Every GitHub API call: issues, labels, PRs, checks, merge |
 | `memory` | The `.mem/` validator; a CI gate (§5) |

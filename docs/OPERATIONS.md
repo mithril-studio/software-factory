@@ -376,7 +376,7 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `FACTORY_MAX_REVIEW_CYCLES` | Fix cycles per issue (2). |
 | `FACTORY_MAX_ATTEMPTS` | Crash retries per issue (3). |
 | `FACTORY_HALT_ON_FAILURE` | Halt a repo's queue on an open `agent:failed`/`agent:blocked` issue. On by default. |
-| `FACTORY_PLAN` | The goal loop: plan new issues toward a repo's goal when its queue runs dry. **Off by default** — it files issues, which is autonomous spend. Cadence and caps: `FACTORY_PLAN_COOLDOWN` (900s), `FACTORY_PLAN_MAX_STALLS` (2), `FACTORY_PLAN_MAX_ISSUES` (6). |
+| `FACTORY_PLAN` | The goal loop: plan new issues toward a repo's committed `.factory/goal.md` when its queue runs dry, one feature per pass. **Off by default** — it files issues, which is autonomous spend. Cadence and caps: `FACTORY_PLAN_COOLDOWN` (900s), `FACTORY_PLAN_MAX_STALLS` (2), `FACTORY_PLAN_MAX_ISSUES` (6). |
 | `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
 | `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
 | `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |
@@ -404,9 +404,10 @@ exhaustive list is `control/app.py`.
   `GET /api/preflight?repo=`, `POST`/`DELETE /api/repos/{owner}/{name}/golden`,
   `POST /api/goldens/refresh`, `GET /api/goldens`, `GET /api/machines`,
   `POST /api/reconcile`
-- **Goals** — `PATCH /api/repos/{owner}/{name}` `{"goal": "..."}` sets, edits or (empty)
-  clears the goal the plan loop builds toward; `POST .../replan` re-arms a `met` or
-  `stalled` goal. `POST /api/runs` with `kind: "plan"` plans now, ignoring the cooldown.
+- **Goals** — the goal itself is not an API: it is `.factory/goal.md`, committed in the
+  repo, noticed by SHA within ~5 minutes. `POST .../replan` re-arms a `met` or `stalled`
+  goal without editing the file. `POST /api/runs` with `kind: "plan"` plans now, ignoring
+  the cooldown.
 - **Memory** — `GET /api/memory/candidates`, `POST /api/memory/candidates/{id}/accept`
   or `.../reject` — the triage queue for learnings the agent proposed. No UI consumer yet;
   it is curl territory.

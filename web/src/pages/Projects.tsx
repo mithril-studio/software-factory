@@ -7,7 +7,6 @@ import {
   dropGolden,
   preflight,
   replan,
-  setGoal,
   usePoll,
   warmGolden,
   type Connected,
@@ -195,12 +194,12 @@ function GoalState({ p }: { p: Project }) {
   return null
 }
 
-/** Read, edit and re-arm a repo's goal — the endstate the factory plans toward when this
- *  repo's queue runs dry. Each cell manages its own editor; the register row is small and
- *  the 15-second projects poll refreshes the read view underneath it. */
+/** Where a repo's goal stands. Read-only by design: the goal itself is `.factory/goal.md`,
+ *  committed in the repo — one file, one source of truth, with the images and context a
+ *  goal wants living beside it in the checkout. Committing a change to it (re-)arms the
+ *  loop within minutes; the only action this cell offers is Replan, which re-arms without
+ *  an edit. */
 function GoalCell({ p, onChanged }: { p: Project; onChanged: () => void }) {
-  const [editing, setEditing] = useState(false)
-  const [text, setText] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -209,7 +208,6 @@ function GoalCell({ p, onChanged }: { p: Project; onChanged: () => void }) {
     setError(null)
     try {
       await work()
-      setEditing(false)
       onChanged()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -218,48 +216,24 @@ function GoalCell({ p, onChanged }: { p: Project; onChanged: () => void }) {
     }
   }
 
-  if (editing) {
-    return (
-      <div className="flex min-w-64 flex-col gap-2 py-1">
-        <textarea
-          className="min-h-20 w-full border border-input bg-background p-2 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          value={text}
-          disabled={busy}
-          placeholder="The endstate: what should this project be when it is done?"
-          onChange={(e) => setText(e.target.value)}
-        />
-        <div className="flex items-center gap-2">
-          <Button size="sm" disabled={busy} onClick={() => act(() => setGoal(p.repo, text))}>
-            {busy ? "Saving…" : "Save"}
-          </Button>
-          <Button variant="ghost" size="sm" disabled={busy} onClick={() => setEditing(false)}>
-            Cancel
-          </Button>
-          {error && <span className="font-mono text-[10px] text-bad">{error}</span>}
-        </div>
-      </div>
-    )
-  }
-
   return (
     <div className="flex items-center gap-2">
       <GoalState p={p} />
-      {p.goal && (
-        <span className="max-w-56 truncate text-xs text-muted-foreground" title={p.goal}>
-          {p.goal}
+      {p.goal_sha ? (
+        <span
+          className="font-mono text-xs text-muted-foreground"
+          title="The goal is .factory/goal.md, committed in this repo. Any commit that changes it re-arms planning — even after the goal was met."
+        >
+          .factory/goal.md @ {p.goal_sha.slice(0, 7)}
+        </span>
+      ) : (
+        <span
+          className="text-xs text-muted-foreground"
+          title="Commit a .factory/goal.md to this repo — prose, images, mockups — and the factory plans toward it whenever the queue runs dry."
+        >
+          no goal — commit .factory/goal.md
         </span>
       )}
-      <Button
-        variant="ghost"
-        size="sm"
-        title="The goal loop: when this repo's queue runs dry, a plan run compares it against this text and files the next issues or declares it met."
-        onClick={() => {
-          setText(p.goal ?? "")
-          setEditing(true)
-        }}
-      >
-        {p.goal ? "Edit" : "Set goal"}
-      </Button>
       {(p.goal_state === "met" || p.goal_state === "stalled") && (
         <Button
           variant="ghost"
