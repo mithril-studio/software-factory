@@ -300,7 +300,7 @@ export function Runs() {
       <PageHeader
         kicker="Dispatch log"
         title="Runs"
-        subtitle="Every attempt — issue in, pull request out. Open one to see its phases."
+        subtitle="Every attempt. Open one to see its phases."
         actions={
           <ProjectFilter
             projects={projects}

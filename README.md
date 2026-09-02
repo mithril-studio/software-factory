@@ -1,7 +1,5 @@
 # Software Factory
 
-GitHub issues in, reviewed pull requests out.
-
 A control plane watches your repos for queued issues. For each one it restores an isolated [boxd](https://boxd.sh) VM from a golden snapshot, runs a coding agent inside it, reviews and merges the pull request, and destroys the VM. You watch it all happen live in a web UI.
 
 The control plane is deterministic and contains no LLM. All intelligence lives in the agent, inside the VM.
