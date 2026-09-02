@@ -13,7 +13,15 @@ Run it directly, no framework needed:
 """
 import sys
 
-from control.plan import cooldown_elapsed, parse_plan_verdict, plan_outcome, should_plan
+from control.plan import (
+    GOAL_PATH,
+    PLAN_PROMPT_TEMPLATE,
+    cooldown_elapsed,
+    goal_prompt,
+    parse_plan_verdict,
+    plan_outcome,
+    should_plan,
+)
 
 fails = []
 
@@ -29,7 +37,7 @@ NOW = "2026-08-27T12:00:00+00:00"
 
 
 def row(**over):
-    base = {"goal": "a working CLI", "goal_state": "active", "last_planned_at": None}
+    base = {"goal_sha": "abc123", "goal_state": "active", "last_planned_at": None}
     base.update(over)
     return base
 
@@ -39,10 +47,13 @@ def row(**over):
 check("all-clear -> plan", should_plan(row(), NOW, enabled=True, cooldown=900))
 check("switched off -> never", should_plan(row(), NOW, enabled=False, cooldown=900), False)
 check("unwatched repo (no row) -> never", should_plan(None, NOW, enabled=True, cooldown=900), False)
-check("no goal -> nothing to plan toward",
-      should_plan(row(goal=None), NOW, enabled=True, cooldown=900), False)
-check("whitespace goal is no goal",
-      should_plan(row(goal="   "), NOW, enabled=True, cooldown=900), False)
+check("no goal file -> nothing to plan toward",
+      should_plan(row(goal_sha=None), NOW, enabled=True, cooldown=900), False)
+# The file is the only goal source. A row that somehow still carries prose (a database the
+# drop migration could not touch) must not count as having a goal.
+check("leftover goal prose without a file is no goal",
+      should_plan(row(goal_sha=None, goal="a working CLI"), NOW, enabled=True, cooldown=900),
+      False)
 check("goal met -> idle until a human or an edit re-arms it",
       should_plan(row(goal_state="met"), NOW, enabled=True, cooldown=900), False)
 check("stalled -> parked for a human",
@@ -117,6 +128,26 @@ check("and cannot hold the stall counter open at the cap",
 # cannot be walked back by another pass.
 check("a goal is not met while any work is queued, even work this run did not file",
       plan_outcome(True, True, 0, 2, filed=False)[0], "active")
+
+# ---------- the goal reaches the planner as a pointer, never as spliced content
+#
+# The goal file rides in the checkout because that is the only channel that can carry the
+# images it references. The prompt therefore points at the file; splicing its text here
+# would silently drop everything that is not text.
+
+check("goal_prompt names the file", GOAL_PATH in goal_prompt("abc123"))
+check("and the sha the sync recorded", "abc123" in goal_prompt("abc123"))
+check("and tells the agent to read what the file references",
+      "images" in goal_prompt("abc123"))
+
+# The prompt's methodology: one feature per pass, structured as an `agent:feature` parent
+# with `agent:queued` sub-issues. String containment, the same way the runner's prompt
+# properties are held elsewhere — the wording may drift, the contract may not.
+check("the plan prompt files feature parents", "agent:feature" in PLAN_PROMPT_TEMPLATE)
+check("and links their sub-issues", "sub_issues" in PLAN_PROMPT_TEMPLATE)
+check("and works one feature per pass", "ONE feature" in PLAN_PROMPT_TEMPLATE)
+check("and the verdict counts sub-issues, not parents",
+      "sub-issue numbers" in PLAN_PROMPT_TEMPLATE)
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

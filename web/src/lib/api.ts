@@ -135,8 +135,10 @@ export type Project = {
   failed: number
   active: number
   last_run: string | null
-  /** The endstate this repo is being built toward, or null when nobody has set one. */
-  goal: string | null
+  /** The goal is a committed `.factory/goal.md` in the repo; this is its git blob SHA as of
+   *  the factory's last check, or null when no goal file is known. Committing a change to
+   *  the file (re-)arms the goal loop; deleting it clears the goal. */
+  goal_sha: string | null
   /** Where the goal loop stands: `none` (no goal), `active` (planning may fire when the
    *  queue runs dry), `met` (a plan run verified the endstate against an empty queue), or
    *  `stalled` (consecutive fruitless plans — a human decides what happens next). */
@@ -410,19 +412,6 @@ export async function del<T>(url: string): Promise<T> {
   return resp.json()
 }
 
-export async function patch<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
-  if (!resp.ok) {
-    if (resp.status === 401) onUnauthorized()
-    throw new Error(await detail(resp))
-  }
-  return resp.json()
-}
-
 // ---- repos ----
 
 /** One repo the control plane's GitHub token can see. For the connect picker only — what a
@@ -472,13 +461,8 @@ export function dropGolden(repo: string): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/api/repos/${repo}/golden`)
 }
 
-/** Set, change or clear a repo's goal. Empty or null clears it; new text activates the
- *  loop; unchanged text is a server-side no-op, so saving twice cannot wake a met goal. */
-export function setGoal(repo: string, goal: string | null): Promise<{ goal_state: string }> {
-  return patch<{ goal_state: string }>(`/api/repos/${repo}`, { goal })
-}
-
-/** Put a `met` or `stalled` goal back to `active`, so the next dry poll tick plans again. */
+/** Put a `met` or `stalled` goal back to `active`, so the next dry poll tick plans again.
+ *  There is no set-goal call: the goal is `.factory/goal.md`, committed in the repo. */
 export function replan(repo: string): Promise<{ goal_state: string }> {
   return post<{ goal_state: string }>(`/api/repos/${repo}/replan`)
 }

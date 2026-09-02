@@ -116,9 +116,11 @@ async def record_golden(repo: str, golden: str | None, status: str) -> None:
 
 # --------------------------------------------------------------------------- the goal loop
 
-# What `goal_state` may hold. The transitions live in the two functions below and in
-# `plan.plan_outcome` — this module owns the human-driven ones (a goal written, a repo
-# reactivated), `plan` owns what a plan run's verdict does.
+# What `goal_state` may hold. Three writers own the transitions: `apply_goal_file` below
+# turns what the sync observed about `.factory/goal.md` into state (a commit arms or re-arms
+# the loop, a deletion clears it), `reactivate` is the one human-driven transition left, and
+# `plan.plan_outcome` owns what a plan run's verdict does. There is no set-goal API: the goal
+# is the committed file, and the way to change it is to change the file.
 GOAL_NONE, GOAL_ACTIVE, GOAL_MET, GOAL_STALLED = "none", "active", "met", "stalled"
 
 
@@ -127,23 +129,35 @@ def row(repo: str) -> dict | None:
     return _rows.get(repo)
 
 
-async def set_goal(repo: str, goal: str | None) -> dict:
-    """Write `repo`'s goal and derive its state from the edit. Returns the fresh row.
+def goal_file_transition(row: dict, sha: str | None) -> str | None:
+    """What state the observed goal-file SHA implies. None means no transition at all.
 
-    The transition is decided here, at the only writer, which is what lets `goal_state`
-    avoid needing a hash column: unchanged text is a no-op (so saving the form twice does
-    not wake a `met` repo), changed text reactivates whatever state the old goal earned
-    (met, stalled) and resets the stall count, and empty text removes the goal entirely.
+    An unchanged SHA — including "still no file" — is a no-op, which is what keeps a `met`
+    repo asleep across every sync. Any *changed* SHA re-arms to `active` from whatever the
+    old goal earned (met, stalled): a commit to the goal file is a human asking for more,
+    the same way editing the old textarea used to be. A SHA that disappeared means the file
+    was deleted, and with the file being the only goal source, that removes the goal.
+    """
+    old = row.get("goal_sha")
+    if sha == old:
+        return None
+    return GOAL_ACTIVE if sha else GOAL_NONE
+
+
+async def apply_goal_file(repo: str, sha: str | None) -> dict:
+    """Record what the goal-file sync observed, transitioning state if the file changed.
+
+    Returns the (possibly refreshed) register row. Stalls reset on every transition: a new
+    goal file starts with a clean slate, whatever the previous one earned.
     """
     repo = repo.strip()
     current = _rows.get(repo)
     if current is None:
         raise ValueError(f"{repo} is not watched")
-    goal = (goal or "").strip() or None
-    if goal == (current.get("goal") or None):
+    state = goal_file_transition(current, sha)
+    if state is None:
         return current
-    state = GOAL_ACTIVE if goal else GOAL_NONE
-    await db.set_repo_goal(repo, goal, state, stalls=0)
+    await db.set_goal_file(repo, sha, state, stalls=0)
     await load()
     return _rows[repo]
 
@@ -151,16 +165,17 @@ async def set_goal(repo: str, goal: str | None) -> dict:
 async def reactivate(repo: str) -> dict:
     """Put a `met` or `stalled` repo back to `active`, so the next dry tick plans again.
 
-    The way past a stall without editing the goal, and the way to re-open a met goal whose
-    endstate has since drifted. Refuses a repo with no goal — there is nothing to plan toward.
+    The way past a stall without editing the goal file, and the way to re-open a met goal
+    whose endstate has since drifted. Refuses a repo with no goal file — there is nothing
+    to plan toward.
     """
     repo = repo.strip()
     current = _rows.get(repo)
     if current is None:
         raise ValueError(f"{repo} is not watched")
-    if not (current.get("goal") or "").strip():
-        raise ValueError(f"{repo} has no goal to reactivate")
-    await db.set_repo_goal(repo, current["goal"], GOAL_ACTIVE, stalls=0)
+    if not current.get("goal_sha"):
+        raise ValueError(f"{repo} has no goal to reactivate; commit .factory/goal.md first")
+    await db.set_goal_file(repo, current["goal_sha"], GOAL_ACTIVE, stalls=0)
     await load()
     return _rows[repo]
 
