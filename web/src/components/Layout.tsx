@@ -1,17 +1,46 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom"
-import { Activity, Boxes, Bot, FolderGit2, ListChecks, BarChart3, ScrollText, Sprout, Sun, Moon, LogOut } from "lucide-react"
+import { Activity, Boxes, Bot, Bug, FolderGit2, ListChecks, BarChart3, ScrollText, Sprout, Sun, Moon, LogOut, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useTheme } from "@/lib/theme"
 import { logout } from "@/lib/api"
 
-const NAV = [
-  { to: "/", label: "Runs", icon: Activity, end: true },
-  { to: "/plan", label: "Plan", icon: ListChecks },
-  { to: "/projects", label: "Projects", icon: FolderGit2 },
-  { to: "/goldens", label: "Goldens", icon: Bot },
-  { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
-  { to: "/digest", label: "Digest", icon: ScrollText },
-  { to: "/improvements", label: "Improvements", icon: Sprout },
+/** A `to` of null lists the page without linking it: the row is visible but inert. */
+type NavItem = {
+  to: string | null
+  label: string
+  icon: LucideIcon
+  end?: boolean
+}
+
+type NavGroup = { title: string | null; items: NavItem[] }
+
+/** The sidebar in groups. The first group is unlabelled — those pages are the daily path,
+ *  and a header over them would only name what the reader is already looking at. Later
+ *  groups carry a title, so the list reads as three destinations, not seven. */
+const NAV: NavGroup[] = [
+  {
+    title: null,
+    items: [
+      { to: "/", label: "Runs", icon: Activity, end: true },
+      { to: "/plan", label: "Plan", icon: ListChecks },
+      { to: "/projects", label: "Projects", icon: FolderGit2 },
+      { to: "/goldens", label: "Goldens", icon: Bot },
+    ],
+  },
+  {
+    title: "Analytics",
+    items: [
+      { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
+      { to: "/digest", label: "Digest", icon: ScrollText },
+      { to: "/improvements", label: "Improvements", icon: Sprout },
+    ],
+  },
+  {
+    title: "Monitoring",
+    // No route yet: the row is listed so the shape of the product is visible, but it
+    // stays inert until the page exists.
+    items: [{ to: null, label: "Bugs", icon: Bug }],
+  },
 ]
 
 /** Sidebar rows: mono, uppercase, square. The active one is a solid terracotta block —
@@ -44,14 +73,38 @@ export function Layout() {
               Factory
             </span>
           </div>
-          <div className="eyebrow mt-2.5 text-sidebar-muted">Issue in · PR out</div>
         </div>
-        <nav className="flex flex-1 flex-col gap-0.5 px-3 py-4">
-          {NAV.map(({ to, label, icon: Icon, end }) => (
-            <NavLink key={to} to={to} end={end} className={({ isActive }) => sidebarRow(isActive)}>
-              <Icon className="size-3.5" />
-              {label}
-            </NavLink>
+        <nav className="flex flex-1 flex-col px-3 py-4">
+          {NAV.map(({ title, items }) => (
+            <div key={title ?? "primary"} className="flex flex-col gap-0.5 mt-6 first:mt-0">
+              {title && (
+                <div className="eyebrow px-3 pb-2 text-[0.625rem] text-sidebar-muted/70">
+                  {title}
+                </div>
+              )}
+              {items.map(({ to, label, icon: Icon, end }) =>
+                to ? (
+                  <NavLink
+                    key={label}
+                    to={to}
+                    end={end}
+                    className={({ isActive }) => sidebarRow(isActive)}
+                  >
+                    <Icon className="size-3.5" />
+                    {label}
+                  </NavLink>
+                ) : (
+                  <div
+                    key={label}
+                    aria-disabled="true"
+                    className={sidebarRow(false) + " cursor-default text-sidebar-muted/50 hover:translate-x-0 hover:bg-transparent hover:text-sidebar-muted/50"}
+                  >
+                    <Icon className="size-3.5" />
+                    {label}
+                  </div>
+                )
+              )}
+            </div>
           ))}
         </nav>
         <div className="border-t border-sidebar-border px-3 py-3">

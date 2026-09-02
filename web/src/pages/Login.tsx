@@ -35,8 +35,7 @@ export function Login() {
           <Boxes className="size-7 text-primary" />
           <span className="font-serif text-4xl leading-none text-foreground">Factory</span>
         </div>
-        <div className="eyebrow mt-2.5 mb-7 text-muted-foreground">Issue in · PR out</div>
-        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+        <form onSubmit={onSubmit} className="mt-7 flex flex-col gap-4">
           <div className="flex flex-col gap-1.5">
             <label htmlFor="email" className="eyebrow text-muted-foreground">
               Email
