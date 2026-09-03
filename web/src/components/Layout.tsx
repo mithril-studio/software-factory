@@ -37,9 +37,7 @@ const NAV: NavGroup[] = [
   },
   {
     title: "Monitoring",
-    // No route yet: the row is listed so the shape of the product is visible, but it
-    // stays inert until the page exists.
-    items: [{ to: null, label: "Bugs", icon: Bug }],
+    items: [{ to: "/bugs", label: "Bugs", icon: Bug }],
   },
 ]
 

@@ -147,6 +147,43 @@ export type Project = {
   /** Whether this deployment runs the goal loop at all (FACTORY_PLAN). A goal set while
    *  this is false is a note on the register, and the UI should say so. */
   plan_enabled: boolean
+  /** The Sentry project mirroring this repo, the DSN its apps report to (a client-side
+   *  identifier, safe to display), and the wiring issue the factory filed for it. All null
+   *  until FACTORY_SENTRY provisions the repo. */
+  sentry_project: string | null
+  sentry_dsn: string | null
+  sentry_wiring_issue: number | null
+}
+
+/** One production error, as Sentry groups it: a fingerprint-cluster of events, not a single
+ *  occurrence. A mirror row — Sentry owns capture, grouping, counts and status, and the sync
+ *  loop overwrites this with whatever Sentry says now. `count` is how many events collapsed
+ *  into it, which is the number that separates an incident from a curiosity. */
+export type Bug = {
+  id: string
+  repo: string
+  sentry_issue_id: string
+  short_id: string
+  title: string
+  culprit: string
+  level: string
+  status: string
+  /** Sentry's refinement of `status` — `regressed` under `unresolved` is the one that
+   *  matters: the error came back after somebody resolved it. */
+  substatus: string
+  count: number
+  user_count: number
+  first_seen: string
+  last_seen: string
+  permalink: string
+  synced_at: string
+}
+
+export type BugsResponse = {
+  /** Whether the deployment syncs at all (FACTORY_SENTRY). An empty list means two very
+   *  different things depending on this flag, and the page has to say which. */
+  enabled: boolean
+  bugs: Bug[]
 }
 
 /** One preflight question and its answer.

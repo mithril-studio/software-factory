@@ -373,6 +373,7 @@ export function Projects() {
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
                 <TableHead>Golden</TableHead>
+                <TableHead>Sentry</TableHead>
                 <TableHead>Goal</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
@@ -398,6 +399,23 @@ export function Projects() {
                     <span className="ml-2">
                       <Provisioning status={p.provision_status} />
                     </span>
+                  </TableCell>
+                  {/* Which Sentry project mirrors this repo, and whether its wiring issue
+                      exists yet. The DSN itself lives on the register and in that issue —
+                      a name is what a human scans a table for. */}
+                  <TableCell className="whitespace-nowrap font-mono text-xs">
+                    {p.sentry_project ? (
+                      <>
+                        {p.sentry_project}
+                        {p.sentry_wiring_issue && (
+                          <span className="ml-2 text-muted-foreground">
+                            #{p.sentry_wiring_issue}
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      "—"
+                    )}
                   </TableCell>
                   <TableCell>
                     <GoalCell p={p} onChanged={refresh} />
