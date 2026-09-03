@@ -114,6 +114,18 @@ async def record_golden(repo: str, golden: str | None, status: str) -> None:
     await load()
 
 
+async def record_sentry(repo: str, project: str, dsn: str) -> None:
+    """Record `repo`'s Sentry project and DSN, and refresh the cached row."""
+    await db.set_repo_sentry(repo.strip(), project, dsn)
+    await load()
+
+
+async def record_sentry_wiring(repo: str, issue_number: int) -> None:
+    """Record the wiring issue the factory filed for `repo`, so it never files a second."""
+    await db.set_repo_sentry_wiring(repo.strip(), issue_number)
+    await load()
+
+
 # --------------------------------------------------------------------------- the goal loop
 
 # What `goal_state` may hold. The transitions live in the two functions below and in

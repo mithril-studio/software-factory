@@ -22,7 +22,20 @@ from pydantic import BaseModel
 from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
-from . import agents, auth, db, github, goldens, plan, poller, preflight, provision, repos, runner
+from . import (
+    agents,
+    auth,
+    db,
+    github,
+    goldens,
+    plan,
+    poller,
+    preflight,
+    provision,
+    repos,
+    runner,
+    sentry,
+)
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -55,12 +68,14 @@ async def lifespan(app: FastAPI):
     await repos.seed()
     poller.start()
     goldens.start()
+    sentry.start()
     runner.start_reconciler()
     try:
         yield
     finally:
         await poller.stop()
         await goldens.stop()
+        await sentry.stop()
         await runner.stop_reconciler()
 
 
@@ -624,9 +639,33 @@ async def api_projects():
                 "plan_stalls": row.get("plan_stalls") or 0,
                 "last_planned_at": row.get("last_planned_at"),
                 "plan_enabled": settings.plan_enabled,
+                # The Sentry integration: which project mirrors this repo, the DSN its apps
+                # report to (client-side identifier, safe to show), and the wiring issue the
+                # factory filed. All null until FACTORY_SENTRY provisions the repo.
+                "sentry_project": row.get("sentry_project"),
+                "sentry_dsn": row.get("sentry_dsn"),
+                "sentry_wiring_issue": row.get("sentry_wiring_issue"),
             }
         )
     return out
+
+
+# --------------------------------------------------------------------------- bugs
+
+
+@app.get("/api/bugs")
+async def api_bugs(repo: str | None = None):
+    """Every production error the Sentry sync has mirrored, most recently seen first.
+
+    Everything, deliberately: the sync writes all statuses and levels, and this hands them
+    over unfiltered so the UI's filters and the API never disagree about what exists. The
+    interesting decisions — which of these deserve a triage run — belong to a later loop,
+    not to this endpoint.
+    """
+    return {
+        "enabled": settings.sentry_enabled,
+        "bugs": await db.list_bugs(repo=repo),
+    }
 
 
 # --------------------------------------------------------------------------- memory candidates

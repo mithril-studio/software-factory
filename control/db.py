@@ -182,6 +182,38 @@ CREATE TABLE IF NOT EXISTS improvements (
 );
 CREATE INDEX IF NOT EXISTS improvements_repo_idx ON improvements (repo);
 CREATE INDEX IF NOT EXISTS improvements_status_idx ON improvements (status);
+
+-- What Sentry knows about the apps this factory built: one row per Sentry *issue* — their
+-- fingerprint-grouped cluster of events — refreshed by the sync loop in `control/sentry.py`.
+--
+-- A mirror, never a source of truth. Sentry owns capture, grouping, occurrence counts and
+-- status, and every sync overwrites what it said last time; nothing in this plane edits a
+-- row except the sync. It exists so production errors are listable next to runs, and so a
+-- later triage loop has a table to decide from rather than an API to interrogate mid-tick.
+--
+-- `id` is derived from (repo, sentry_issue_id), so the same Sentry issue lands on the same
+-- row across syncs and deployments — the UNIQUE constraint is the contract, the derived id
+-- just keeps the primary key aligned with it.
+CREATE TABLE IF NOT EXISTS bugs (
+    id               TEXT PRIMARY KEY,
+    repo             TEXT NOT NULL,
+    sentry_issue_id  TEXT NOT NULL,
+    short_id         TEXT,
+    title            TEXT,
+    culprit          TEXT,
+    level            TEXT,
+    status           TEXT,
+    substatus        TEXT,
+    count            INTEGER NOT NULL DEFAULT 0,
+    user_count       INTEGER NOT NULL DEFAULT 0,
+    first_seen       TEXT,
+    last_seen        TEXT,
+    permalink        TEXT,
+    synced_at        TEXT NOT NULL,
+    UNIQUE (repo, sentry_issue_id)
+);
+CREATE INDEX IF NOT EXISTS bugs_repo_idx ON bugs (repo);
+CREATE INDEX IF NOT EXISTS bugs_last_seen_idx ON bugs (last_seen DESC);
 """
 
 # Additive migrations for databases created before a column existed. Each is tried once at
@@ -246,6 +278,14 @@ MIGRATIONS = (
     "ALTER TABLE repos ADD COLUMN goal_state TEXT NOT NULL DEFAULT 'none'",
     "ALTER TABLE repos ADD COLUMN plan_stalls INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE repos ADD COLUMN last_planned_at TEXT",
+    # The Sentry integration (control/sentry.py). `sentry_project` is the Sentry project slug
+    # mirroring this repo; `sentry_dsn` is that project's client key, kept so the register can
+    # show it and the wiring issue could carry it (a DSN is a client-side identifier — it
+    # ships in browser bundles — not a secret). `sentry_wiring_issue` is the number of the
+    # "wire the SDK in" issue the factory filed, recorded so it is filed exactly once.
+    "ALTER TABLE repos ADD COLUMN sentry_project TEXT",
+    "ALTER TABLE repos ADD COLUMN sentry_dsn TEXT",
+    "ALTER TABLE repos ADD COLUMN sentry_wiring_issue INTEGER",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -536,6 +576,31 @@ async def set_plan_state(
     async with connect() as conn:
         await conn.execute(
             f"UPDATE repos SET {', '.join(sets)} WHERE repo = ?", (*values, repo)
+        )
+        await conn.commit()
+
+
+async def set_repo_sentry(repo: str, project: str, dsn: str) -> None:
+    """Record which Sentry project mirrors `repo`, and the DSN its apps report to.
+
+    Written once, when provisioning creates (or finds) the project. Separate from the wiring
+    issue below because the two happen at different moments and the second can fail alone:
+    a project that exists with no issue filed yet is a repo the next sync finishes, not one
+    that needs the project created twice.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE repos SET sentry_project = ?, sentry_dsn = ? WHERE repo = ?",
+            (project, dsn, repo),
+        )
+        await conn.commit()
+
+
+async def set_repo_sentry_wiring(repo: str, issue_number: int) -> None:
+    """Record the wiring issue the factory filed for `repo`, so it is filed exactly once."""
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE repos SET sentry_wiring_issue = ? WHERE repo = ?", (issue_number, repo)
         )
         await conn.commit()
 
@@ -989,3 +1054,73 @@ async def transition_improvement(
             )
     improvement.update(updates)
     return improvement
+
+
+# --------------------------------------------------------------------------- bugs
+
+# The columns a sync may write. A closed set for the reason `set_plan_state` gives: column
+# names are interpolated into the statement, so the set of legal ones is decided here, not by
+# whatever the mapping upstream happened to produce.
+BUG_COLUMNS = (
+    "id",
+    "repo",
+    "sentry_issue_id",
+    "short_id",
+    "title",
+    "culprit",
+    "level",
+    "status",
+    "substatus",
+    "count",
+    "user_count",
+    "first_seen",
+    "last_seen",
+    "permalink",
+    "synced_at",
+)
+
+# What a re-sync updates: everything except the identity. `first_seen` is on the list because
+# Sentry owns it — it is stable in practice, and if Sentry ever revises it, the mirror agrees
+# with Sentry rather than with its own history.
+_BUG_REFRESH = tuple(c for c in BUG_COLUMNS if c not in ("id", "repo", "sentry_issue_id"))
+
+
+async def upsert_bug(fields: dict[str, Any]) -> None:
+    """Insert one Sentry issue's row, or refresh it if this repo has synced it before.
+
+    One statement rather than select-then-write: the sync loop calls this once per issue per
+    tick, and `ON CONFLICT` on the (repo, sentry_issue_id) contract is what makes a re-sync
+    an update instead of a growing pile of duplicates.
+    """
+    unknown = set(fields) - set(BUG_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown bug column(s): {', '.join(sorted(unknown))}")
+    cols = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    sets = ", ".join(f"{c} = excluded.{c}" for c in _BUG_REFRESH if c in fields)
+    async with connect() as conn:
+        await conn.execute(
+            f"INSERT INTO bugs ({cols}) VALUES ({marks}) "
+            f"ON CONFLICT (repo, sentry_issue_id) DO UPDATE SET {sets}",
+            tuple(fields.values()),
+        )
+        await conn.commit()
+
+
+async def list_bugs(repo: str | None = None, limit: int = 500) -> list[dict]:
+    """Every synced bug, most recently seen first, optionally scoped to one repo.
+
+    No status or level filter here: the sync mirrors everything Sentry has and the UI decides
+    what to show, so the API refusing rows would make the two disagree about what exists.
+    """
+    where, params = "", []
+    if repo:
+        where = "WHERE repo = ?"
+        params.append(repo)
+    async with connect() as conn:
+        async with conn.execute(
+            f"SELECT * FROM bugs {where} ORDER BY last_seen DESC, id LIMIT ?",
+            (*params, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]

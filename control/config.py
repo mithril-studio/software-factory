@@ -230,6 +230,28 @@ class Settings:
     # before letting them merge into the repos the factory works on.
     learn_autoqueue: bool = os.environ.get("FACTORY_LEARN_AUTOQUEUE", "0") == "1"
 
+    # --- the Sentry integration
+    #
+    # Sentry is the eyes: its SDKs capture production exceptions from the apps this factory
+    # built, fingerprint them into issues, and count occurrences. The factory's side of that
+    # is `control/sentry.py` — a deterministic REST client and a sync loop, never a webhook
+    # and never a model call. Off by default because provisioning files a wiring issue per
+    # repo, and an issue the factory files is an issue the factory spends money building.
+    sentry_enabled: bool = os.environ.get("FACTORY_SENTRY", "0") == "1"
+    # The Sentry organization slug, and an auth token for it. The token needs project:write
+    # (create a project per repo, read its DSN) and event:read (list issues). It stays in
+    # this process — no run VM sees it; the only Sentry-derived value that leaves the
+    # factory is a DSN, which is a client-side identifier and not a secret.
+    sentry_org: str = os.environ.get("FACTORY_SENTRY_ORG", "")
+    sentry_token: str = os.environ.get("FACTORY_SENTRY_TOKEN", "")
+    # The team new projects are created under. Sentry requires one; the org's default team
+    # usually shares the org's slug, which is why empty falls back to `sentry_org`.
+    sentry_team: str = os.environ.get("FACTORY_SENTRY_TEAM", "")
+    # Seconds between syncs. Five minutes, like the golden refresh and for the same reason:
+    # each tick is a handful of list calls, and what it buys is a production error being
+    # visible in the UI within a poll or two of happening. 0 switches the loop off.
+    sentry_sync_interval: int = int(os.environ.get("FACTORY_SENTRY_SYNC_INTERVAL", "300"))
+
     # Issue polling. The repos this deployment starts up watching — see `_repos()`.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"
