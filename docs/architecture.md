@@ -185,6 +185,36 @@ The runner prints the manifest as a `FACTORY-MANIFEST` line, selects the telemet
 from it, and falls back to `claude -p` when `factory-agent` is absent. The full contract is
 `../control/README.md` §2.3.
 
+### §3.6 The Sentry mirror
+
+Sentry owns the front half of bug tracking — SDKs capture production exceptions from the
+apps the factory builds, fingerprint them into issues, count occurrences, notice
+regressions. The factory does not rebuild any of that (an earlier note in `discussion.md`
+had Sentry *removed* from target apps in favour of an own telemetry layer; that stands for
+logs — pino stays — and is reversed for exceptions, where Sentry's grouping is the value).
+
+`control/sentry.py` is the whole integration, and it is deterministic end to end:
+
+- **Provisioning.** For each watched repo (behind `FACTORY_SENTRY`, off by default), create
+  a Sentry project named for the repo, record its DSN on the register, and file one
+  `agent:queued` issue on the repo — "wire the SDK in, DSN enclosed" — that the factory
+  builds like any other issue. Each step is recorded when it happens, so a crash resumes
+  rather than repeats: no second project, no second issue, ever. A DSN is a client-side
+  identifier (it ships in browser bundles), which is why it may sit in an issue body.
+- **The mirror.** A sync loop lists each project's issues every few minutes into the `bugs`
+  table — one row per Sentry issue, upserted on `(repo, sentry_issue_id)`, every status
+  included so a resolve in Sentry is a resolve here. `GET /api/bugs` and the `/bugs` page
+  read it; nothing else does, yet. Deciding what to *do* about a bug — a triage run that
+  reads the stack trace and files a fix issue — is the deferred next loop, and this table
+  is deliberately shaped to be its input.
+- **The seam with agents.** The factory's automation speaks Sentry's REST API, exactly as
+  `github.py` speaks GitHub's. The Sentry *MCP* (`.mcp.json`) is the other half: an
+  agent-facing protocol for Claude sessions to drive Sentry conversationally. A control
+  plane has no model to speak MCP with, and per §1 it never will.
+
+The org token (`FACTORY_SENTRY_TOKEN`) stays in the control plane's process; no run VM
+sees it.
+
 ## §4 The pipeline
 
 Every phase of an issue is a row in `runs` with its own `kind`, and every step is a status
@@ -231,8 +261,11 @@ halted repo never plans. `control/plan.py` holds the whole loop.
 
 Named so they stay unbuilt until something proves they are needed:
 
-- No GitHub webhooks. Polling every 30s is simpler and sufficient at
-  `FACTORY_MAX_CONCURRENT=3` runs.
+- No webhooks — GitHub's or Sentry's. Polling every 30s is simpler and sufficient at
+  `FACTORY_MAX_CONCURRENT=3` runs, and the same argument carried when Sentry arrived
+  (§3.6): its issue list has queue semantics, so a poll is one authenticated GET where a
+  webhook is a public endpoint, an HMAC check, and a hole in the auth middleware. Revisit
+  when something genuinely needs to hear about an event in seconds.
 - No queue broker. SQLite plus one active-run check per repo (`db.has_active_run`); a repo
   runs one issue at a time, lowest number first.
 - No `ExecutionBackend` abstraction. `control` talks to boxd concretely. The interface gets

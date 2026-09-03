@@ -359,6 +359,31 @@ Keep harness invariants out of it. Anything that would hang or corrupt *any* run
 background long commands, commit and push as you go) belongs in the prompt, not here; see
 `../discussion.md` §"Where rules live".
 
+## Connecting Sentry
+
+Bug tracking is a division of labour: Sentry's SDKs capture and fingerprint production
+errors in the apps the factory builds; the factory mirrors what Sentry heard onto the
+**Bugs** page. One org-level setup covers every repo:
+
+1. Create (or use) a Sentry organization. Mint an auth token with `project:write` and
+   `event:read` — org settings → Auth Tokens.
+2. Set `FACTORY_SENTRY=1`, `FACTORY_SENTRY_ORG`, `FACTORY_SENTRY_TOKEN` (and
+   `FACTORY_SENTRY_TEAM` if the org's default team is not named after the org) in `.env`,
+   restart.
+3. That is the whole setup. On the next sync tick the factory creates a Sentry project per
+   watched repo, records its DSN on the register, and files one `agent:queued` wiring issue
+   on each repo — "add the SDK, DSN enclosed" — which the factory then builds itself.
+   Progress is visible on **Projects** (the Sentry column) and the issues on GitHub.
+4. Once a wiring PR merges and the app deploys, errors appear on **Bugs** within a sync
+   interval (`FACTORY_SENTRY_SYNC_INTERVAL`, default 300s). Resolving, assigning and
+   alert rules stay in Sentry — the page links every row back to it.
+
+The token stays on the control plane; run VMs never see it. The only Sentry-derived value
+that leaves the factory is each project's DSN, which is a client-side identifier, not a
+secret. For conversational access — inspecting an issue from a Claude session, say — the
+repo's `.mcp.json` registers Sentry's MCP server; that is for agents and humans, never for
+the control plane.
+
 ## Configuration
 
 The ~12 variables an operator actually decides about. Every variable, with its default and
@@ -382,6 +407,7 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |
 | `FACTORY_LEARN_EVERY` | Issues a repo must finish before its next learning run (5). |
 | `FACTORY_LEARN_AUTOQUEUE` | Label what the loop files `agent:queued`, so the factory builds it. Off by default. |
+| `FACTORY_SENTRY` | Mirror production errors from Sentry (above). **Off by default** — provisioning files a wiring issue per repo, which is autonomous spend. Needs `FACTORY_SENTRY_ORG` + `FACTORY_SENTRY_TOKEN`. |
 | `FACTORY_LOG_LEVEL` | Control-plane log verbosity. |
 
 ## API surface
@@ -410,6 +436,8 @@ exhaustive list is `control/app.py`.
 - **Memory** — `GET /api/memory/candidates`, `POST /api/memory/candidates/{id}/accept`
   or `.../reject` — the triage queue for learnings the agent proposed. No UI consumer yet;
   it is curl territory.
+- **Bugs** — `GET /api/bugs?repo=` — everything the Sentry sync has mirrored, most recently
+  seen first, unfiltered (the UI filters). Read-only: resolving happens in Sentry.
 - **Health** — `GET /healthz`, unauthenticated, for the external monitor
 
 ## Scripts

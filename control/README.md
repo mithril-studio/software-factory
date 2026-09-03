@@ -48,6 +48,7 @@ One module per concern:
 | `preflight` | Is a repo ready? Labels, token scopes, golden — boots nothing |
 | `github` | Every GitHub API call: issues, labels, PRs, checks, merge |
 | `memory` | The `.mem/` validator; a CI gate (§5) |
+| `sentry` | The Sentry mirror: provision a project per repo, file its wiring issue, sync its issue list into `bugs` |
 | `repos` | The repo register: connected at runtime, seeded from `FACTORY_REPOS` |
 | `auth` | Session login; everything under `/api` except login sits behind it |
 | `db` | SQLite schema and queries; `db.init()` is idempotent, no migrations |
