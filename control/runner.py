@@ -24,7 +24,7 @@ from telemetry import digest
 from telemetry import store as telemetry_store
 from telemetry.recorder import Recorder
 
-from . import agents, db, github, memory
+from . import agents, db, github, memory, repos
 from .config import settings
 
 # boxd reports a snapshot's timestamps in **milliseconds**, but the SDK's snapshot mapper reads
@@ -2005,6 +2005,13 @@ async def _merge(
                     raise
                 continue
             log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
+            if repos.configured_base(repo) and issue.get("number"):
+                # `Closes #n` only fires on a merge into the default branch, so a repo that
+                # integrates elsewhere would keep every finished issue open.
+                try:
+                    await github.close_issue(repo, issue["number"])
+                except Exception as exc:  # noqa: BLE001 - the merge happened; this is a mirror
+                    log.write(f"[factory] could not close #{issue['number']}: {exc!r}")
             # If this issue was the improvement loop's own proposal, it is now live. Recorded
             # here for the reason the CI verdict is: this is the one place the factory learns a
             # merge happened, and a transition written into one branch of one caller is one the
@@ -2178,7 +2185,7 @@ async def create(
     # at all, so both belong to the build's base by way of the attempt they share, and giving
     # them their own would be a second answer to a question already answered. Two API calls
     # against a run that lasts twenty minutes.
-    base_sha = await github.ref_sha(repo, await github.default_branch(repo))
+    base_sha = await github.ref_sha(repo, await repos.base_branch(repo))
 
     await db.create_run(
         id=run_id,
@@ -2316,7 +2323,7 @@ async def _guarded_learn(run_id: str, repo: str) -> None:
 
 async def _execute_learn(run_id: str, repo: str, log: RunLog) -> None:
     """Read the window, ask an agent what to change, and file what it proposes."""
-    base = await github.default_branch(repo)
+    base = await repos.base_branch(repo)
     window = settings.learn_window_days
     evidence = await digest.build(repo=repo, days=window)
     ledger = await db.list_improvements(repo=repo)
@@ -2685,7 +2692,7 @@ async def _execute(
     collected = False
     number = issue["number"]
     try:
-        base = await github.default_branch(repo)
+        base = await repos.base_branch(repo)
         notes = await project_notes(repo, base)
         prompt = build_prompt(
             repo, issue, branch, base, notes, attempt, prior_error, prior_log, review_cycle
@@ -2872,7 +2879,7 @@ async def _execute_review(
 ) -> None:
     """Fork a VM, review the PR against the issue's criteria, then merge it or send it back."""
     number = issue["number"]
-    base = await github.default_branch(repo)
+    base = await repos.base_branch(repo)
     criteria = parse_criteria(issue.get("body") or "")
     boxd = client()
     machine = None

@@ -151,13 +151,13 @@ async def file(repo: str, path: str, ref: str) -> str | None:
     return resp.text
 
 
-async def file_sha(repo: str, path: str) -> str | None:
-    """The git blob SHA of one file on the default branch. None when there is no such file.
+async def file_sha(repo: str, path: str, ref: str | None = None) -> str | None:
+    """The git blob SHA of one file on `ref`, or on the default branch when `ref` is None.
 
     The goal-file sync's read: it compares SHAs across polls, so it needs the identity of the
     content, not the content itself. JSON headers rather than `vnd.github.raw` because the
-    contents object is what carries `sha`. No `ref` parameter — omitting it makes the API
-    answer for the default branch, which saves the `default_branch` round trip.
+    contents object is what carries `sha`. `ref` is omitted from the request when None, which
+    makes the API answer for the default branch and saves the `default_branch` round trip.
 
     Three answers, deliberately distinct: a SHA (the file exists and has content), None (a
     definite "not there" — 404, a directory, or an empty file, which is no goal at all), or
@@ -168,6 +168,7 @@ async def file_sha(repo: str, path: str) -> str | None:
         resp = await client.get(
             f"{API}/repos/{repo}/contents/{path}",
             headers=_headers(),
+            params={"ref": ref} if ref else None,
             follow_redirects=True,
         )
     if resp.status_code == 404:
@@ -708,6 +709,22 @@ async def create_issue(
         )
         resp.raise_for_status()
     return resp.json()
+
+
+async def close_issue(repo: str, number: int) -> None:
+    """Close an issue as completed.
+
+    GitHub closes an issue from a `Closes #n` line only when the pull request merges into the
+    *default* branch. A repo that integrates on another branch gets its pull requests merged
+    and its issues left open, so the factory closes them itself on those repos.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.patch(
+            f"{API}/repos/{repo}/issues/{number}",
+            headers=_headers(),
+            json={"state": "closed", "state_reason": "completed"},
+        )
+        resp.raise_for_status()
 
 
 async def ensure_labels(repo: str) -> None:

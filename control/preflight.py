@@ -28,7 +28,7 @@ import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from . import agents, github, runner
+from . import agents, github, repos, runner
 from .config import settings
 
 
@@ -170,7 +170,7 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
     if info is None:
         return [Check("repo readable", False, f"the token cannot read {repo}")]
     checks = [
-        Check("repo readable", True, f"default branch {base}"),
+        Check("repo readable", True, f"base branch {base}"),
         # The agent pushes its branch and opens the pull request as this token. Asked of git
         # rather than of `info["permissions"]`, which answers for the account and not the
         # token — see `github.can_push`.
@@ -213,12 +213,30 @@ async def _fleet() -> tuple[tuple[str, ...], Check | None]:
         await boxd.close()
 
 
+def base_branch_check(branch: str, sha: str | None) -> Check:
+    """Does the integration branch this repo is pointed at exist?
+
+    Blocking: every run checks out `origin/<base>`, so a missing one fails each dispatch at the
+    checkout, after a VM has been restored for it.
+    """
+    if sha:
+        return Check("integration branch exists", True, f"{branch} at {sha[:8]}")
+    return Check(
+        "integration branch exists",
+        False,
+        f"{branch} is set as this repo's base branch and does not resolve on GitHub",
+    )
+
+
 async def run(repo: str) -> list[Check]:
     """Every check for `repo`, and for the golden its runs would boot."""
     base, (available, outage) = await asyncio.gather(
-        github.default_branch(repo), _fleet()
+        repos.base_branch(repo), _fleet()
     )
-    checks = await _repo_checks(repo, base)
+    checks = []
+    if repos.configured_base(repo):
+        checks.append(base_branch_check(base, await github.ref_sha(repo, base)))
+    checks += await _repo_checks(repo, base)
     if outage:
         checks.append(outage)
     else:

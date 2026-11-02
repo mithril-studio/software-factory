@@ -64,7 +64,7 @@ log = logging.getLogger("factory.provision")
 # state it returns to if its golden is deleted — not an error, just the cold path.
 NONE, RUNNING, READY, FAILED = "none", "running", "ready", "failed"
 
-# Clone, check out the default branch, repair the toolchain if the repo pins one, install.
+# Clone, check out the integration branch, repair the toolchain if the repo pins one, install.
 #
 # `eval "$FACTORY_SETUP"` rather than the command interpolated into this text: the SDK
 # `shlex.quote`s every value it puts in the exec prefix, so the command crosses the wire as one
@@ -150,7 +150,7 @@ async def create(repo: str) -> str:
     not an absent one, and running it would be running something nobody wrote.
     """
     repo = repo.strip()
-    base = await github.default_branch(repo)
+    base = await repos.base_branch(repo)
     command = await setup_command(repo, base)
     if "\n" in command:
         raise ValueError(f"{repo}'s setup command spans more than one line: {command!r}")

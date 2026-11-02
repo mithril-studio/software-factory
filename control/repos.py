@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import re
 
-from . import db
+from . import db, github
 from .config import settings
 
 log = logging.getLogger("factory.repos")
@@ -112,6 +112,56 @@ async def record_golden(repo: str, golden: str | None, status: str) -> None:
     """Record what provisioning did for `repo`, and refresh the cached row."""
     await db.set_repo_golden(repo.strip(), golden, status)
     await load()
+
+
+# --------------------------------------------------------------------------- integration branch
+
+# A branch name GitHub would accept, narrowly. Validated before it is asked about, so a typo is
+# a 400 that says so rather than a ref lookup that 404s for a reason nobody reads.
+BRANCH_RE = re.compile(r"^(?!.*\.\.)(?!/)(?!.*//)[A-Za-z0-9._/-]+(?<![./])$")
+
+
+def configured_base(repo: str) -> str | None:
+    """The integration branch set for `repo`, or None when it follows the GitHub default.
+
+    Synchronous and free, for the callers that can pass None on to an API that already means
+    "the default branch" by omission — the goal-file sync is one, and asking GitHub for the
+    default's name there would be a round trip to say nothing.
+    """
+    return (_rows.get(repo) or {}).get("base_branch") or None
+
+
+async def base_branch(repo: str) -> str:
+    """The branch `repo`'s runs start from, open their pull requests against and merge into.
+
+    The one answer every dispatch path asks for. It used to be `github.default_branch` at six
+    call sites, which made the default branch the integration branch by construction — and a
+    repo that keeps `main` for production and integrates on `develop` could not be pointed at
+    at all. A repo with no `base_branch` set still gets the default, so nothing changes until
+    somebody sets one.
+    """
+    return configured_base(repo) or await github.default_branch(repo)
+
+
+async def set_base_branch(repo: str, branch: str | None) -> dict:
+    """Point `repo` at an integration branch, or back at its default with None or "".
+
+    Refuses a branch that does not exist on GitHub. A run dispatched onto a base that is not
+    there fails at its checkout with exit 92, after a VM has been restored for it; asking first
+    costs one GET.
+    """
+    repo = repo.strip()
+    if repo not in _rows:
+        raise ValueError(f"{repo} is not watched")
+    name = (branch or "").strip() or None
+    if name is not None:
+        if not BRANCH_RE.match(name):
+            raise ValueError(f"{name!r} is not a branch name")
+        if await github.ref_sha(repo, name) is None:
+            raise ValueError(f"{repo} has no branch {name!r}")
+    await db.set_repo_base_branch(repo, name)
+    await load()
+    return _rows[repo]
 
 
 # --------------------------------------------------------------------------- the goal loop

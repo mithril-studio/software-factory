@@ -90,6 +90,10 @@ CREATE INDEX IF NOT EXISTS runs_status_idx  ON runs (status);
 -- empty), or 'stalled' (consecutive fruitless plans hit the cap — a human decides what
 -- happens next). `plan_stalls` counts those fruitless plans; `last_planned_at` is the
 -- cooldown clock between plan dispatches.
+--
+-- `base_branch` is the integration branch: where runs branch from, where their pull requests
+-- target and merge, and what a release promotes from. NULL means the repo's GitHub default
+-- branch, which is what every repo used before the column existed.
 CREATE TABLE IF NOT EXISTS repos (
     repo             TEXT PRIMARY KEY,
     added_at         TEXT NOT NULL,
@@ -99,7 +103,8 @@ CREATE TABLE IF NOT EXISTS repos (
     goal_sha         TEXT,
     goal_state       TEXT NOT NULL DEFAULT 'none',
     plan_stalls      INTEGER NOT NULL DEFAULT 0,
-    last_planned_at  TEXT
+    last_planned_at  TEXT,
+    base_branch      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -254,6 +259,8 @@ MIGRATIONS = (
     # ignore below and the dead column stays — nothing reads it either way.)
     "ALTER TABLE repos ADD COLUMN goal_sha TEXT",
     "ALTER TABLE repos DROP COLUMN goal",
+    # The integration branch, when it is not the GitHub default. See the repos table comment.
+    "ALTER TABLE repos ADD COLUMN base_branch TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -496,6 +503,13 @@ async def set_repo_golden(repo: str, golden: str | None, status: str) -> None:
             "UPDATE repos SET golden = ?, provision_status = ? WHERE repo = ?",
             (golden, status, repo),
         )
+        await conn.commit()
+
+
+async def set_repo_base_branch(repo: str, branch: str | None) -> None:
+    """Record which branch `repo`'s work integrates into. None reverts to the default branch."""
+    async with connect() as conn:
+        await conn.execute("UPDATE repos SET base_branch = ? WHERE repo = ?", (branch, repo))
         await conn.commit()
 
 
