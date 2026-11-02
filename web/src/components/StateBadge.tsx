@@ -35,6 +35,17 @@ const VARIANT: Record<string, "ok" | "warn" | "bad" | "muted" | "default"> = {
   reverted: "muted",
   rejected: "bad",
   abandoned: "muted",
+  // release states. `promoted`, `deployed` and `accepted` are a version standing on the test
+  // server waiting for a human — warn, because the repo is frozen until somebody reads it.
+  // `reviewed` is the only ending that is a green tick; `expired` is nobody looking.
+  assembling: "warn",
+  promoted: "warn",
+  deploying: "warn",
+  deployed: "warn",
+  accepting: "warn",
+  accepted: "warn",
+  reviewed: "ok",
+  expired: "muted",
 }
 
 /** The colour one state carries, for the places that need the hue without the badge —

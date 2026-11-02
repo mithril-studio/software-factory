@@ -345,6 +345,62 @@ export type Improvement = {
   created_at: string
 }
 
+/** One promotion of a repo's integration branch onto its release branch, and what happened to
+ *  that version afterwards. Any status but the last three freezes the repo's next release. */
+export type Release = {
+  id: number
+  repo: string
+  status:
+    | "assembling"
+    | "promoted"
+    | "deploying"
+    | "deployed"
+    | "accepting"
+    | "accepted"
+    | "rejected"
+    | "reviewed"
+    | "expired"
+    | "failed"
+  /** The integration-branch commit this release is pinned to. */
+  test_sha: string | null
+  /** Where the release branch pointed before; null on a repo's first release. */
+  base_sha_before: string | null
+  created_at: string
+  promoted_at: string | null
+  deployed_at: string | null
+  deployed_sha: string | null
+  test_url: string | null
+  accepted_at: string | null
+  reviewed_at: string | null
+  repair_issue: number | null
+  error: string | null
+  updated_at: string
+  item_count?: number
+}
+
+/** A factory-built change a release carried: one merged pull request. */
+export type ReleaseItem = {
+  release_id: number
+  issue_number: number
+  issue_title: string | null
+  pr_url: string | null
+  merged_sha: string
+  summary: string | null
+}
+
+export type ReleaseDetail = Release & { items: ReleaseItem[] }
+
+/** Assemble a release now. `release` is null when there is nothing new, with the reason;
+ *  a frozen repo throws (409). */
+export function assembleRelease(repo: string): Promise<{ release: Release | null; reason: string }> {
+  return post<{ release: Release | null; reason: string }>("/api/releases/assemble", { repo })
+}
+
+/** Say a release has been read. Lifts its repo's freeze. */
+export function markReleaseReviewed(id: number): Promise<Release> {
+  return post<Release>(`/api/releases/${id}/reviewed`)
+}
+
 export type RunTelemetry = {
   totals: {
     calls?: number

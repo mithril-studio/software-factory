@@ -22,7 +22,9 @@ from pydantic import BaseModel
 from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
-from . import agents, auth, db, github, goldens, plan, poller, preflight, provision, repos, runner
+from . import (
+    agents, auth, db, github, goldens, plan, poller, preflight, provision, release, repos, runner,
+)
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
@@ -56,12 +58,14 @@ async def lifespan(app: FastAPI):
     poller.start()
     goldens.start()
     runner.start_reconciler()
+    await release.start()
     try:
         yield
     finally:
         await poller.stop()
         await goldens.stop()
         await runner.stop_reconciler()
+        await release.stop()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
@@ -720,6 +724,63 @@ async def api_improvement(improvement_id: str):
     if row is None:
         raise HTTPException(404, f"no such improvement: {improvement_id}")
     return _with_evidence(row)
+
+
+# --------------------------------------------------------------------------- releases
+
+# A release is one promotion of a repo's integration branch onto its release branch, and what
+# then happens to that version. The schedule makes them; these routes read them, start one out
+# of schedule, and let a human say they have read one — which is what lifts the freeze.
+
+
+@app.get("/api/releases")
+async def api_releases(repo: str | None = None):
+    """Releases newest first, optionally for one repo, each with its item count."""
+    return await db.list_releases(repo=repo)
+
+
+@app.get("/api/releases/{release_id}")
+async def api_release(release_id: int):
+    row = await db.get_release(release_id)
+    if row is None:
+        raise HTTPException(404, f"no such release: {release_id}")
+    return {**row, "items": await db.release_items(release_id)}
+
+
+class AssembleRelease(BaseModel):
+    repo: str
+
+
+@app.post("/api/releases/assemble")
+async def api_assemble_release(body: AssembleRelease):
+    """Assemble a release of `repo` now, without waiting for the next scheduled moment.
+
+    Not gated on FACTORY_RELEASE, for the reason a hand-started learning run is not: the switch
+    governs what the factory does on its own. The freeze still applies — 409 while the latest
+    release is unreviewed, because reviewing it is the only thing that lifts it. A repo with
+    nothing new to release answers 200 with no release and the reason.
+    """
+    repo = body.repo.strip()
+    if repo not in repos.watched():
+        raise HTTPException(404, f"{repo} is not watched")
+    try:
+        row, why = await release.assemble(repo)
+    except release.Frozen as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
+        raise HTTPException(400, f"could not assemble a release of {repo}: {exc}") from exc
+    return {"release": row, "reason": why}
+
+
+@app.post("/api/releases/{release_id}/reviewed")
+async def api_release_reviewed(release_id: int):
+    """A human has read this release. Lifts the freeze on its repo."""
+    if await db.get_release(release_id) is None:
+        raise HTTPException(404, f"no such release: {release_id}")
+    try:
+        return await release.mark_reviewed(release_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- goldens / fleet

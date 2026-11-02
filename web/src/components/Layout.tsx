@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom"
-import { Activity, Boxes, Bot, Bug, FolderGit2, ListChecks, BarChart3, ScrollText, Sprout, Sun, Moon, LogOut, type LucideIcon } from "lucide-react"
+import { Activity, Boxes, Bot, Bug, FolderGit2, ListChecks, BarChart3, Rocket, ScrollText, Sprout, Sun, Moon, LogOut, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useTheme } from "@/lib/theme"
 import { logout } from "@/lib/api"
@@ -24,6 +24,7 @@ const NAV: NavGroup[] = [
       { to: "/", label: "Runs", icon: Activity, end: true },
       { to: "/plan", label: "Plan", icon: ListChecks },
       { to: "/projects", label: "Projects", icon: FolderGit2 },
+      { to: "/releases", label: "Releases", icon: Rocket },
       { to: "/goldens", label: "Goldens", icon: Bot },
     ],
   },
