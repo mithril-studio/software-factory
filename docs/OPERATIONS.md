@@ -133,6 +133,7 @@ The name is the whole registry. There is no list of goldens anywhere else:
 |---|---|
 | `golden-copy` | The **base image**. Tooling, skills, an agent login, warm toolchain caches — and no repo. Serves every repo. |
 | `golden-<owner-repo>` | The **warm tier**: the same image with one repo already cloned at `$HOME/work/<name>` and installed. |
+| `golden-tester` | The **acceptance image**: `golden-copy` plus Playwright and Chromium in `~/tester`. Booted only by browser-acceptance runs, by name; never resolved for a build or review. Built with `scripts/build-golden.sh --name golden-tester --playwright --no-login`, which refuses `--playwright` for any other name. |
 
 A run resolves in that order, most specific first (`agents.resolve_snapshot`):
 
@@ -422,6 +423,7 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `FACTORY_PLAN` | The goal loop: plan new issues toward a repo's committed `.factory/goal.md` when its queue runs dry, one feature per pass. **Off by default** — it files issues, which is autonomous spend. Cadence and caps: `FACTORY_PLAN_COOLDOWN` (900s), `FACTORY_PLAN_MAX_STALLS` (2), `FACTORY_PLAN_MAX_ISSUES` (6). |
 | `FACTORY_RELEASE` | Promote each repo's green integration head onto `FACTORY_RELEASE_BRANCH` (`test`) at `FACTORY_RELEASE_TIMES` (`09:00,11:30,14:00,16:00`, `FACTORY_RELEASE_TZ` `Europe/Amsterdam`), then freeze until reviewed or `FACTORY_RELEASE_REVIEW_TIMEOUT` (86400s). **Off by default.** |
 | `FACTORY_DEPLOY` | Deploy each promoted release to its repo's test server per its `## Deploy` section. `FACTORY_DEPLOY_TIMEOUT` (1800s), `FACTORY_DEPLOY_HEALTH_WAIT` (90s). **Off by default.** |
+| `FACTORY_ACCEPT` | After a deploy, check the release in a browser on its test server (`golden-tester`); a seen failure files one `agent:queued` repair issue, and after `FACTORY_ACCEPT_MAX_REPAIRS` (1) in a row a further one stops for a human. **Off by default.** |
 | `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
 | `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
 | `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |
@@ -453,7 +455,8 @@ exhaustive list is `control/app.py`.
 - **Releases** — `GET /api/releases?repo=`, `GET /api/releases/{id}` (with its items),
   `POST /api/releases/assemble {"repo"}` (now, out of schedule; 409 while frozen),
   `POST /api/releases/{id}/deploy` (deploy a promoted release now; the retry after a
-  refusal), `POST /api/releases/{id}/reviewed` (lifts the freeze).
+  refusal), `POST /api/releases/{id}/accept` (check a deployed release in a browser now),
+  `POST /api/releases/{id}/reviewed` (lifts the freeze).
   `GET /api/releases/{id}/packet` is the review packet — each item with the criteria it was
   reviewed against and the evidence, the deploy, the browser acceptance, and the feedback.
   `POST .../feedback {"text"}` stores a note and files nothing;

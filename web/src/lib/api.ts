@@ -469,6 +469,11 @@ export function deployRelease(id: number): Promise<{ run_id: string }> {
   return post<{ run_id: string }>(`/api/releases/${id}/deploy`)
 }
 
+/** Check a deployed release in a browser on its test server now. */
+export function acceptRelease(id: number): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>(`/api/releases/${id}/accept`)
+}
+
 /** Say a release has been read. Lifts its repo's freeze. */
 export function markReleaseReviewed(id: number): Promise<Release> {
   return post<Release>(`/api/releases/${id}/reviewed`)

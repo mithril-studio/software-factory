@@ -2,6 +2,7 @@ import { useState } from "react"
 import { Link } from "react-router-dom"
 import { Rocket } from "lucide-react"
 import {
+  acceptRelease,
   assembleRelease,
   deployRelease,
   markReleaseReviewed,
@@ -93,6 +94,17 @@ function Actions({ release, onDone }: { release: Release; onDone: () => void }) 
           onClick={() => act("deploy", () => deployRelease(release.id))}
         >
           {busy === "deploy" ? "Starting…" : "Deploy"}
+        </Button>
+      )}
+      {release.status === "deployed" && (
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={busy !== null}
+          title="Open the test server in a browser on a golden-tester VM and check each issue"
+          onClick={() => act("accept", () => acceptRelease(release.id))}
+        >
+          {busy === "accept" ? "Starting…" : "Accept"}
         </Button>
       )}
       {STANDING.includes(release.status) && (

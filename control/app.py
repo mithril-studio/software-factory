@@ -23,8 +23,8 @@ from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
 from . import (
-    agents, auth, db, deploy, github, goldens, plan, poller, preflight, provision, release, repos,
-    runner,
+    accept, agents, auth, db, deploy, github, goldens, plan, poller, preflight, provision,
+    release, repos, runner,
 )
 from .config import ROOT, settings
 
@@ -856,6 +856,27 @@ async def api_release_deploy(release_id: int):
         raise HTTPException(409, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
         raise HTTPException(400, f"could not deploy release {release_id}: {exc}") from exc
+
+
+@app.post("/api/releases/{release_id}/accept")
+async def api_release_accept(release_id: int):
+    """Check a deployed release in a browser now — the human trigger and retry.
+
+    For a release FACTORY_ACCEPT did not pick up, or one refused because `golden-tester` did
+    not exist yet. Clears the refusal and asks again; anything but `deployed` is a 409.
+    """
+    row = await db.get_release(release_id)
+    if row is None:
+        raise HTTPException(404, f"no such release: {release_id}")
+    if row["status"] != "deployed":
+        raise HTTPException(409, f"release {release_id} is {row['status']}, not deployed")
+    await db.set_release_error(release_id, None)
+    try:
+        return {"run_id": await accept.create(release_id)}
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - an unreachable boxd is a 400, not a 500
+        raise HTTPException(400, f"could not start acceptance of release {release_id}: {exc}") from exc
 
 
 @app.post("/api/releases/{release_id}/reviewed")

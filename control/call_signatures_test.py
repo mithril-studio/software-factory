@@ -25,7 +25,7 @@ import inspect
 import pathlib
 import sys
 
-from control import plan, provision, runner
+from control import accept, deploy, plan, provision, release, runner
 
 fails: list[str] = []
 
@@ -50,6 +50,9 @@ MODULES = {
     "control/runner.py": runner,
     "control/plan.py": plan,
     "control/provision.py": provision,
+    "control/deploy.py": deploy,
+    "control/accept.py": accept,
+    "control/release.py": release,
 }
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -108,7 +111,10 @@ check("and has no failed parameter", "failed" in params, False)
 
 # Every RunLog opened must be closed, or the process leaks a descriptor per run. Two of these
 # went unclosed at once, one of them on the build dispatch path.
-for relpath in ("control/runner.py", "control/plan.py", "control/provision.py"):
+for relpath in (
+    "control/runner.py", "control/plan.py", "control/provision.py", "control/deploy.py",
+    "control/accept.py",
+):
     source = (ROOT / relpath).read_text()
     opened = source.count("RunLog(")
     closed = source.count(".close()") - source.count("_fh.close()") - source.count("recorder.close()")

@@ -260,6 +260,16 @@ class Settings:
     # How long a restarted service has to answer its health URL before the deploy rolls back.
     deploy_health_wait: int = int(os.environ.get("FACTORY_DEPLOY_HEALTH_WAIT", "90"))
 
+    # After a release deploys, check it in a real browser on the test server: an agent on a VM
+    # booted from `golden-tester` exercises each issue the release carried and reports per
+    # issue. A rejection files a repair issue citing the failed issues' own criteria. Off by
+    # default — it is an agent run per release, and the image it needs is built separately.
+    accept_enabled: bool = os.environ.get("FACTORY_ACCEPT", "0") == "1"
+    # How many repair issues in a row acceptance may file for one repo before a further
+    # rejection stops for a human instead. One, for the reason review cycles are two: a repair
+    # that did not repair says the problem is not one an agent can see.
+    accept_max_repairs: int = int(os.environ.get("FACTORY_ACCEPT_MAX_REPAIRS", "1"))
+
     # Issue polling. The repos this deployment starts up watching — see `_repos()`.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"

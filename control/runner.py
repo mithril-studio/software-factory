@@ -116,7 +116,11 @@ class BudgetExceeded(RuntimeError):
 
 PLAN_PREFIX = "plan-"
 LEARN_PREFIX = "learn-"
-VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, PLAN_PREFIX, LEARN_PREFIX)
+# A browser-acceptance run against a release on its repo's test server (`control/accept.py`).
+ACCEPT_PREFIX = "acc-"
+VM_PREFIXES = (
+    RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, PLAN_PREFIX, LEARN_PREFIX, ACCEPT_PREFIX,
+)
 
 
 # Run kinds that work on a machine the factory did not create and must never delete.
@@ -129,8 +133,8 @@ def is_run_vm(name: str) -> bool:
 
 
 def vm_role(name: str) -> str:
-    """What a machine in the fleet is: `run`, `review`, `provision`, `plan`, `learn`, or
-    `other`.
+    """What a machine in the fleet is: `run`, `review`, `provision`, `plan`, `learn`,
+    `accept`, or `other`.
 
     Read off the same prefixes `is_run_vm` sweeps on, so the fleet view and the reaper can
     never disagree about what belongs to the factory. `other` covers everything the factory
@@ -146,6 +150,8 @@ def vm_role(name: str) -> str:
         return "plan"
     if name.startswith(LEARN_PREFIX):
         return "learn"
+    if name.startswith(ACCEPT_PREFIX):
+        return "accept"
     if name.startswith(RUN_PREFIX):
         return "run"
     return "other"

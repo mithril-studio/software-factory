@@ -90,7 +90,10 @@ function ItemRow({ item, acceptance }: { item: PacketItem; acceptance?: { status
       <TableCell className="align-top">
         {acceptance ? (
           <>
-            <StateBadge state={acceptance.status === "pass" ? "kept" : "failed"} />
+            <StateBadge
+              state={acceptance.status === "pass" ? "kept" : acceptance.status === "not_applicable" ? "none" : "failed"}
+            />
+            <span className="ml-2 font-mono text-[11px] text-muted-foreground">{acceptance.status}</span>
             <p className="mt-1 max-w-xs text-[11px] text-muted-foreground">{acceptance.evidence}</p>
           </>
         ) : (

@@ -345,7 +345,10 @@ TERMINAL = ("succeeded", "failed", "cancelled")
 #
 # `deploy` is a release reaching the test server: it runs on that persistent machine, claims no
 # issue, and must not stop the queue from building the next one while it restarts a service.
-UNCLAIMED_KINDS = ("provision", "learn", "deploy")
+#
+# `accept` is a browser checking a release on that same server: work about a release, not an
+# issue, and the queue keeps building while it looks.
+UNCLAIMED_KINDS = ("provision", "learn", "deploy", "accept")
 
 
 def utcnow() -> str:
