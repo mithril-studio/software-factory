@@ -75,6 +75,20 @@ CREATE TABLE IF NOT EXISTS memory_receipts (
     received_at TEXT
 );
 
+-- One row per skill a run reported finishing, from its `FACTORY_SKILL {...}` receipt line. The
+-- skill loop (slob-detection, simplification, design-check) is mandatory only if it is
+-- observable, and a receipt in the stream is how it is observed: whether a build ran each
+-- skill, and what the skill said — `clean`, `changed`, or `findings` — is a query, not a hope.
+-- A skill reported twice in one run REPLACEs: the second run of a skill is the one that counts.
+CREATE TABLE IF NOT EXISTS skill_receipts (
+    run_id      TEXT NOT NULL,
+    skill       TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    summary     TEXT,
+    received_at TEXT,
+    PRIMARY KEY (run_id, skill)
+);
+
 CREATE TABLE IF NOT EXISTS model_prices (
     model                   TEXT NOT NULL,
     valid_from              TEXT NOT NULL,
@@ -221,6 +235,7 @@ async def clear_run(run_id: str) -> None:
         await conn.execute("DELETE FROM tool_calls WHERE run_id = ?", (run_id,))
         await conn.execute("DELETE FROM memory_reads WHERE run_id = ?", (run_id,))
         await conn.execute("DELETE FROM memory_receipts WHERE run_id = ?", (run_id,))
+        await conn.execute("DELETE FROM skill_receipts WHERE run_id = ?", (run_id,))
         await conn.commit()
 
 
@@ -269,6 +284,35 @@ async def memory_reads_for_run(run_id: str) -> list[dict]:
            WHERE run_id = ? ORDER BY ts, memory_id""",
         (run_id,),
     )
+
+
+async def write_skill_receipt(
+    run_id: str, skill: str, verdict: str, summary: str | None, ts: str | None = None
+) -> None:
+    """Record that a run finished one skill of the loop, and what it said.
+
+    REPLACE on (run, skill): a skill run again after its findings were fixed reports again, and
+    the later report is the one that describes the change being handed over.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            """INSERT OR REPLACE INTO skill_receipts (run_id, skill, verdict, summary, received_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (run_id, skill, verdict, summary, ts),
+        )
+        await conn.commit()
+
+
+async def skill_receipts_for_run(run_id: str) -> list[dict]:
+    """The skill receipts one run filed, in the order they arrived."""
+    return [
+        dict(r)
+        for r in await _rows(
+            "SELECT skill, verdict, summary, received_at FROM skill_receipts "
+            "WHERE run_id = ? ORDER BY received_at, rowid",
+            (run_id,),
+        )
+    ]
 
 
 async def memory_receipt_for_run(run_id: str) -> dict:

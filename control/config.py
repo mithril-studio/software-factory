@@ -270,6 +270,20 @@ class Settings:
     # that did not repair says the problem is not one an agent can see.
     accept_max_repairs: int = int(os.environ.get("FACTORY_ACCEPT_MAX_REPAIRS", "1"))
 
+    # The skill loop: before a build opens its pull request it runs each of these skills on its
+    # change and each prints a `FACTORY_SKILL {...}` receipt. Receipts are always recorded;
+    # with this on, the build prompt asks for the loop and a build missing any receipt is sent
+    # back as a fix cycle before a review VM is spent on it. Off until the skills exist in
+    # agent-skills — a gate on a skill no golden carries would send every build back.
+    skill_loop: bool = os.environ.get("FACTORY_SKILL_LOOP", "0") == "1"
+    skill_loop_required: tuple[str, ...] = tuple(
+        s.strip()
+        for s in os.environ.get(
+            "FACTORY_SKILL_LOOP_REQUIRED", "slob-detection,simplification,design-check"
+        ).split(",")
+        if s.strip()
+    )
+
     # Issue polling. The repos this deployment starts up watching — see `_repos()`.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"

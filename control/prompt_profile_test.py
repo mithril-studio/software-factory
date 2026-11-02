@@ -140,7 +140,7 @@ REVIEW_BODY = (
 rev = runner.REVIEW_PROMPT_TEMPLATE.format(
     project_notes=PROFILE, repo="a/repo", number=7, title="t", pr_url="u",
     branch="b", base="main", base_sha="deadbeef", criteria="- id: AC1\n",
-    body=REVIEW_BODY,
+    body=REVIEW_BODY, skill_loop_check="",
 )
 check("the reviewer gets the project's own checks", "npm test` is the whole suite" in rev, True)
 check("and not another project's", "test:integration" in rev, False)

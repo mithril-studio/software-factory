@@ -195,6 +195,21 @@ code is the whole verdict: 0 deployed, 95 refused before changing anything, 96/9
 rolled back, 98 failed and the rollback failed too. Format and operations:
 `OPERATIONS.md` § "`## Deploy`".
 
+### §3.7 The skill-loop receipt
+
+Before a build opens its pull request it runs a fixed loop of skills —
+`FACTORY_SKILL_LOOP_REQUIRED`, by default `slob-detection`, `simplification`, `design-check`,
+which live in agent-skills — and each skill ends by printing one line:
+
+    FACTORY_SKILL {"skill": "simplification", "verdict": "clean|changed|findings", "summary": "…"}
+
+and appending it to a `## Skill loop` section of the PR body. `runner.parse_skill_receipts`
+reads the lines off the stream like the memory receipt, and `telemetry` keeps them in
+`skill_receipts`. Receipts are always recorded. With `FACTORY_SKILL_LOOP` on, the build
+prompt asks for the loop, the reviewer treats a missing `## Skill loop` section as a finding,
+and a build missing any receipt is sent back as a fix cycle before a review VM is booted.
+Nothing can gate until those skills ship, which is why the switch defaults off.
+
 ## §4 The pipeline
 
 Every phase of an issue is a row in `runs` with its own `kind`, and every step is a status
