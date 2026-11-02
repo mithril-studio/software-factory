@@ -119,7 +119,7 @@ check("a learning run does not claim the repo either", run(db.has_active_run(REP
 
 # Both exclusions come from one list rather than two `!=` clauses that drifted apart.
 check("the excluded kinds are named in one place", sorted(db.UNCLAIMED_KINDS),
-      ["learn", "provision"])
+      ["deploy", "learn", "provision"])
 
 # A build alongside them still claims it. Without this the previous two checks would also
 # pass if the guard had simply stopped working.

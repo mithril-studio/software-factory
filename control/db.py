@@ -321,7 +321,10 @@ TERMINAL = ("succeeded", "failed", "cancelled")
 # that was never in the way. `provision` learned this by stopping repos for a whole install;
 # `learn` is here from the start for the same reason, and because a learning run reads a
 # window of finished work that builds keep extending underneath it.
-UNCLAIMED_KINDS = ("provision", "learn")
+#
+# `deploy` is a release reaching the test server: it runs on that persistent machine, claims no
+# issue, and must not stop the queue from building the next one while it restarts a service.
+UNCLAIMED_KINDS = ("provision", "learn", "deploy")
 
 
 def utcnow() -> str:
@@ -1209,6 +1212,21 @@ async def add_release_items(release_id: int, items: list[dict]) -> None:
                  i["merged_sha"], i.get("summary"))
                 for i in items
             ],
+        )
+        await conn.commit()
+
+
+async def set_release_error(release_id: int, error: str | None) -> None:
+    """Note why a release is stuck where it is, without moving it.
+
+    For the one case a transition cannot express: a promoted release whose deploy was refused
+    before it started — the repo says nothing about how to deploy — stays `promoted`, and the
+    schedule must not try again every tick until somebody fixes the profile.
+    """
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE releases SET error = ?, updated_at = ? WHERE id = ?",
+            (error, utcnow(), release_id),
         )
         await conn.commit()
 

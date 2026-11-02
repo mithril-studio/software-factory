@@ -185,6 +185,16 @@ The runner prints the manifest as a `FACTORY-MANIFEST` line, selects the telemet
 from it, and falls back to `claude -p` when `factory-agent` is absent. The full contract is
 `../control/README.md` §2.3.
 
+### §3.6 The deploy contract
+
+A repo says how a release reaches its test server in the `## Deploy` section of its
+`.factory.md` — `machine`, `path`, `install`, `build`, optional `migrate`, `service`, `health`,
+`url` — read at the release's own commit by `preflight.deploy_facts`. The control plane runs
+those commands on that machine through a fixed POSIX script (`deploy.DEPLOY_SCRIPT`) whose exit
+code is the whole verdict: 0 deployed, 95 refused before changing anything, 96/97 failed and
+rolled back, 98 failed and the rollback failed too. Format and operations:
+`OPERATIONS.md` § "`## Deploy`".
+
 ## §4 The pipeline
 
 Every phase of an issue is a row in `runs` with its own `kind`, and every step is a status
@@ -198,6 +208,7 @@ transition on that row:
 | `provision` | `prov-*` | Build a repo's warm golden |
 | `plan` | `plan-*` | Compare the repo against its goal; file the next issues or declare it met |
 | `learn` | `learn-*` | Read the window's telemetry and file proposals to improve the repo |
+| `deploy` | `test-*` (persistent) | Fast-forward the repo's test server to a promoted release, rebuild, restart, check health; roll back on failure |
 
 Every run works against the repo's **integration branch** — `repos.base_branch`, the
 GitHub default unless a repo is pointed elsewhere — and nothing in the dispatch paths asks

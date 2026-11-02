@@ -369,6 +369,38 @@ Keep harness invariants out of it. Anything that would hang or corrupt *any* run
 background long commands, commit and push as you go) belongs in the prompt, not here; see
 `../discussion.md` §"Where rules live".
 
+### `## Deploy`
+
+How a promoted release reaches the repo's stable test server. Read by the control plane, not
+by agents, at the release's own commit — so a release deploys the way that version says it
+deploys. One `key: value` line per step, values optionally in backticks:
+
+```markdown
+## Deploy
+
+- machine: test-acme-api
+- path: /home/boxd/app
+- install: `npm ci`
+- build: `npm run build`
+- migrate: `npm run db:migrate`
+- service: test-acme-api
+- health: http://localhost:3000/healthz
+- url: https://test-acme-api.boxd.sh
+```
+
+Every key but `migrate` is required. `machine` must not carry a run prefix (`run-`, `rev-`, …)
+— the reconciler destroys those between runs — so it is `test-<owner-repo>`, which is what
+`scripts/provision-test-server.sh` builds and what it prints this section for.
+
+A deploy (`control/deploy.py`, a run of `kind='deploy'`) refuses a dirty checkout or the wrong
+branch, fast-forwards to the release sha, then runs install, build, migrate, restarts the
+service and waits `FACTORY_DEPLOY_HEALTH_WAIT` seconds for `health`. If anything after the
+fast-forward fails it resets the checkout to where it started, rebuilds, restarts and checks
+health again. **A migration is not rolled back** — only the checkout is. The factory never
+creates, starts or destroys the machine: a missing or stopped test server fails the deploy
+for a human. If a deploy ever leaves the box beyond what its rollback fixes,
+`boxd machine checkpoint restore test-<owner-repo> initial` is the reset.
+
 ## Configuration
 
 The ~12 variables an operator actually decides about. Every variable, with its default and
@@ -389,6 +421,7 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `FACTORY_HALT_ON_FAILURE` | Halt a repo's queue on an open `agent:failed`/`agent:blocked` issue. On by default. |
 | `FACTORY_PLAN` | The goal loop: plan new issues toward a repo's committed `.factory/goal.md` when its queue runs dry, one feature per pass. **Off by default** — it files issues, which is autonomous spend. Cadence and caps: `FACTORY_PLAN_COOLDOWN` (900s), `FACTORY_PLAN_MAX_STALLS` (2), `FACTORY_PLAN_MAX_ISSUES` (6). |
 | `FACTORY_RELEASE` | Promote each repo's green integration head onto `FACTORY_RELEASE_BRANCH` (`test`) at `FACTORY_RELEASE_TIMES` (`09:00,11:30,14:00,16:00`, `FACTORY_RELEASE_TZ` `Europe/Amsterdam`), then freeze until reviewed or `FACTORY_RELEASE_REVIEW_TIMEOUT` (86400s). **Off by default.** |
+| `FACTORY_DEPLOY` | Deploy each promoted release to its repo's test server per its `## Deploy` section. `FACTORY_DEPLOY_TIMEOUT` (1800s), `FACTORY_DEPLOY_HEALTH_WAIT` (90s). **Off by default.** |
 | `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
 | `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
 | `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |
@@ -419,7 +452,8 @@ exhaustive list is `control/app.py`.
   `POST /api/reconcile`
 - **Releases** — `GET /api/releases?repo=`, `GET /api/releases/{id}` (with its items),
   `POST /api/releases/assemble {"repo"}` (now, out of schedule; 409 while frozen),
-  `POST /api/releases/{id}/reviewed` (lifts the freeze).
+  `POST /api/releases/{id}/deploy` (deploy a promoted release now; the retry after a
+  refusal), `POST /api/releases/{id}/reviewed` (lifts the freeze).
 - **Goals** — the goal itself is not an API: it is `.factory/goal.md`, committed in the
   repo, noticed by SHA within ~5 minutes. `POST .../replan` re-arms a `met` or `stalled`
   goal without editing the file. `POST /api/runs` with `kind: "plan"` plans now, ignoring
@@ -438,6 +472,7 @@ exhaustive list is `control/app.py`.
 | `build-golden.sh` | Build the `golden-copy` base image (above). |
 | `refresh-golden.sh` | Refresh a repo's warm golden in place (above). |
 | `factory-health.sh` | External monitor; runs from a GitHub Actions cron every 10 minutes and manages an alert issue. |
+| `provision-test-server.sh` | Build a repo's persistent `test-<owner-repo>` machine: clone of the release branch over a read-only deploy key, systemd unit, the app's `.env` placed by hand, checkpoint `initial`. Prints the `## Deploy` section. |
 | `provision-hetzner.sh` | Build the control-plane box from nothing: systemd unit, Caddy, unattended upgrades. |
 | `planner-setup.sh` | Provision the `planner` box that runs `factory-compose`. |
 

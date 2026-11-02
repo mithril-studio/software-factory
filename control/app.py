@@ -23,7 +23,8 @@ from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
 from . import (
-    agents, auth, db, github, goldens, plan, poller, preflight, provision, release, repos, runner,
+    agents, auth, db, deploy, github, goldens, plan, poller, preflight, provision, release, repos,
+    runner,
 )
 from .config import ROOT, settings
 
@@ -770,6 +771,28 @@ async def api_assemble_release(body: AssembleRelease):
     except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
         raise HTTPException(400, f"could not assemble a release of {repo}: {exc}") from exc
     return {"release": row, "reason": why}
+
+
+@app.post("/api/releases/{release_id}/deploy")
+async def api_release_deploy(release_id: int):
+    """Deploy a promoted release now — the human retry.
+
+    For a release the schedule did not deploy: FACTORY_DEPLOY is off, or the repo's `## Deploy`
+    section was missing or wrong when it was promoted. Clears the refusal noted on the release
+    and asks again; a release that is not `promoted` is a 409.
+    """
+    row = await db.get_release(release_id)
+    if row is None:
+        raise HTTPException(404, f"no such release: {release_id}")
+    if row["status"] != "promoted":
+        raise HTTPException(409, f"release {release_id} is {row['status']}, not promoted")
+    await db.set_release_error(release_id, None)
+    try:
+        return {"run_id": await deploy.create(release_id)}
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
+        raise HTTPException(400, f"could not deploy release {release_id}: {exc}") from exc
 
 
 @app.post("/api/releases/{release_id}/reviewed")

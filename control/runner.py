@@ -119,6 +119,10 @@ LEARN_PREFIX = "learn-"
 VM_PREFIXES = (RUN_PREFIX, REVIEW_PREFIX, PROVISION_PREFIX, PLAN_PREFIX, LEARN_PREFIX)
 
 
+# Run kinds that work on a machine the factory did not create and must never delete.
+PERSISTENT_VM_KINDS = ("deploy",)
+
+
 def is_run_vm(name: str) -> bool:
     """True for a machine this factory created for a run: build, review or provisioning."""
     return name.startswith(VM_PREFIXES)
@@ -3273,7 +3277,9 @@ async def cancel(run_id: str) -> bool:
     task = _tasks.get(run_id)
     if task:
         task.cancel()
-    if run.get("vm_id"):
+    # A deploy runs on the repo's persistent test server, which is not the run's to destroy.
+    # Its row carries no `vm_id` for exactly this reason; the kind check is the second lock.
+    if run.get("vm_id") and run.get("kind") not in PERSISTENT_VM_KINDS:
         boxd = client()
         try:
             await boxd.machines.delete(run["vm_id"])
