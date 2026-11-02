@@ -10,8 +10,8 @@ name: Factory health
 #
 # It lives here, and not on the control plane, because a monitor that shares a disk with the
 # thing it monitors goes quiet in exactly the failure it exists to catch. GitHub Actions is
-# outside boxd and outside the Hetzner box the control plane is moving to, so this survives
-# that move: only the FACTORY_URL variable changes.
+# outside wherever the control plane runs — boxd, then Hetzner, now boxd again — so it has
+# survived every move: only the FACTORY_URL variable changed.
 #
 # Setup — one repository variable and two secrets:
 #   gh variable set FACTORY_URL      --body 'https://…'

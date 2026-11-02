@@ -8,6 +8,21 @@ Newest first.
 
 ---
 
+## 2026-11-02 — The control plane moves back to boxd
+
+The Hetzner box stopped answering: up according to Hetzner, silent on every port including
+ping, and still silent after a reboot. Its disk held the only `.env` and the only run history.
+Rather than rescue it, the owner moved the control plane back to boxd (`mithril-factory`).
+
+The first boxd control plane was lost to a corrupted root filesystem on 2026-08-19, and that
+risk has not gone away. What changed is what a lost machine costs: daily boxd disk backups, a
+checkpoint before every deploy, a machine that rebuilds itself from `scripts/provision-boxd.sh`,
+and secrets that are re-issued (`scripts/factory-secrets.sh`, a newly minted boxd key) rather
+than restored. The run history from Hetzner is not carried over; the factory starts with an
+empty ledger.
+
+---
+
 ## 2026-08-12 — Run analysis session
 
 Analysed the last 10 runs on the `software-factory` boxd VM (target repo:

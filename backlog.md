@@ -368,7 +368,7 @@ Three parts, in order:
    archaeology exercise.
 
 Related and already agreed: Infisical for secrets, on Joost's own backlog. Until that lands,
-credentials live in `.env` on the Hetzner box and in `boxd env` for the machines, and
+credentials live in `.env` on the control-plane machine and in `boxd env` for the machines, and
 mirroring between the two is by hand.
 
 ## later
