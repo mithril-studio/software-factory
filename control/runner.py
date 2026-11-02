@@ -431,6 +431,75 @@ async def _persist_memory_receipt(run_id: str, receipt: dict, log: RunLog) -> No
         log.write(f"[factory] memory receipt not recorded: {exc!r}")
 
 
+# --------------------------------------------------------------------------- skill receipts
+
+# The line a skill in the loop prints when it finishes, so whether a build ran it is readable
+# off the stream the same way memory priming is. The skills own the printing (agent-skills);
+# this layer owns reading it, and — with FACTORY_SKILL_LOOP on — refusing to review a build
+# that did not.
+SKILL_RECEIPT_MARKER = "FACTORY_SKILL"
+SKILL_VERDICTS = ("clean", "changed", "findings")
+_SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+
+
+def parse_skill_receipt(text: str) -> dict | None:
+    """The first valid `FACTORY_SKILL` receipt in `text`, or None. Pure, never raises.
+
+    Valid is `{"skill": <slug>, "verdict": clean|changed|findings, "summary": <str>}`. The
+    prompt's own example line names `<name>` and the verdicts joined by bars, so an echo of the
+    prompt parses as nothing rather than as a receipt for a skill that never ran.
+    """
+    found = parse_skill_receipts(text)
+    return found[0] if found else None
+
+
+def parse_skill_receipts(text: str) -> list[dict]:
+    """Every valid `FACTORY_SKILL` receipt in `text`, in order."""
+    out: list[dict] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith(SKILL_RECEIPT_MARKER):
+            continue
+        payload = line[len(SKILL_RECEIPT_MARKER):]
+        if not payload or not payload[0].isspace():
+            continue
+        try:
+            obj = json.loads(payload.strip())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        skill, verdict = obj.get("skill"), obj.get("verdict")
+        if not isinstance(skill, str) or not _SKILL_NAME.match(skill):
+            continue
+        if verdict not in SKILL_VERDICTS:
+            continue
+        summary = obj.get("summary")
+        out.append({
+            "skill": skill,
+            "verdict": verdict,
+            "summary": " ".join(str(summary).split())[:500] if summary is not None else None,
+        })
+    return out
+
+
+def skill_loop_gap(receipts: Iterable[str] | dict, required: Iterable[str]) -> list[str]:
+    """The required skills no receipt was seen for, in the order they are required. Pure."""
+    seen = set(receipts)
+    return [skill for skill in required if skill not in seen]
+
+
+async def _persist_skill_receipt(run_id: str, receipt: dict, log: RunLog) -> None:
+    """Record one skill receipt through telemetry. Best-effort, like the memory receipt."""
+    try:
+        await telemetry_store.write_skill_receipt(
+            run_id, receipt["skill"], receipt["verdict"], receipt.get("summary"), db.utcnow()
+        )
+        log.write(f"[factory] skill {receipt['skill']}: {receipt['verdict']}")
+    except Exception as exc:  # noqa: BLE001 - telemetry must never fail an otherwise good run
+        log.write(f"[factory] skill receipt not recorded: {exc!r}")
+
+
 # --------------------------------------------------------------------------- memory candidates
 
 # Where the agent writes the learnings it wants to propose, and the variable that tells it.
@@ -692,7 +761,7 @@ How to work:
    README, CLAUDE.md, `.factory.md` or the code itself. At most {memory_candidate_max}, and
    usually zero — a run that discovered nothing new writes nothing. Never put a secret, a
    token, or a transcript excerpt in one.
-7. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
+{skill_loop}{pr_step}. Push the final commit and open a pull request with `gh pr create --fill --base {base}`,
    referencing the issue in the body so it links (e.g. "Closes #{number}").
 
 This project — the package manager's download caches on this machine are warm, so installing
@@ -897,6 +966,44 @@ async def project_notes(repo: str, ref: str) -> str:
     return text.strip() if text and text.strip() else DEFAULT_PROJECT_NOTES
 
 
+SKILL_LOOP_STEP = """7. Run the skill loop on your change before you open the pull request. Load and run each of
+   these skills, in this order: {skills}. Apply what each finds, verify again, and commit.
+   Each skill ends by printing one receipt line, `{marker} {{"skill": "<name>", "verdict":
+   "clean|changed|findings", "summary": "<one line>"}}` — make sure every one is printed. The
+   control plane reads them, and a pull request missing any of the {count} is sent back
+   before anyone reviews it. Copy the same lines under a `## Skill loop` heading in the pull
+   request body.
+"""
+
+SKILL_LOOP_REVIEW = """
+3. **Skill loop.** The pull request body must carry a `## Skill loop` section with one
+   `{marker}` line for each of {skills}. A missing section, or a skill missing from it, is a
+   finding. So is a line whose `verdict` is `findings` when the change does not address what
+   its summary says was found.
+"""
+
+
+def skill_loop_step() -> str:
+    """The build prompt's skill-loop step, or nothing when the loop is off."""
+    if not settings.skill_loop or not settings.skill_loop_required:
+        return ""
+    return SKILL_LOOP_STEP.format(
+        skills=", ".join(f"`{s}`" for s in settings.skill_loop_required),
+        marker=SKILL_RECEIPT_MARKER,
+        count=len(settings.skill_loop_required),
+    )
+
+
+def skill_loop_review() -> str:
+    """The review prompt's skill-loop check, or nothing when the loop is off."""
+    if not settings.skill_loop or not settings.skill_loop_required:
+        return ""
+    return SKILL_LOOP_REVIEW.format(
+        marker=SKILL_RECEIPT_MARKER,
+        skills=", ".join(f"`{s}`" for s in settings.skill_loop_required),
+    )
+
+
 def build_prompt(
     repo: str,
     issue: dict,
@@ -921,6 +1028,8 @@ def build_prompt(
         memory_candidate_env=MEMORY_CANDIDATE_ENV,
         memory_candidate_path=MEMORY_CANDIDATE_PATH,
         memory_candidate_max=MEMORY_CANDIDATE_MAX_RECORDS,
+        skill_loop=skill_loop_step(),
+        pr_step=8 if skill_loop_step() else 7,
     )
     # Keyed on the cycle and the attempt, not on the attempt alone. A fix run is attempt 1 of
     # cycle 2, so `attempt > 1` was false for it — and the review findings or CI log the whole
@@ -1040,7 +1149,7 @@ Then look for two specific things and report them as findings if present:
    `docs/adr/*`, `.mem/`. Only rules that are actually written down. Do not invent a
    convention and then report the code for violating it; if it is not written anywhere, it is
    not a finding.
-
+{skill_loop_check}
 When you are done, write your verdict to **/tmp/factory-verdict.json** and nothing else:
 
 ```json
@@ -2772,8 +2881,10 @@ async def _execute(
             # request back for another pass.
             resume=attempt > 1 or review_cycle > 1,
         )
+        skills: dict[str, dict] = {}
         exit_code, usage, manifest = await asyncio.wait_for(
-            _stream(boxd, machine.id, env, log, run_id), timeout=settings.run_timeout
+            _stream(boxd, machine.id, env, log, run_id, skills=skills),
+            timeout=settings.run_timeout,
         )
         log.write(f"[factory] agent exited {exit_code}")
         await db.update_run(
@@ -2806,9 +2917,42 @@ async def _execute(
             # base branch on the builder's word alone. The poller refuses such issues before
             # dispatch now (`gate_reason`); this catches the ones that arrive by hand.
             unreviewable = gate_reason(issue.get("body") or "") is not None
-            review_next = settings.review_enabled and not unreviewable
+            # The skill loop is checked before anything else is spent on the pull request: a
+            # build that skipped it goes back as a fix cycle, and no review VM is booted to
+            # discover what the receipts already say.
+            skill_gap = (
+                skill_loop_gap(skills, settings.skill_loop_required)
+                if settings.skill_loop and not unreviewable
+                else []
+            )
+            review_next = settings.review_enabled and not unreviewable and not skill_gap
             merged = False
-            if review_next:
+            if skill_gap:
+                log.write(f"[factory] skill loop not run: {', '.join(skill_gap)}; sending back")
+                await _fix_cycle(
+                    repo,
+                    number,
+                    review_cycle,
+                    log,
+                    reason=f"skill-loop not run: {', '.join(skill_gap)}",
+                    detail=(
+                        f"The pull request {pr_url} was opened without the skill loop. No "
+                        f"receipt was seen for: {', '.join(skill_gap)}.\n\n"
+                        + skill_loop_step().replace("7. ", "", 1)
+                        + "\nRun the missing skills now, on the change as it stands, commit "
+                          "what they produce, and update the pull request body."
+                    ),
+                    going_back=(
+                        f"Pull request {pr_url} skipped the skill loop "
+                        f"({', '.join(skill_gap)}). Sending it back before review."
+                    ),
+                    giving_up=(
+                        f"Pull request {pr_url} still skipped the skill loop "
+                        f"({', '.join(skill_gap)}) after {review_cycle} cycles. Stopping — "
+                        f"needs a human."
+                    ),
+                )
+            elif review_next:
                 # Hand the PR to a reviewing agent instead of merging on the builder's word.
                 log.write(f"[factory] {len(criteria)} acceptance criteria; queueing review")
             elif unreviewable:
@@ -2827,7 +2971,9 @@ async def _execute(
             )
             outcome = f"Factory run finished. Pull request: {pr_url}"
             label = github.LABEL_DONE
-            if merged:
+            if skill_gap:
+                outcome = None  # `_fix_cycle` has already said what happens next
+            elif merged:
                 outcome += " (auto-merged)"
             elif review_next:
                 outcome += " — under review"
@@ -2838,14 +2984,15 @@ async def _execute(
                     f"factory builds issues carrying {CRITERIA_FORMAT}."
                 )
                 label = github.LABEL_BLOCKED
-            await _mirror_issue(
-                repo,
-                number,
-                None if review_next else label,
-                [] if review_next else [github.LABEL_RUNNING],
-                log,
-                comment=outcome,
-            )
+            if not skill_gap:
+                await _mirror_issue(
+                    repo,
+                    number,
+                    None if review_next else label,
+                    [] if review_next else [github.LABEL_RUNNING],
+                    log,
+                    comment=outcome,
+                )
         else:
             reason = f"exit {exit_code}, {'no ' if not pr_url else ''}pull request"
             await _fail_run(
@@ -2928,6 +3075,7 @@ async def _execute_review(
             base_sha=base_sha,
             criteria=yaml.safe_dump(criteria, sort_keys=False, allow_unicode=True),
             body=issue.get("body") or "(no description given)",
+            skill_loop_check=skill_loop_review(),
         )
         env = dispatch_env(
             repo=repo,
@@ -3126,6 +3274,7 @@ async def _stream(
     log: RunLog,
     run_id: str,
     script: str = VM_SCRIPT,
+    skills: dict | None = None,
 ) -> tuple[int, dict, dict]:
     """Run the agent, formatting its event stream into the log as it arrives.
 
@@ -3139,11 +3288,16 @@ async def _stream(
     stream we were already parsing, not a second stream: the facts telemetry wants are
     the ones scrolling past here, and the only thing that used to happen to them was
     being formatted into a log line and forgotten.
+
+    `skills`, when given, is filled with the skill-loop receipts seen on the way past, keyed
+    by skill — the caller's copy of what was also persisted, so the gate does not depend on a
+    telemetry write having succeeded.
     """
     buffer = ""
     usage: dict = {}
     manifest: dict = {}
     receipt: dict | None = None
+    seen_skills: dict[str, dict] = skills if skills is not None else {}
     recorder = Recorder(run_id)
     async with boxd.machines.stream_exec(
         machine_id, command=export_prelude(env) + script, env=env, close_stdin=True
@@ -3218,15 +3372,18 @@ async def _stream(
                             )
                     for formatted in stream_lines(event, line):
                         log.write(formatted)
-                    better = _better_receipt(receipt, _receipt_candidates(event))
+                    texts = _receipt_candidates(event)
+                    better = _better_receipt(receipt, texts)
                     if better is not None:
                         receipt = better
                         await _persist_memory_receipt(run_id, receipt, log)
+                    await _harvest_skills(run_id, texts, seen_skills, log)
                     continue
                 better = _better_receipt(receipt, (line,))
                 if better is not None:
                     receipt = better
                     await _persist_memory_receipt(run_id, receipt, log)
+                await _harvest_skills(run_id, (line,), seen_skills, log)
                 log.write(line)
         code = stream.exit_code
         if inspect.isawaitable(code):
@@ -3235,6 +3392,20 @@ async def _stream(
     if recorder.dropped:
         log.write(f"[factory] telemetry dropped {recorder.dropped} events")
     return int(code or 0), usage, manifest
+
+
+async def _harvest_skills(
+    run_id: str, texts: Iterable[str], seen: dict[str, dict], log: RunLog
+) -> None:
+    """Record every new or changed skill receipt in `texts` into `seen` and telemetry."""
+    for text in texts:
+        if SKILL_RECEIPT_MARKER not in (text or ""):
+            continue
+        for found in parse_skill_receipts(text):
+            if seen.get(found["skill"]) == found:
+                continue
+            seen[found["skill"]] = found
+            await _persist_skill_receipt(run_id, found, log)
 
 
 async def _salvage_transcript(

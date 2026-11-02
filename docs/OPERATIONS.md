@@ -424,6 +424,7 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `FACTORY_RELEASE` | Promote each repo's green integration head onto `FACTORY_RELEASE_BRANCH` (`test`) at `FACTORY_RELEASE_TIMES` (`09:00,11:30,14:00,16:00`, `FACTORY_RELEASE_TZ` `Europe/Amsterdam`), then freeze until reviewed or `FACTORY_RELEASE_REVIEW_TIMEOUT` (86400s). **Off by default.** |
 | `FACTORY_DEPLOY` | Deploy each promoted release to its repo's test server per its `## Deploy` section. `FACTORY_DEPLOY_TIMEOUT` (1800s), `FACTORY_DEPLOY_HEALTH_WAIT` (90s). **Off by default.** |
 | `FACTORY_ACCEPT` | After a deploy, check the release in a browser on its test server (`golden-tester`); a seen failure files one `agent:queued` repair issue, and after `FACTORY_ACCEPT_MAX_REPAIRS` (1) in a row a further one stops for a human. **Off by default.** |
+| `FACTORY_SKILL_LOOP` | Require the skill loop (`FACTORY_SKILL_LOOP_REQUIRED`, default `slob-detection,simplification,design-check`) before review: a build missing a `FACTORY_SKILL` receipt is sent back as a fix cycle. Receipts are recorded either way. **Off by default** — the skills must exist in agent-skills first. |
 | `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
 | `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
 | `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |

@@ -107,6 +107,7 @@ import is the producer knowing its sink, and it disappears when OTLP arrives.
 | `model_prices` | `telemetry` | Per-million rates for every token class, per model, with `valid_from` |
 | `memory_reads` | `telemetry` | One row per memory record a run opened while priming (§3.3) |
 | `memory_receipts` | `telemetry` | One row per run: what its `FACTORY_MEMORY` receipt reported (§3.3) |
+| `skill_receipts` | `telemetry` | One row per run and skill: what its `FACTORY_SKILL` receipt reported — the skill loop, observed |
 
 The coupling with `control` is the one-way import described in §2 plus the shared database
 and `run.id`.

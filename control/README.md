@@ -203,6 +203,10 @@ deterministic plumbing:
   priming. `runner.parse_memory_receipt` reads it off the stream and persists it through
   `telemetry` (`memory_reads`, `memory_receipts`), so whether memory is being read is a
   queryable fact rather than a hope.
+- **The skill receipt.** Not memory, but the same machinery: each skill in the loop prints
+  `FACTORY_SKILL {json}`, `runner.parse_skill_receipts` reads it off the stream, and
+  telemetry keeps it in `skill_receipts`. With `FACTORY_SKILL_LOOP` on, a build missing one
+  goes back as a fix cycle before any review (`../docs/architecture.md` §3.7).
 - **The candidate queue.** `runner._collect_memory_candidates` pulls
   `$FACTORY_MEMORY_CANDIDATES` out of the VM before reaping — bounded (64 kB, 20 records),
   scope-checked to repo-relative paths, content-addressed — into the `memory_candidates`
