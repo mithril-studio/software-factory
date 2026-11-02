@@ -73,7 +73,10 @@ don't push it ahead of the mechanical fixes, which are cheaper and land sooner.
 ### Scope decisions: Playwright out, Sentry out
 
 - **Playwright belongs to a future tester agent, not the main factory.** It must not be
-  installed or run inside a factory run, and the golden must not warm the browser cache. The
+  installed or run inside a factory run, and the golden must not warm the browser cache.
+  *(2026-11-02: that tester is now browser acceptance — `control/accept.py`, booting its own
+  `golden-tester` image that no build or review can resolve onto. The rule above still holds
+  for every other run.)* The
   repo's e2e suite and its CI step stay — CI is where that coverage comes from for now.
 - **Sentry gets removed.** Joost is building his own telemetry layer to give insight into the
   logs, so a third-party error tracker is redundant. `pino` and the structured logging stay;

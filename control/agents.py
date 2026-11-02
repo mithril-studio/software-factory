@@ -4,6 +4,8 @@ A golden is a boxd snapshot, and its *name* says which repo it was warmed for:
 
     golden-copy               the base image — tooling and the agent's auth, no repo
     golden-<repo-slug>        the base image with one repo already cloned and installed
+    golden-tester             the base image plus a browser, for acceptance runs only — the
+                              one `golden-*` name that is deliberately *not* a golden here
 
     resolution:  golden-<repo-slug>  →  golden-copy  →  nothing
 
@@ -45,6 +47,12 @@ GOLDEN_PREFIX = "golden-"
 # It cannot collide with a per-repo name. A slug is built from `owner/name`, and the `/` alone
 # guarantees at least one hyphen, so no repo slug is ever the single word `copy`.
 BASE_SNAPSHOT = f"{GOLDEN_PREFIX}copy"
+
+# The browser-acceptance image: `golden-copy` plus Playwright and a browser. It is a snapshot
+# the factory boots, but never for a build or a review — Playwright is kept out of those runs by
+# standing decision — so it is the one `golden-*` name `parse_golden` refuses (below). It cannot
+# collide with a repo slug for the reason `copy` cannot: a slug always carries a hyphen.
+TESTER_SNAPSHOT = f"{GOLDEN_PREFIX}tester"
 
 # What `parse_golden` returns for the base image: a golden that carries no repo. Empty rather
 # than `None` because `None` already means "not a golden at all", and those are different
@@ -98,7 +106,9 @@ def parse_golden(name: str) -> str | None:
     with the hyphens a slug can never begin with.
     """
     name = (name or "").strip()
-    if not name.startswith(GOLDEN_PREFIX):
+    # The one exception to the contract: the acceptance image is not a golden any build or
+    # review may resolve onto. Only `control/accept.py` boots it, by name.
+    if not name.startswith(GOLDEN_PREFIX) or name == TESTER_SNAPSHOT:
         return None
     if name == BASE_SNAPSHOT:
         return BASE

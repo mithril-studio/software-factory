@@ -98,6 +98,7 @@ async def get_issue(repo: str, number: int) -> dict:
         "body": data.get("body") or "",
         "url": data.get("html_url") or "",
         "labels": [label["name"] for label in data.get("labels", [])],
+        "state": data.get("state") or "open",
     }
 
 

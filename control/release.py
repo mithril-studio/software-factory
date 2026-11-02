@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import db, deploy, github, repos, runner
+from . import accept, db, deploy, github, repos, runner
 from .config import settings
 
 log = logging.getLogger("factory.release")
@@ -133,16 +133,38 @@ def stale(release: dict, now: dt.datetime, timeout: int) -> bool:
     )
 
 
-def frozen(release: dict | None, now: dt.datetime, timeout: int) -> bool:
+def frozen(
+    release: dict | None, now: dt.datetime, timeout: int, repair_open: bool = False
+) -> bool:
     """Whether `release` — a repo's latest — holds that repo's next release back.
 
     Every non-terminal state freezes: the control plane is still working on it, or it is on
     the test server waiting to be read. A standing release past its timeout does not, because
     the next `expire_stale` turns it terminal and the repo should not wait a tick for that.
+
+    `repair_open` is the one way a *terminal* release still freezes: acceptance rejected it and
+    filed a repair, a human has read it, and the repair has not merged yet. Releasing again
+    before it does would put the same broken change back on the test server.
     """
-    if release is None or release.get("status") in db.RELEASE_TERMINAL:
+    if release is None:
         return False
+    if release.get("status") in db.RELEASE_TERMINAL:
+        return bool(repair_open and release.get("repair_issue"))
     return not stale(release, now, timeout)
+
+
+async def repair_open(release: dict | None) -> bool:
+    """Whether `release` filed a repair issue that is still open. Fails closed: an issue
+    GitHub cannot be asked about is treated as open, so an outage holds the freeze."""
+    if not release or not release.get("repair_issue"):
+        return False
+    try:
+        issue = await github.get_issue(release["repo"], int(release["repair_issue"]))
+    except Exception:  # noqa: BLE001 - see the docstring
+        log.warning("could not read repair #%s of %s; holding the freeze",
+                    release["repair_issue"], release["repo"])
+        return True
+    return issue.get("state") != "closed"
 
 
 def promotion_failure(status_code: int, message: str, branch: str) -> str:
@@ -224,8 +246,12 @@ async def assemble(repo: str) -> tuple[dict | None, str]:
     asking, only by reviewing.
     """
     latest = await db.latest_release(repo)
-    if frozen(latest, _now(), settings.release_review_timeout):
-        raise Frozen(f"release {latest['id']} is {latest['status']} and holds {repo} frozen")
+    if frozen(latest, _now(), settings.release_review_timeout, await repair_open(latest)):
+        raise Frozen(
+            f"release {latest['id']} is {latest['status']}"
+            + (f" with repair #{latest['repair_issue']} open" if latest.get("repair_issue") else "")
+            + f" and holds {repo} frozen"
+        )
     base = await repos.base_branch(repo)
     head = await github.branch_sha(repo, base)
     if head is None:
@@ -460,13 +486,31 @@ async def deploy_promoted() -> list[int]:
     return started
 
 
+async def accept_deployed() -> list[int]:
+    """Start browser acceptance for every deployed release not already refused one."""
+    started = []
+    for release in await db.releases_in(("deployed",)):
+        if release.get("error"):
+            continue
+        try:
+            await accept.create(release["id"])
+            started.append(release["id"])
+        except ValueError as exc:
+            log.info("release %s not accepted: %s", release["id"], exc)
+        except Exception:  # noqa: BLE001 - one repo's acceptance must not stop another's
+            log.exception("could not start acceptance of release %s", release["id"])
+    return started
+
+
 async def _tick() -> None:
     now = _now()
     await expire_stale(now)
-    # Before the release switch, not behind it: a release assembled by hand deploys like a
-    # scheduled one. FACTORY_DEPLOY is the switch that governs this half.
+    # Before the release switch, not behind it: a release assembled by hand deploys and is
+    # accepted like a scheduled one. FACTORY_DEPLOY and FACTORY_ACCEPT govern these halves.
     if settings.deploy_enabled:
         await deploy_promoted()
+    if settings.accept_enabled:
+        await accept_deployed()
     if not settings.release_enabled:
         return
     times = parse_times(settings.release_times)
@@ -479,7 +523,7 @@ async def _tick() -> None:
             if moment is None or _checked.get(repo) == moment:
                 continue
             _checked[repo] = moment
-            if frozen(latest, now, settings.release_review_timeout):
+            if frozen(latest, now, settings.release_review_timeout, await repair_open(latest)):
                 log.info("%s: %s moment skipped, release %s is %s",
                          repo, moment.isoformat(), latest["id"], latest["status"])
                 continue

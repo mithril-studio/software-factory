@@ -48,6 +48,7 @@ One module per concern:
 | `plan` | The goal loop: sync `.factory/goal.md`, plan the next feature toward it when the queue runs dry |
 | `release` | The release schedule: promote green integration heads onto `test`, freeze until reviewed |
 | `deploy` | Deploy a promoted release to its repo's persistent test server, as a run of `kind='deploy'` |
+| `accept` | Browser acceptance of a deployed release on a `golden-tester` VM, as a run of `kind='accept'`; files the repair on a rejection |
 | `preflight` | Is a repo ready? Labels, token scopes, golden — boots nothing |
 | `github` | Every GitHub API call: issues, labels, PRs, checks, merge |
 | `memory` | The `.mem/` validator; a CI gate (§5) |

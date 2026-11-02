@@ -208,6 +208,7 @@ transition on that row:
 | `provision` | `prov-*` | Build a repo's warm golden |
 | `plan` | `plan-*` | Compare the repo against its goal; file the next issues or declare it met |
 | `learn` | `learn-*` | Read the window's telemetry and file proposals to improve the repo |
+| `accept` | `acc-*` | Open the deployed release in a browser (`golden-tester`), report per issue; a seen failure files a repair issue |
 | `deploy` | `test-*` (persistent) | Fast-forward the repo's test server to a promoted release, rebuild, restart, check health; roll back on failure |
 
 Every run works against the repo's **integration branch** — `repos.base_branch`, the
@@ -268,6 +269,17 @@ repo is then frozen until a human marks the release `reviewed` or it expires; me
 integration branch continue meanwhile. The schedule and the freeze are both read off the
 latest `releases` row, so a restart neither repeats nor loses a moment. `control/release.py`
 holds the loop.
+
+With `FACTORY_DEPLOY` a promoted release is deployed to the repo's persistent test server
+(§3.6, `control/deploy.py`); with `FACTORY_ACCEPT` a deployed one is then checked in a browser
+by an agent on a `golden-tester` VM (`control/accept.py`). The agent reports per issue and the
+control plane decides, fail-closed: a seen failure rejects the release and files one
+`agent:queued` repair issue that re-cites the failed issues' blocking criteria, so it passes
+the dispatch gate by construction; anything less concrete fails the release for a human. A
+rejected release keeps its repo frozen until it is reviewed *and* its repair has merged, and
+the test server is never rolled back automatically. Every release ends in a human review
+packet (`GET /api/releases/{id}/packet`) where feedback is noted, and filed as an issue only
+on a second click.
 
 ## §5 What it deliberately does not have
 
