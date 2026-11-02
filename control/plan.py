@@ -212,7 +212,9 @@ async def sync_goal_file(repo: str) -> None:
         return
     _goal_synced[repo] = now
     try:
-        sha = await github.file_sha(repo, GOAL_PATH)
+        # Read from the integration branch when one is set: that is the branch the planner
+        # checks out, so a goal committed there is the goal it will read.
+        sha = await github.file_sha(repo, GOAL_PATH, repos.configured_base(repo))
     except Exception as exc:  # noqa: BLE001 - unknown is not absent; try again next interval
         log.warning("could not check %s's goal file: %r", repo, exc)
         return
@@ -440,7 +442,7 @@ async def _execute(run_id: str, repo: str, goal: str, run_log: runner.RunLog) ->
     machine = None
     reaped = False
     try:
-        base = await github.default_branch(repo)
+        base = await repos.base_branch(repo)
         notes = await runner.project_notes(repo, base)
 
         await db.update_run(run_id, status="forking", started_at=db.utcnow())

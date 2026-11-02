@@ -199,6 +199,10 @@ transition on that row:
 | `plan` | `plan-*` | Compare the repo against its goal; file the next issues or declare it met |
 | `learn` | `learn-*` | Read the window's telemetry and file proposals to improve the repo |
 
+Every run works against the repo's **integration branch** — `repos.base_branch`, the
+GitHub default unless a repo is pointed elsewhere — and nothing in the dispatch paths asks
+GitHub for the default directly (`control/base_branch_test.py`).
+
 Two budgets, deliberately separate:
 
 - **Attempts** (`FACTORY_MAX_ATTEMPTS`, default 3): a crashed build retries on a fresh VM,

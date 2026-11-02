@@ -545,6 +545,29 @@ async def api_replan(owner: str, name: str):
     return {"repo": repo, "goal_state": row.get("goal_state")}
 
 
+class RepoSettings(BaseModel):
+    # The integration branch: where runs branch from and merge into. Empty or null reverts to
+    # the repo's GitHub default branch.
+    base_branch: str | None = None
+
+
+@app.patch("/api/repos/{owner}/{name}")
+async def api_repo_settings(owner: str, name: str, body: RepoSettings):
+    """Change how the factory works a watched repo. Today that is its integration branch.
+
+    Validated against GitHub before it is stored, so a typo is refused here rather than
+    discovered by the next run's checkout.
+    """
+    repo = f"{owner}/{name}"
+    if repo not in repos.watched():
+        raise HTTPException(404, f"{repo} is not watched")
+    try:
+        row = await repos.set_base_branch(repo, body.base_branch)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"repo": repo, "base_branch": row.get("base_branch")}
+
+
 @app.delete("/api/repos/{owner}/{name}")
 async def api_disconnect_repo(owner: str, name: str):
     """Stop watching a repo. Its runs stay — they are the ledger, not the configuration.
@@ -609,6 +632,8 @@ async def api_projects():
                 "plan_stalls": row.get("plan_stalls") or 0,
                 "last_planned_at": row.get("last_planned_at"),
                 "plan_enabled": settings.plan_enabled,
+                # The integration branch, or null when the repo follows its GitHub default.
+                "base_branch": row.get("base_branch"),
             }
         )
     return out

@@ -149,6 +149,9 @@ export type Project = {
   /** Whether this deployment runs the goal loop at all (FACTORY_PLAN). A goal set while
    *  this is false is a note on the register, and the UI should say so. */
   plan_enabled: boolean
+  /** The integration branch: where runs branch from and merge into. Null means the repo's
+   *  GitHub default branch. */
+  base_branch: string | null
 }
 
 /** One preflight question and its answer.
@@ -403,6 +406,19 @@ export async function post<T>(url: string, body?: unknown): Promise<T> {
   return resp.json()
 }
 
+export async function patch<T>(url: string, body: unknown): Promise<T> {
+  const resp = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!resp.ok) {
+    if (resp.status === 401) onUnauthorized()
+    throw new Error(await detail(resp))
+  }
+  return resp.json()
+}
+
 export async function del<T>(url: string): Promise<T> {
   const resp = await fetch(url, { method: "DELETE" })
   if (!resp.ok) {
@@ -459,6 +475,12 @@ export function warmGolden(repo: string): Promise<{ run_id: string }> {
 /** Drop this repo's golden. Its runs fall back to the base and install for themselves. */
 export function dropGolden(repo: string): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/api/repos/${repo}/golden`)
+}
+
+/** Point a repo at an integration branch, or back at its default with an empty string.
+ *  Refused with a message when the branch does not exist on GitHub. */
+export function setBaseBranch(repo: string, branch: string): Promise<{ base_branch: string | null }> {
+  return patch<{ base_branch: string | null }>(`/api/repos/${repo}`, { base_branch: branch })
 }
 
 /** Put a `met` or `stalled` goal back to `active`, so the next dry poll tick plans again.

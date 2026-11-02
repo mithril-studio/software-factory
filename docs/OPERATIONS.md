@@ -294,10 +294,17 @@ re-snapshot it under the same name.
 
    `FACTORY_REPOS` is the *seed* for that register: entries are added on boot if they are
    not already there, and removing one does not unwatch the repo.
-3. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
+3. Optionally point it at an **integration branch** — **Projects → Base branch**, or
+   `PATCH /api/repos/{owner}/{name} {"base_branch": "develop"}`. Runs then branch from it,
+   open their pull requests against it and merge into it, the planner reads its goal file
+   from it, and its golden is warmed on it. Empty reverts to the GitHub default. The branch
+   must already exist (it is checked before it is stored), and CI has to run on pushes and
+   pull requests to it. Because GitHub only honours `Closes #n` on the default branch, the
+   factory closes an issue itself after merging it into an integration branch.
+4. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
    without checks, auto-merge can never pass its gate and every pull request waits for a
    human.
-4. Ask, before trusting any of it:
+5. Ask, before trusting any of it:
 
    ```bash
    .venv/bin/python -m control.preflight mithril-studio/legal-ai-app
@@ -404,7 +411,8 @@ exhaustive list is `control/app.py`.
   same evidence a learning run is handed. `GET /api/improvements` and
   `GET /api/improvements/{id}` are the ledger of what the loop changed and why — read-only,
   because a status is moved by the factory as work actually happens to it.
-- **Repos & goldens** — `POST`/`DELETE /api/repos`, `GET /api/github/repos`,
+- **Repos & goldens** — `POST`/`DELETE /api/repos`, `PATCH /api/repos/{owner}/{name}`
+  (`base_branch`), `GET /api/github/repos`,
   `GET /api/preflight?repo=`, `POST`/`DELETE /api/repos/{owner}/{name}/golden`,
   `POST /api/goldens/refresh`, `GET /api/goldens`, `GET /api/machines`,
   `POST /api/reconcile`

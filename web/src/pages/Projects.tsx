@@ -7,6 +7,7 @@ import {
   dropGolden,
   preflight,
   replan,
+  setBaseBranch,
   usePoll,
   warmGolden,
   type Connected,
@@ -19,6 +20,7 @@ import { RepoPicker } from "@/components/RepoPicker"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { PageHeader, Empty, ErrorNote } from "@/components/Page"
 
@@ -250,6 +252,48 @@ function GoalCell({ p, onChanged }: { p: Project; onChanged: () => void }) {
   )
 }
 
+/** The integration branch, editable in place. Empty means the repo's GitHub default — which
+ *  is what every repo used before this existed, so nothing changes until somebody types. */
+function BranchCell({ p, onChanged }: { p: Project; onChanged: () => void }) {
+  const [value, setValue] = useState(p.base_branch ?? "")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const dirty = value.trim() !== (p.base_branch ?? "")
+
+  async function onSave(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError(null)
+    try {
+      await setBaseBranch(p.repo, value.trim())
+      onChanged()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form onSubmit={onSave} className="flex items-center gap-2">
+      <Input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="default branch"
+        title="Where runs branch from, open pull requests against and merge into. Empty follows the GitHub default."
+        className="h-7 w-32 text-xs"
+        disabled={busy}
+      />
+      {dirty && (
+        <Button type="submit" variant="ghost" size="sm" disabled={busy}>
+          {busy ? "Saving…" : "Save"}
+        </Button>
+      )}
+      {error && <span className="font-mono text-[10px] text-bad">{error}</span>}
+    </form>
+  )
+}
+
 function Provisioning({ status }: { status: string }) {
   if (status === "ready") return <Badge variant="outline">warm</Badge>
   if (status === "running") return <Badge variant="muted">warming…</Badge>
@@ -347,6 +391,7 @@ export function Projects() {
                 <TableHead>Id</TableHead>
                 <TableHead>Git Url</TableHead>
                 <TableHead>Golden</TableHead>
+                <TableHead>Base branch</TableHead>
                 <TableHead>Goal</TableHead>
                 <TableHead className="text-right">Runs</TableHead>
                 <TableHead className="text-right">Successful Runs</TableHead>
@@ -372,6 +417,9 @@ export function Projects() {
                     <span className="ml-2">
                       <Provisioning status={p.provision_status} />
                     </span>
+                  </TableCell>
+                  <TableCell>
+                    <BranchCell key={p.base_branch ?? ""} p={p} onChanged={refresh} />
                   </TableCell>
                   <TableCell>
                     <GoalCell p={p} onChanged={refresh} />
