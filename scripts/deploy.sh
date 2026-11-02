@@ -87,6 +87,30 @@ else
 fi
 npm --prefix web run build >/tmp/npm-build.log 2>&1 || { tail -20 /tmp/npm-build.log; exit 1; }
 
+# Credentials set with `boxd env set` are injected into exec sessions like this one and into no
+# file, so systemd never sees them. Copy the ones the control plane reads into .env, so that
+# rotating a token with `boxd env set` reaches the service on the next deploy. A variable boxd
+# does not inject leaves its .env line alone.
+python3 - <<\PY
+import os, pathlib
+keys = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GITHUB_TOKEN")
+new = {k: os.environ[k] for k in keys if os.environ.get(k, "").strip()}
+env = pathlib.Path(".env")
+lines = env.read_text().splitlines()
+seen, out = set(), []
+for line in lines:
+    key = line.partition("=")[0]
+    if key in new:
+        out.append(f"{key}={new[key]}"); seen.add(key)
+    else:
+        out.append(line)
+out += [f"{k}={v}" for k, v in new.items() if k not in seen]
+if new:
+    env.write_text("\n".join(out) + "\n")
+print("from boxd env:", ", ".join(sorted(new)) or "nothing")
+PY
+chmod 600 .env
+
 # Schema changes apply themselves on boot — db.init() and telemetry.store.init() are both
 # idempotent — so a restart is the whole migration step. `sync` because boxd reboots are cold.
 sync

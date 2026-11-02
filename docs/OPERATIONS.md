@@ -69,8 +69,12 @@ and a `gh` that may add deploy keys, and can again. Re-running it is safe. It mi
 machine's own `BOXD_API_KEY` (that needs an interactive `boxd login`; an API-key session may
 not mint keys, and the script says what to run instead) and generates the UI login, and it
 writes no GitHub or agent credential. Those are handed over with `scripts/factory-secrets.sh`,
-which prompts for them hidden and moves them straight into the machine's `.env`. Secrets live
-in that `.env` and in no other place — not in this repo, not in CI.
+which prompts for them hidden and moves them straight into the machine's `.env` — or set
+them with `boxd env set --secret` scoped to the machine: boxd injects those into exec sessions
+but not into systemd, so `scripts/deploy.sh` copies `CLAUDE_CODE_OAUTH_TOKEN`,
+`ANTHROPIC_API_KEY` and `GITHUB_TOKEN` from them into `.env` on every deploy, and a token
+rotated with `boxd env set` reaches the service with the next deploy. Secrets live in that
+`.env` and in boxd's env store, and in no other place — not in this repo, not in CI.
 
 The boxd machine name doubles as its `.boxd.sh` subdomain and is unique across boxd, which is
 why it is not `software-factory` — that name belongs to somebody else.
