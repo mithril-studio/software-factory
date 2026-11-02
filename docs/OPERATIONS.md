@@ -81,6 +81,10 @@ stops answering.
 
 ## What a run does
 
+The poller only gets this far for an issue whose `## Acceptance criteria` block holds at least
+one `test`, `probe` or `structure` criterion. Anything else is labelled `agent:blocked` with a
+comment naming what is missing, and never gets a VM (`FACTORY_REQUIRE_CRITERIA`).
+
 1. Fetch the issue from GitHub
 2. Restore a VM from the golden snapshot (~0.2s), with idle-suspend disabled and a
    self-destruct timer set
@@ -92,8 +96,7 @@ stops answering.
    prompt, streaming its event log back live
 5. Find the PR the agent opened; salvage the session transcript; harvest memory candidates
 6. Destroy the VM
-7. When the issue carries acceptance criteria: dispatch a **review run** on a fresh VM and
-   record its verdict, record what **CI** decided, and — with auto-merge on — squash-merge
+7. Dispatch a **review run** on a fresh VM and record its verdict, record what **CI** decided, and — with auto-merge on — squash-merge
    pinned to the tested sha, repairing a conflict once by merging base into the branch. A
    rejecting review or red CI starts a fix cycle back at step 2.
 
@@ -373,6 +376,7 @@ the reasoning behind it, is annotated in `../.env.example`; defaults live in
 | `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | Durable agent auth; set one for unattended operation. |
 | `FACTORY_AUTO_MERGE` | Squash-merge a passing PR. Off by default. |
 | `FACTORY_REVIEW` | Dispatch a review run per PR. **On by default.** |
+| `FACTORY_REQUIRE_CRITERIA` | Refuse to dispatch an issue with no `test`/`probe`/`structure` acceptance criterion; it is labelled `agent:blocked` instead. **On by default.** |
 | `FACTORY_MAX_REVIEW_CYCLES` | Fix cycles per issue (2). |
 | `FACTORY_MAX_ATTEMPTS` | Crash retries per issue (3). |
 | `FACTORY_HALT_ON_FAILURE` | Halt a repo's queue on an open `agent:failed`/`agent:blocked` issue. On by default. |

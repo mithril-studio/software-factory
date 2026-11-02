@@ -170,10 +170,14 @@ class Settings:
     # How long to wait for those checks before giving up and leaving the PR open.
     merge_check_timeout: int = int(os.environ.get("FACTORY_MERGE_CHECK_TIMEOUT", "900"))
     # After a build run opens a PR, run a second agent that checks it against the issue's
-    # acceptance criteria before anything merges. Only applies to issues that actually carry a
-    # machine-readable criteria block — without one there is nothing to check, so the review is
-    # skipped rather than guessed at.
+    # acceptance criteria before anything merges. An issue without a blocking criterion is
+    # never reviewed and never merged: there is nothing to check it against, so its PR stops
+    # for a human (`agent:blocked`) rather than merging on the builder's word.
     review_enabled: bool = os.environ.get("FACTORY_REVIEW", "1") == "1"
+    # Refuse to dispatch a queued issue that carries no blocking acceptance criterion
+    # (`runner.gate_reason`). The poller labels it `agent:blocked` with a comment naming the
+    # format instead of spending a VM on a build that could only stop for a human at the end.
+    require_criteria: bool = os.environ.get("FACTORY_REQUIRE_CRITERIA", "1") == "1"
     # How many times a review may send an issue back for changes before it stops and asks for a
     # human. Two is deliberate: a third failure means the issue is wrong, not the code.
     max_review_cycles: int = int(os.environ.get("FACTORY_MAX_REVIEW_CYCLES", "2"))

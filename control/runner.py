@@ -763,6 +763,35 @@ def parse_criteria(body: str) -> list[dict]:
     return out
 
 
+# What an issue has to carry before the factory will build it, said once so the poller's
+# refusal, the build path's refusal and the feedback form's warning all quote the same rule.
+CRITERIA_FORMAT = (
+    "an `## Acceptance criteria` heading followed by a fenced ```yaml list, each item with "
+    "`id`, `mode`, `statement` and `verify` (the factory-compose format), and at least one "
+    f"criterion in mode {', '.join(BLOCKING_MODES)}"
+)
+
+
+def gate_reason(body: str) -> str | None:
+    """Why this issue may not be dispatched, or None when it may.
+
+    An issue without a blocking criterion has nothing a reviewer can run, so a build of it can
+    only ever be merged on the builder's word or stopped for a human — and the second is the
+    only safe answer, which makes dispatching it a VM spent to arrive at a question that was
+    answerable from the issue body. Three distinct reasons, because each is a different edit:
+    there is no block, the block does not parse, or every criterion is `inspect`, which
+    `decide` never lets block.
+    """
+    if not _CRITERIA_BLOCK.search(body or ""):
+        return "the issue has no `## Acceptance criteria` block"
+    criteria = parse_criteria(body)
+    if not criteria:
+        return "the `## Acceptance criteria` block does not parse into any criterion"
+    if not any(c.get("mode") in BLOCKING_MODES for c in criteria):
+        return "every acceptance criterion is `inspect`, and `inspect` never blocks a merge"
+    return None
+
+
 def _run_link(run_id: str) -> str | None:
     return f"{settings.base_url}/runs/{run_id}" if settings.base_url else None
 
@@ -2689,18 +2718,21 @@ async def _execute(
         review_next = False
         if ok:
             criteria = parse_criteria(issue.get("body") or "")
-            review_next = settings.review_enabled and bool(criteria)
+            # Nothing a reviewer can run means nothing may merge. This used to fall through to
+            # auto-merge, so with FACTORY_AUTO_MERGE on an issue without criteria went into the
+            # base branch on the builder's word alone. The poller refuses such issues before
+            # dispatch now (`gate_reason`); this catches the ones that arrive by hand.
+            unreviewable = gate_reason(issue.get("body") or "") is not None
+            review_next = settings.review_enabled and not unreviewable
             merged = False
             if review_next:
                 # Hand the PR to a reviewing agent instead of merging on the builder's word.
-                # An issue with no machine-readable criteria has nothing to review against, so
-                # it falls through to the old path rather than being reviewed against a guess.
                 log.write(f"[factory] {len(criteria)} acceptance criteria; queueing review")
+            elif unreviewable:
+                log.write("[factory] no blocking acceptance criteria; not reviewing, not merging")
             elif settings.auto_merge:
-                # Merge now so the next issue in the sequence branches from a main that
-                # already contains this issue's work.
-                if not criteria:
-                    log.write("[factory] issue carries no acceptance criteria; skipping review")
+                # Review is switched off by the operator. Merge now so the next issue in the
+                # sequence branches from a base that already contains this issue's work.
                 merged = (
                     await _merge(
                         repo, pr_url, base, log,
@@ -2711,14 +2743,22 @@ async def _execute(
                 run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
             )
             outcome = f"Factory run finished. Pull request: {pr_url}"
+            label = github.LABEL_DONE
             if merged:
                 outcome += " (auto-merged)"
             elif review_next:
                 outcome += " — under review"
+            elif unreviewable:
+                outcome = (
+                    f"PR opened, no acceptance criteria, not merged: {pr_url}\n\n"
+                    f"Nothing here can be reviewed against, so it stops for a human. The "
+                    f"factory builds issues carrying {CRITERIA_FORMAT}."
+                )
+                label = github.LABEL_BLOCKED
             await _mirror_issue(
                 repo,
                 number,
-                None if review_next else github.LABEL_DONE,
+                None if review_next else label,
                 [] if review_next else [github.LABEL_RUNNING],
                 log,
                 comment=outcome,

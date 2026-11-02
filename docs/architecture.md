@@ -206,8 +206,13 @@ Two budgets, deliberately separate:
 - **Review cycles** (`FACTORY_MAX_REVIEW_CYCLES`, default 2): a rejecting review or red CI
   dispatches a fix run against the same PR.
 
-Issues opt into review by carrying an `## Acceptance criteria` YAML block; `control` parses
-it deterministically and the reviewer checks each criterion. On a yes verdict with
+Criteria are mandatory, not opt-in. An issue is dispatched only when its `## Acceptance
+criteria` YAML block parses and holds at least one criterion in a blocking mode (`test`,
+`probe`, `structure`); otherwise the poller labels it `agent:blocked` and says what is missing
+(`runner.gate_reason`, `FACTORY_REQUIRE_CRITERIA`). A build that arrives without one by hand
+opens its PR and stops at `agent:blocked` — it is never reviewed against a guess and never
+merged. `control` parses the block deterministically and the reviewer checks each criterion.
+On a yes verdict with
 `FACTORY_AUTO_MERGE` on, the factory waits for the PR's checks, squash-merges pinned to the
 tested sha, and repairs a merge conflict once by merging base into the branch.
 
