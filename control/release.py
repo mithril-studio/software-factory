@@ -47,12 +47,20 @@ EXPIRABLE = ("promoted", "deployed", "accepted")
 # How much of each pull request's body the packet quotes.
 SUMMARY_MAX = 400
 
+# How far back assembly looks for factory pull requests a human merged by hand.
+HUMAN_MERGE_WINDOW_DAYS = 30
+
 _task: asyncio.Task | None = None
 # Release id -> the task finishing it (the CI wait and the promotion).
 _inflight: dict[int, asyncio.Task] = {}
 # Repo -> the last moment the schedule evaluated for it and found nothing to release. Memory,
 # not the table, because "nothing to do" writes no row; a restart re-asks once, harmlessly.
 _checked: dict[str, dt.datetime] = {}
+# Repos with an `assemble` between its freeze check and its new row. The freeze is read off the
+# table, and the table only changes at `create_release`, after several GitHub calls — so two
+# callers in that window (the tick and a click, or two clicks) would both pass it and promote
+# twice. Checked and set with no await in between, which is what makes it a lock here.
+_assembling: set[str] = set()
 
 
 # --------------------------------------------------------------------------- pure decisions
@@ -218,6 +226,15 @@ async def recover() -> list[int]:
     `deploying` or `accepting` with no task behind it would otherwise freeze its repo forever.
     """
     failed = []
+    # Their runs too. A deploy's run names a persistent machine that still exists, so the
+    # reconciler would never call it stranded; an acceptance run's row would keep its `acc-*`
+    # VM from ever being swept as an orphan.
+    for run in await db.active_runs():
+        if run.get("kind") in ("deploy", "accept") and run["id"] not in runner._tasks:
+            await db.update_run(
+                run["id"], status="failed", finished_at=db.utcnow(),
+                error="interrupted: the control plane restarted mid-run",
+            )
     for release in await db.releases_in(IN_FLIGHT):
         if release["id"] in _inflight:
             continue
@@ -245,6 +262,16 @@ async def assemble(repo: str) -> tuple[dict | None, str]:
     release still holds the freeze — a human asking for a release does not get to lift it by
     asking, only by reviewing.
     """
+    if repo in _assembling:
+        raise Frozen(f"a release of {repo} is already being assembled")
+    _assembling.add(repo)
+    try:
+        return await _assemble(repo)
+    finally:
+        _assembling.discard(repo)
+
+
+async def _assemble(repo: str) -> tuple[dict | None, str]:
     latest = await db.latest_release(repo)
     if frozen(latest, _now(), settings.release_review_timeout, await repair_open(latest)):
         raise Frozen(
@@ -259,6 +286,7 @@ async def assemble(repo: str) -> tuple[dict | None, str]:
     current = await github.branch_sha(repo, settings.release_branch)
     if current == head:
         return None, f"{settings.release_branch} is already at {base} ({head[:8]})"
+    await record_human_merges(repo, base)
     candidates = await db.unreleased_items(repo)
     if not candidates:
         return None, f"no merged factory work on {base} since the last release"
@@ -270,6 +298,33 @@ async def assemble(repo: str) -> tuple[dict | None, str]:
     _inflight[release["id"]] = task
     task.add_done_callback(lambda _t, rid=release["id"]: _inflight.pop(rid, None))
     return release, f"assembling {head[:8]}"
+
+
+async def record_human_merges(repo: str, base: str) -> int:
+    """Write `merged_sha` for factory pull requests that were merged by hand. Returns how many.
+
+    `runner._merge` records the squash commit, but only when the factory merges. With
+    FACTORY_AUTO_MERGE off — the default — a human merges every pull request, and without this
+    no item would ever be a release candidate. Asked here, at assembly, because this is the only
+    moment the answer is needed, and it costs one GET per unresolved pull request four times a
+    day. Only merges into `base` count: a pull request retargeted elsewhere is not on the branch
+    being released. Best-effort per pull request.
+    """
+    since = (_now() - dt.timedelta(days=HUMAN_MERGE_WINDOW_DAYS)).isoformat(timespec="seconds")
+    found = 0
+    for row in await db.unmerged_pull_requests(repo, since):
+        try:
+            number = int(str(row["pr_url"]).rstrip("/").split("/")[-1])
+            pr = await github.pull_request(repo, number)
+        except Exception:  # noqa: BLE001 - the next assembly asks again
+            log.warning("could not read %s", row["pr_url"])
+            continue
+        if pr.get("merged") and pr.get("merge_commit_sha") and pr.get("base") == base:
+            await db.update_run(row["run_id"], merged_sha=pr["merge_commit_sha"])
+            found += 1
+    if found:
+        log.info("%s: %s pull request(s) merged by hand since they were built", repo, found)
+    return found
 
 
 async def _fail(release_id: int, error: str) -> None:
@@ -329,20 +384,25 @@ async def promote(release_id: int, repo: str, head: str, candidates: list[dict])
 async def _items_in_range(
     repo: str, before: str | None, head: str, candidates: list[dict]
 ) -> list[dict]:
-    """The candidates whose squash commit is in `before..head`, each with a PR excerpt.
+    """The candidates whose squash commit `head` contains, each with a PR excerpt.
+
+    Every unreleased candidate in `head`'s history, not only those since `before`: a release
+    that died between moving the branch and recording its items left work that is on the
+    release branch and in no release, and this is what picks it up.
 
     The release branch has already moved by now, so nothing here may fail the release: a
-    compare that errors falls back to every candidate, and a pull request that cannot be read
-    is listed without its summary.
+    compare that errors keeps the candidate, and a pull request that cannot be read is listed
+    without its summary.
     """
-    chosen = candidates
-    if before is not None:
+    chosen = []
+    for c in candidates:
         try:
-            moved = set(await github.commits_between(repo, before, head))
-            chosen = [c for c in candidates if c["merged_sha"] in moved]
+            if await github.is_ancestor(repo, c["merged_sha"], head):
+                chosen.append(c)
         except Exception:  # noqa: BLE001 - see the docstring
-            log.exception("could not compare %s..%s on %s; listing every candidate",
-                          before[:8], head[:8], repo)
+            log.exception("could not place %s against %s on %s; listing it",
+                          c["merged_sha"][:8], head[:8], repo)
+            chosen.append(c)
     out = []
     for item in chosen:
         summary = criteria = None
@@ -522,12 +582,15 @@ async def _tick() -> None:
             )
             if moment is None or _checked.get(repo) == moment:
                 continue
-            _checked[repo] = moment
             if frozen(latest, now, settings.release_review_timeout, await repair_open(latest)):
+                _checked[repo] = moment
                 log.info("%s: %s moment skipped, release %s is %s",
                          repo, moment.isoformat(), latest["id"], latest["status"])
                 continue
             release, why = await assemble(repo)
+            # Marked only once assembly has answered. A GitHub error raises past this line, and
+            # the next tick asks again rather than losing the moment to a 502.
+            _checked[repo] = moment
             log.info("%s: %s", repo, why if release is None else f"release {release['id']} {why}")
         except Exception:  # noqa: BLE001 - one repo must not stop the others
             log.exception("release tick failed for %s", repo)

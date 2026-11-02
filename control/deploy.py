@@ -69,6 +69,18 @@ SUDO=""
 [ "$(id -u)" = "0" ] || SUDO="sudo -n"
 
 cd "$DEPLOY_PATH" 2>/dev/null || { say "no checkout at $DEPLOY_PATH"; exit 95; }
+
+# One deploy at a time on this machine. The control plane's timeout stops it *listening*, not
+# the script, so a deploy it gave up on may still be running when the next one starts; two at
+# once in one checkout is a state nobody can reason about. Held until this shell exits.
+if command -v flock > /dev/null 2>&1; then
+  exec 9> "${TMPDIR:-/tmp}/factory-deploy.lock"
+  flock -n 9 || { say "another deploy is still running on this machine; refusing"; exit 95; }
+fi
+
+# Each step in a subshell started from the checkout, so a step that does `cd web && …` does
+# not move the next one: the repo writes each command as if it ran from the checkout root.
+step() { ( cd "$DEPLOY_PATH" && eval "$1" ); }
 BEFORE=$(git rev-parse HEAD) || { say "$DEPLOY_PATH is not a git checkout"; exit 95; }
 say "before $BEFORE"
 branch=$(git rev-parse --abbrev-ref HEAD)
@@ -112,19 +124,19 @@ healthy() {
 
 build() {
   say "install"
-  eval "$DEPLOY_INSTALL" || return 1
+  step "$DEPLOY_INSTALL" || return 1
   say "build"
-  eval "$DEPLOY_BUILD" || return 1
+  step "$DEPLOY_BUILD" || return 1
   if [ -n "$DEPLOY_MIGRATE" ]; then
     say "migrate"
-    eval "$DEPLOY_MIGRATE" || return 1
+    step "$DEPLOY_MIGRATE" || return 1
   fi
 }
 
 rollback() {
   say "rolling back to $BEFORE"
   git reset --hard "$BEFORE" || { say "rollback failed: reset"; exit 98; }
-  eval "$DEPLOY_INSTALL" && eval "$DEPLOY_BUILD" || { say "rollback failed: rebuild"; exit 98; }
+  step "$DEPLOY_INSTALL" && step "$DEPLOY_BUILD" || { say "rollback failed: rebuild"; exit 98; }
   restart || { say "rollback failed: restart"; exit 98; }
   healthy || { say "rollback failed: the previous version is not healthy either"; exit 98; }
   say "rolled back to $BEFORE"
@@ -140,8 +152,15 @@ exit 0
 
 
 async def _facts_at(repo: str, sha: str) -> dict[str, str]:
-    """The `## Deploy` section as the release's own commit has it."""
-    return preflight.deploy_facts(await github.file(repo, runner.PROFILE_PATH, sha))
+    """The `## Deploy` section as the release's own commit has it.
+
+    Strict: a GitHub error raises rather than reading as an empty profile, because "the repo
+    says nothing about deploying" is noted on the release and not retried, and an outage must
+    be retried.
+    """
+    return preflight.deploy_facts(
+        await github.file(repo, runner.PROFILE_PATH, sha, strict=True)
+    )
 
 
 async def create(release_id: int) -> str:
@@ -164,6 +183,16 @@ async def create(release_id: int) -> str:
         raise ValueError(f"{repo} cannot be deployed: {problem}")
 
     await db.transition_release(release_id, "deploying", error=None)
+    try:
+        return await _start(release_id, repo, sha, facts)
+    except BaseException as exc:
+        # The release has already moved to `deploying`, and with no task behind it nothing
+        # would ever move it on — its repo would stay frozen until the next restart.
+        await _fail_release(release_id, f"deploy could not start: {exc!r}"[:300])
+        raise
+
+
+async def _start(release_id: int, repo: str, sha: str, facts: dict[str, str]) -> str:
     run_id = uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"
     log_path.touch()

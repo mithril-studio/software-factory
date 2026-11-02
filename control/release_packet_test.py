@@ -160,6 +160,13 @@ check("filing the same note twice is a 409",
       status_of(app_module.api_file_feedback(rid, gated["id"], app_module.FileFeedback())), 409)
 check("and opens no second issue", len(filed), 1)
 
+# Found in review: a note without criteria filed `agent:queued` is blocked by the poller on
+# the next tick, and a blocked issue halts the repo's whole queue.
+plain = run(app_module.api_file_feedback(rid, note["id"], app_module.FileFeedback()))
+check("a note without a blocking criterion is filed as a plain issue, not queued",
+      filed[-1][3], ())
+check("and the response says why", plain["gate_reason"] is not None, True)
+
 boom = run(app_module.api_release_feedback(rid, app_module.Feedback(text="boom: it broke")))
 check("GitHub refusing the issue is a 400",
       status_of(app_module.api_file_feedback(rid, boom["id"], app_module.FileFeedback())), 400)
@@ -171,7 +178,7 @@ check("feedback on another release is a 404",
 packet = run(release.packet(rid))
 check("the packet lists the feedback with its filing state",
       [(f["id"], bool(f["filed_at"])) for f in packet["feedback"]],
-      [(note["id"], False), (gated["id"], True), (boom["id"], False)])
+      [(note["id"], True), (gated["id"], True), (boom["id"], False)])
 
 print()
 print(f"{len(fails)} failed: {', '.join(fails)}" if fails else "ALL PASS")

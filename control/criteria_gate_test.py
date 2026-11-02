@@ -145,8 +145,8 @@ check("an unreviewable PR is caught before the auto-merge branch",
       execute_src.find("elif unreviewable:") < execute_src.find("elif settings.auto_merge:"), True)
 check("the old fall-through that merged without criteria is gone",
       "issue carries no acceptance criteria; skipping review" in execute_src, False)
-check("an unreviewable PR stops at agent:blocked",
-      "label = github.LABEL_BLOCKED" in execute_src, True)
+check("an unreviewable PR stops at agent:blocked where it would have auto-merged",
+      "if settings.auto_merge:\n                    label = github.LABEL_BLOCKED" in execute_src, True)
 
 print()
 print(f"{len(fails)} failed: {', '.join(fails)}" if fails else "ALL PASS")

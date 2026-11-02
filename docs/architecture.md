@@ -241,8 +241,9 @@ Criteria are mandatory, not opt-in. An issue is dispatched only when its `## Acc
 criteria` YAML block parses and holds at least one criterion in a blocking mode (`test`,
 `probe`, `structure`); otherwise the poller labels it `agent:blocked` and says what is missing
 (`runner.gate_reason`, `FACTORY_REQUIRE_CRITERIA`). A build that arrives without one by hand
-opens its PR and stops at `agent:blocked` — it is never reviewed against a guess and never
-merged. `control` parses the block deterministically and the reviewer checks each criterion.
+opens its PR and is never reviewed against a guess and never merged: it stops at
+`agent:blocked` where auto-merge would otherwise have merged it, and is `agent:done` for a
+human to merge where auto-merge is off. `control` parses the block deterministically and the reviewer checks each criterion.
 On a yes verdict with
 `FACTORY_AUTO_MERGE` on, the factory waits for the PR's checks, squash-merges pinned to the
 tested sha, and repairs a merge conflict once by merging base into the branch.
@@ -279,7 +280,8 @@ wall-clock moments (`FACTORY_RELEASE_TIMES` in `FACTORY_RELEASE_TZ`) the control
 each repo's integration head, waits for CI to be green on that exact commit, and
 fast-forwards the release branch (`test`) onto it — never forced; a diverged `test` fails the
 release for a human. The `releases` row records the range and `release_items` the merged
-pull requests in it, found by the squash commit each merge wrote to `runs.merged_sha`. The
+pull requests in it, found by the squash commit each merge wrote to `runs.merged_sha` — by
+`_merge` when the factory merged, or looked up at assembly when a human did. The
 repo is then frozen until a human marks the release `reviewed` or it expires; merges into the
 integration branch continue meanwhile. The schedule and the freeze are both read off the
 latest `releases` row, so a restart neither repeats nor loses a moment. `control/release.py`
@@ -294,7 +296,8 @@ the dispatch gate by construction; anything less concrete fails the release for 
 rejected release keeps its repo frozen until it is reviewed *and* its repair has merged, and
 the test server is never rolled back automatically. Every release ends in a human review
 packet (`GET /api/releases/{id}/packet`) where feedback is noted, and filed as an issue only
-on a second click.
+on a second click — `agent:queued` when it carries a blocking criterion, a plain issue for a
+human when it does not.
 
 ## §5 What it deliberately does not have
 

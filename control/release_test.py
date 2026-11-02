@@ -208,8 +208,8 @@ async def fake_update(repo, branch, sha):
     branches[branch] = sha
 
 
-async def fake_between(repo, base, head):
-    return list(compare_result)
+async def fake_is_ancestor(repo, sha, head):
+    return sha in compare_result
 
 
 async def fake_pr(repo, number):
@@ -228,7 +228,7 @@ github.default_branch = fake_default
 github.checks_green = fake_checks
 github.create_branch = fake_create
 github.update_branch = fake_update
-github.commits_between = fake_between
+github.is_ancestor = fake_is_ancestor
 github.pull_request = fake_pr
 
 
@@ -297,6 +297,105 @@ check("red CI on the head fails the release before anything moves",
       (row["status"], branches["test"]), ("failed", "head3"))
 github.checks_green = fake_checks
 
+# ---------- found in review: races, merges by hand, crash leftovers, lost moments
+
+branches["main"] = "head5"
+run(merged_run("r6", 6, "sha6"))
+compare_result[:] = ["sha5", "sha6"]
+
+
+async def slow_checks(repo, sha, timeout=900, interval=15):
+    await asyncio.sleep(0.05)
+    return (True, "ok", [])
+
+
+async def two_at_once():
+    results = await asyncio.gather(release.assemble("acme/api"), release.assemble("acme/api"),
+                                   return_exceptions=True)
+    await asyncio.gather(*list(release._inflight.values()))
+    return results
+
+
+github.checks_green = slow_checks
+results = run(two_at_once())
+check("two assembles at once make one release",
+      sorted(type(r).__name__ for r in results), ["Frozen", "tuple"])
+row = run(db.latest_release("acme/api"))
+check("which carries the item left out last time, now that head contains it",
+      sorted(i["merged_sha"] for i in run(db.release_items(row["id"]))), ["sha5", "sha6"])
+run(release.mark_reviewed(row["id"]))
+github.checks_green = fake_checks
+
+# A pull request a human merged: no merged_sha on any run until assembly asks GitHub.
+run(db.create_run(id="r7", repo="acme/api", issue_number=7, issue_title="by hand", kind="review",
+                  status="succeeded", pr_url="https://github.com/acme/api/pull/107",
+                  created_at=db.utcnow()))
+run(db.create_run(id="r8", repo="acme/api", issue_number=8, issue_title="elsewhere", kind="build",
+                  status="succeeded", pr_url="https://github.com/acme/api/pull/108",
+                  created_at=db.utcnow()))
+
+
+async def pr_states(repo, number):
+    return {"title": "", "body": "", "merged": True, "merge_commit_sha": f"hand{number}",
+            "base": "main" if number == 107 else "other"}
+
+
+github.pull_request = pr_states
+branches["main"] = "head6"
+compare_result[:] = ["hand107", "hand108"]
+row, why = run(assemble_and_wait("acme/api"))
+check("a pull request merged by hand becomes a release item",
+      [i["merged_sha"] for i in run(db.release_items(row["id"]))], ["hand107"])
+check("one merged into another branch does not", run(db.get_run("r8"))["merged_sha"], None)
+run(release.mark_reviewed(row["id"]))
+github.pull_request = fake_pr
+
+calls = {"n": 0}
+
+
+async def flaky_branch_sha(repo, branch):
+    calls["n"] += 1
+    if calls["n"] == 1:
+        raise RuntimeError("502")
+    return branches.get(branch)
+
+
+object.__setattr__(settings, "release_enabled", True)
+object.__setattr__(settings, "release_times", "00:00")
+object.__setattr__(settings, "deploy_enabled", False)
+object.__setattr__(settings, "accept_enabled", False)
+release._checked.clear()
+github.branch_sha = flaky_branch_sha
+branches["main"] = "head7"
+run(merged_run("r9", 9, "sha9"))
+compare_result[:] = ["sha9"]
+before = run(db.latest_release("acme/api"))["id"]
+
+
+async def backdate(release_id):
+    # So today's 00:00 moment is owed: nothing has happened to the latest release since it.
+    async with db.connect() as conn:
+        await conn.execute("UPDATE releases SET updated_at = '2000-01-01T00:00:00+00:00' "
+                           "WHERE id = ?", (release_id,))
+        await conn.commit()
+
+
+run(backdate(before))
+run(release._tick())
+check("a GitHub error at a moment does not spend it", run(db.latest_release("acme/api"))["id"], before)
+
+
+async def tick_and_wait():
+    await release._tick()
+    await asyncio.gather(*list(release._inflight.values()))
+
+
+run(tick_and_wait())
+check("the next tick tries the same moment again", run(db.latest_release("acme/api"))["id"], before + 1)
+github.branch_sha = fake_branch_sha
+object.__setattr__(settings, "release_enabled", False)
+run(release.mark_reviewed(before + 1))
+
 # ---------- expiry and recovery
 
 old = run(db.create_release("acme/web", test_sha="w1"))
@@ -305,8 +404,12 @@ check("a release nobody read expires", run(release.expire_stale()), [old["id"]])
 check("and lifts the freeze", release.frozen(run(db.get_release(old["id"])), release._now(), 86400),
       False)
 stuck = run(db.create_release("acme/web", test_sha="w2"))
+run(db.create_run(id="dep-orphan", repo="acme/web", issue_number=0, kind="deploy",
+                  status="running", vm_name="test-acme-web", created_at=db.utcnow()))
 check("a release left assembling by a restart is failed at startup",
       run(release.recover()), [stuck["id"]])
+check("and so is a deploy run nothing is watching any more",
+      run(db.get_run("dep-orphan"))["status"], "failed")
 
 # ---------- wiring
 

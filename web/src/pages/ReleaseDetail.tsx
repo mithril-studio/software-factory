@@ -16,6 +16,7 @@ import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { PageHeader, SectionHead, ErrorNote, Empty } from "@/components/Page"
 import { StateBadge } from "@/components/StateBadge"
+import { Badge } from "@/components/ui/badge"
 
 const STANDING = ["promoted", "deployed", "accepted", "rejected"]
 
@@ -33,11 +34,13 @@ function sha(value: string | null | undefined): string {
 }
 
 /** A criterion is only "met" when the reviewer said so with evidence. Everything else —
- *  including a criterion it never mentioned — is shown as the gap it is. */
-function criterionVariant(status: string): string {
-  if (status === "met") return "kept"
-  if (status === "not reported") return "blocked"
-  return "failed"
+ *  including a criterion it never mentioned — is shown as the gap it is. The same reading
+ *  serves the browser's per-issue statuses. */
+function verdictVariant(status: string): "ok" | "warn" | "bad" | "muted" {
+  if (status === "met" || status === "pass") return "ok"
+  if (status === "not_applicable") return "muted"
+  if (status === "not reported" || status === "cannot_verify") return "warn"
+  return "bad"
 }
 
 function ItemRow({ item, acceptance }: { item: PacketItem; acceptance?: { status: string; evidence: string } }) {
@@ -64,10 +67,9 @@ function ItemRow({ item, acceptance }: { item: PacketItem; acceptance?: { status
             {item.criteria.map((c) => (
               <li key={c.id} className="border-l border-subtle pl-3">
                 <div className="flex items-center gap-2 font-mono text-[11px]">
-                  <StateBadge state={criterionVariant(c.status)} />
+                  <Badge variant={verdictVariant(c.status)}>{c.status}</Badge>
                   <span>{c.id}</span>
                   {c.mode && <span className="text-muted-foreground">{c.mode}</span>}
-                  <span className="text-muted-foreground">{c.status}</span>
                 </div>
                 {c.statement && <div className="mt-1 text-xs">{c.statement}</div>}
                 {c.evidence && (
@@ -90,10 +92,7 @@ function ItemRow({ item, acceptance }: { item: PacketItem; acceptance?: { status
       <TableCell className="align-top">
         {acceptance ? (
           <>
-            <StateBadge
-              state={acceptance.status === "pass" ? "kept" : acceptance.status === "not_applicable" ? "none" : "failed"}
-            />
-            <span className="ml-2 font-mono text-[11px] text-muted-foreground">{acceptance.status}</span>
+            <Badge variant={verdictVariant(acceptance.status)}>{acceptance.status}</Badge>
             <p className="mt-1 max-w-xs text-[11px] text-muted-foreground">{acceptance.evidence}</p>
           </>
         ) : (
@@ -119,15 +118,15 @@ function FeedbackRow({ releaseId, note, onDone }: { releaseId: number; note: Fee
         ) : (
           <>
             {note.gate_reason && (
-              <span className="text-warn" title="The poller labels such an issue agent:blocked instead of building it">
-                would not be built: {note.gate_reason}
+              <span className="text-warn" title="Filed as a plain issue rather than agent:queued: the poller would block it, and a blocked issue halts the repo's queue">
+                filed for a human, not queued: {note.gate_reason}
               </span>
             )}
             <Button
               variant="ghost"
               size="sm"
               disabled={busy}
-              title="Open this note as an agent:queued issue on the repo"
+              title={note.gate_reason ? "Open this note as a plain issue on the repo" : "Open this note as an agent:queued issue the factory will build"}
               onClick={async () => {
                 setBusy(true)
                 setError(null)
@@ -320,10 +319,12 @@ export function ReleaseDetail() {
                 )}
               </div>
               {r.repair_issue && <div>Repair issue: #{r.repair_issue}</div>}
-              <p className="text-muted-foreground">
-                A rejected release is not rolled back automatically: the test server keeps it until
-                the repair merges and the next release deploys, or a human restores the server.
-              </p>
+              {r.status === "rejected" && (
+                <p className="text-muted-foreground">
+                  A rejected release is not rolled back automatically: the test server keeps it
+                  until the repair merges and the next release deploys, or a human restores it.
+                </p>
+              )}
             </div>
           </Card>
 

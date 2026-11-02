@@ -323,7 +323,8 @@ MIGRATIONS = (
     # The squash commit a run's merge produced on the integration branch. What ties a merged
     # pull request to a release: the release takes the runs whose `merged_sha` is in the range
     # it promotes. Written on whichever run did the merge — the review, or the build when
-    # review is switched off.
+    # review is switched off — or, for a pull request a human merged, on its newest run when a
+    # release is assembled (`release.record_human_merges`).
     "ALTER TABLE runs ADD COLUMN merged_sha TEXT",
     # Which release a run worked on: a deploy putting it on the test server, an acceptance run
     # checking it there. NULL for everything that works on an issue.
@@ -1220,6 +1221,25 @@ async def unreleased_items(repo: str) -> list[dict]:
             "  WHERE r.repo = ?"
             ") GROUP BY merged_sha ORDER BY merged_at",
             (repo, repo),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def unmerged_pull_requests(repo: str, since: str) -> list[dict]:
+    """Factory pull requests on `repo` since `since` that no run has recorded a merge for.
+
+    One row per pull request, with the newest run that names it — the run a merge found later
+    is written onto. These are the ones a human may have merged by hand: with auto-merge off,
+    or after a merge the factory left for a human, nothing in the factory saw it happen.
+    """
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT pr_url, (SELECT r2.id FROM runs r2 WHERE r2.pr_url = r.pr_url "
+            "  ORDER BY r2.created_at DESC LIMIT 1) AS run_id "
+            "FROM runs r WHERE repo = ? AND pr_url IS NOT NULL AND kind IN ('build', 'review') "
+            "AND created_at >= ? GROUP BY pr_url HAVING MAX(merged_sha) IS NULL",
+            (repo, since),
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]

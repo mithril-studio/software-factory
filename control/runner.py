@@ -2939,8 +2939,10 @@ async def _execute(
                         f"The pull request {pr_url} was opened without the skill loop. No "
                         f"receipt was seen for: {', '.join(skill_gap)}.\n\n"
                         + skill_loop_step().replace("7. ", "", 1)
-                        + "\nRun the missing skills now, on the change as it stands, commit "
-                          "what they produce, and update the pull request body."
+                        + "\nRun the whole loop again, in this run, on the change as it "
+                          "stands — receipts printed by an earlier run do not count, because "
+                          "the change they described has moved. Commit what the skills "
+                          "produce and update the pull request body."
                     ),
                     going_back=(
                         f"Pull request {pr_url} skipped the skill loop "
@@ -2980,10 +2982,14 @@ async def _execute(
             elif unreviewable:
                 outcome = (
                     f"PR opened, no acceptance criteria, not merged: {pr_url}\n\n"
-                    f"Nothing here can be reviewed against, so it stops for a human. The "
-                    f"factory builds issues carrying {CRITERIA_FORMAT}."
+                    f"Nothing here can be reviewed against, so a human takes it from here. The "
+                    f"factory reviews and merges issues carrying {CRITERIA_FORMAT}."
                 )
-                label = github.LABEL_BLOCKED
+                # Blocked only where it would otherwise have merged. With auto-merge off a
+                # human merges every pull request anyway, which is what `agent:done` has
+                # always meant there — and `agent:blocked` would halt the repo's queue.
+                if settings.auto_merge:
+                    label = github.LABEL_BLOCKED
             if not skill_gap:
                 await _mirror_issue(
                     repo,

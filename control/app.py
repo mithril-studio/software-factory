@@ -809,11 +809,12 @@ class FileFeedback(BaseModel):
 
 @app.post("/api/releases/{release_id}/feedback/{feedback_id}/file")
 async def api_file_feedback(release_id: int, feedback_id: int, body: FileFeedback | None = None):
-    """File one note as an `agent:queued` issue on the release's repo. Exactly once: 409 after.
+    """File one note as an issue on the release's repo. Exactly once: 409 after.
 
-    Never automatic. The issue is queued work the factory will pick up, so it is a human's
-    decision; the response carries `gate_reason` so a note without a blocking criterion — which
-    the poller would refuse and label `agent:blocked` — is visible as such at the moment of filing.
+    Never automatic. A note with a blocking acceptance criterion is filed `agent:queued`, which
+    the factory will build, so filing is a human's decision. One without is filed as a plain
+    issue — queued, the poller would block it and halt the repo — and the response carries
+    `gate_reason` to say why it was not queued.
     """
     rel = await db.get_release(release_id)
     note = await db.get_release_feedback(feedback_id)
@@ -824,8 +825,14 @@ async def api_file_feedback(release_id: int, feedback_id: int, body: FileFeedbac
             409, f"feedback {feedback_id} was already filed{' as ' + note['issue_url'] if note['issue_url'] else ''}"
         )
     title, text = release.feedback_issue(rel, note["text"], body.title if body else None)
+    # Queued only when the poller would build it. A note without a blocking criterion filed as
+    # `agent:queued` is labelled `agent:blocked` on the next tick, and a blocked issue halts the
+    # repo's whole queue — so it is filed as a plain issue for a human to shape instead.
+    buildable = runner.gate_reason(note["text"]) is None
     try:
-        issue = await github.create_issue(rel["repo"], title, text, [github.LABEL_QUEUED])
+        issue = await github.create_issue(
+            rel["repo"], title, text, [github.LABEL_QUEUED] if buildable else []
+        )
     except Exception as exc:  # noqa: BLE001 - GitHub refusing is a 400, not a 500
         await db.unclaim_feedback(feedback_id)
         raise HTTPException(400, f"could not file the issue: {exc}") from exc

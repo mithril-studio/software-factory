@@ -127,7 +127,7 @@ else:
                               capture_output=True, text=True).stdout.strip()
 
     def scenario(name, *, build="true", health_in_new=True, dirty=False, branch="test",
-                 diverge=False, health_wait="2"):
+                 diverge=False, health_wait="2", install=None, hold_lock=False):
         """A fresh origin with A then B on `test`, and a server checkout sitting at A."""
         root = tmp / name
         origin, work, server = root / "origin.git", root / "work", root / "server"
@@ -159,14 +159,22 @@ else:
         env = {
             **env_base,
             **deploy.deploy_env(b, {
-                "path": str(server), "install": f"echo install >> {root}/steps",
+                "path": str(server), "install": install or f"echo install >> {root}/steps",
                 "build": build, "service": "acme-api",
                 "health": f"file://{server}/health.txt",
             }),
             "DEPLOY_HEALTH_WAIT": health_wait,
         }
+        env["TMPDIR"] = str(root)
+        holder = None
+        if hold_lock:
+            holder = subprocess.Popen(["flock", str(root / "factory-deploy.lock"), "sleep", "30"])
+            import time
+            time.sleep(0.3)
         proc = subprocess.run(["/bin/sh", "-c", deploy.DEPLOY_SCRIPT], env=env, capture_output=True,
                               text=True, timeout=120)
+        if holder:
+            holder.kill()
         head = git("rev-parse", "HEAD", cwd=server)
         return proc, head, a, b, root
 
@@ -199,6 +207,18 @@ else:
     check("a checkout that cannot fast-forward is refused", proc.returncode, deploy.REFUSED)
     check("and not reset", head != a and head != b, True)
 
+    # Found in review: every step was eval'd in one shell, so `cd web && npm ci` moved the
+    # build into web/web, and the rollback failed the same way — exit 98 on a healthy app.
+    proc, head, a, b, _ = scenario(
+        "cd-in-steps", install="mkdir -p sub && cd sub && touch installed",
+        build="cd sub && test -f installed")
+    check("a step that changes directory does not move the next one", proc.returncode, 0)
+
+    if shutil.which("flock"):
+        proc, head, a, b, _ = scenario("locked", hold_lock=True)
+        check("a deploy still running on the machine refuses a second one",
+              (proc.returncode, head), (deploy.REFUSED, a))
+
     shutil.rmtree(tmp, ignore_errors=True)
 
 # ---------- the factory side: create refuses, and both endings land on the release
@@ -212,7 +232,7 @@ run(db.init())
 profile_text = {"value": PROFILE}
 
 
-async def fake_file(repo, path, ref):
+async def fake_file(repo, path, ref, strict=False):
     return profile_text["value"]
 
 
@@ -239,6 +259,28 @@ row = run(db.get_release(rid))
 check("the release stays promoted", row["status"], "promoted")
 check("with the reason noted, so the schedule does not retry every tick",
       "not deployed" in (row["error"] or ""), True)
+
+
+# Found in review: a 502 reading the profile used to read as "no ## Deploy section", which is
+# noted on the release and never retried.
+async def flaky_file(repo, path, ref, strict=False):
+    raise RuntimeError("502 Bad Gateway")
+
+
+github.file = flaky_file
+outage_rid = promoted_release()
+try:
+    run(deploy.create(outage_rid))
+    outage = None
+except ValueError:
+    outage = "refused"
+except RuntimeError:
+    outage = "raised"
+check("a GitHub outage raises rather than refusing", outage, "raised")
+check("and notes nothing, so the next tick tries again", run(db.get_release(outage_rid))["error"], None)
+check("the release is still promoted", run(db.get_release(outage_rid))["status"], "promoted")
+github.file = fake_file
+run(db.transition_release(outage_rid, "reviewed"))
 
 
 class FakeMachine:
@@ -311,6 +353,26 @@ rid = promoted_release()
 fleet.clear()
 run(deploy_and_wait(rid))
 check("a missing test server fails the release", "never creates" in (run(db.get_release(rid))["error"] or ""), True)
+
+# Found in review: a failure after the release moved to `deploying` but before the task
+# existed left it there, freezing the repo until a restart.
+rid = promoted_release()
+fleet.append(FakeMachine("test-acme-api"))
+real_create_run = db.create_run
+
+
+async def broken_create_run(**fields):
+    raise RuntimeError("disk full")
+
+
+db.create_run = broken_create_run
+try:
+    run(deploy.create(rid))
+except RuntimeError:
+    pass
+db.create_run = real_create_run
+check("a deploy that cannot start fails its release instead of leaving it deploying",
+      run(db.get_release(rid))["status"], "failed")
 
 print()
 print(f"{len(fails)} failed: {', '.join(fails)}" if fails else "ALL PASS")
