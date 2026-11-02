@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS runs (
     tokens_in       INTEGER,
     tokens_out      INTEGER,
     cost_usd        REAL,
+    merged_sha      TEXT,
     created_at      TEXT NOT NULL,
     started_at      TEXT,
     finished_at     TEXT
@@ -188,6 +189,49 @@ CREATE TABLE IF NOT EXISTS improvements (
 );
 CREATE INDEX IF NOT EXISTS improvements_repo_idx ON improvements (repo);
 CREATE INDEX IF NOT EXISTS improvements_status_idx ON improvements (status);
+
+-- A release: one promotion of a repo's integration branch onto its release branch (`test`),
+-- and everything that happens to that version afterwards — deployed to the stable test
+-- server, accepted or rejected in a browser, read by a human. The control plane assembles one
+-- at fixed moments of the day; until a human marks it `reviewed` (or it expires) the repo is
+-- frozen and no further release is assembled, so what is on the test server holds still while
+-- somebody looks at it. Merges into the integration branch carry on regardless: the release
+-- is pinned by `test_sha`, not by whatever the branch says now.
+--
+-- `base_sha_before` is where the release branch pointed before this promotion, so "what
+-- changed" is a compare between two shas rather than a reconstruction. `status` moves only
+-- along `RELEASE_TRANSITIONS`.
+CREATE TABLE IF NOT EXISTS releases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo            TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    test_sha        TEXT,
+    base_sha_before TEXT,
+    created_at      TEXT NOT NULL,
+    promoted_at     TEXT,
+    deployed_at     TEXT,
+    deployed_sha    TEXT,
+    test_url        TEXT,
+    accepted_at     TEXT,
+    reviewed_at     TEXT,
+    repair_issue    INTEGER,
+    error           TEXT,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS releases_repo_idx ON releases (repo, created_at DESC);
+
+-- The factory-built changes a release carried: one row per merged pull request whose squash
+-- commit was in the promoted range. Recorded at promotion, never before, so a release that
+-- failed on red CI claims nothing and its changes ride the next one.
+CREATE TABLE IF NOT EXISTS release_items (
+    release_id   INTEGER NOT NULL,
+    issue_number INTEGER NOT NULL,
+    issue_title  TEXT,
+    pr_url       TEXT,
+    merged_sha   TEXT NOT NULL,
+    summary      TEXT,
+    PRIMARY KEY (release_id, merged_sha)
+);
 """
 
 # Additive migrations for databases created before a column existed. Each is tried once at
@@ -261,6 +305,11 @@ MIGRATIONS = (
     "ALTER TABLE repos DROP COLUMN goal",
     # The integration branch, when it is not the GitHub default. See the repos table comment.
     "ALTER TABLE repos ADD COLUMN base_branch TEXT",
+    # The squash commit a run's merge produced on the integration branch. What ties a merged
+    # pull request to a release: the release takes the runs whose `merged_sha` is in the range
+    # it promotes. Written on whichever run did the merge — the review, or the build when
+    # review is switched off.
+    "ALTER TABLE runs ADD COLUMN merged_sha TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -1011,3 +1060,164 @@ async def transition_improvement(
             )
     improvement.update(updates)
     return improvement
+
+
+# --------------------------------------------------------------------------- releases
+
+# The life of a release, as edges. `reviewed`, `expired` and `failed` are terminal — nothing
+# leaves them — and every other state freezes the repo (`release.frozen`).
+#
+# `assembling`, `deploying` and `accepting` are the control plane doing something; the rest are
+# a version standing still on the test server, waiting for the next step or for a human.
+# `reviewed` is reachable from every standing state because a human may read a release at any
+# point and lift the freeze; `expired` is the same lift, by the clock, for a release nobody
+# read. `rejected` does not expire: a browser said the version is broken, and that waits for a
+# person.
+RELEASE_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "assembling": ("promoted", "failed"),
+    "promoted": ("deploying", "reviewed", "expired"),
+    "deploying": ("deployed", "failed"),
+    "deployed": ("accepting", "reviewed", "expired"),
+    "accepting": ("accepted", "rejected", "failed"),
+    "accepted": ("reviewed", "expired"),
+    "rejected": ("reviewed",),
+}
+RELEASE_TERMINAL = ("reviewed", "expired", "failed")
+
+# Columns a transition may set beside `status`. Closed for the reason `CANDIDATE_COLUMNS` is.
+RELEASE_FIELDS = frozenset({
+    "test_sha", "base_sha_before", "promoted_at", "deployed_at", "deployed_sha", "test_url",
+    "accepted_at", "reviewed_at", "repair_issue", "error",
+})
+
+
+async def create_release(repo: str, test_sha: str | None = None) -> dict:
+    """Open a release in `assembling`. Returns the row."""
+    now = utcnow()
+    async with connect() as conn:
+        cur = await conn.execute(
+            "INSERT INTO releases (repo, status, test_sha, created_at, updated_at) "
+            "VALUES (?, 'assembling', ?, ?, ?)",
+            (repo, test_sha, now, now),
+        )
+        await conn.commit()
+        release_id = cur.lastrowid
+    return await get_release(release_id)
+
+
+async def get_release(release_id: int) -> dict | None:
+    async with connect() as conn:
+        async with conn.execute("SELECT * FROM releases WHERE id = ?", (release_id,)) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_releases(repo: str | None = None, limit: int = 100) -> list[dict]:
+    """Releases newest first, each with how many items it carried."""
+    where, params = ("WHERE r.repo = ?", [repo]) if repo else ("", [])
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT r.*, (SELECT COUNT(*) FROM release_items i WHERE i.release_id = r.id) "
+            f"AS item_count FROM releases r {where} ORDER BY r.id DESC LIMIT ?",
+            (*params, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def latest_release(repo: str) -> dict | None:
+    """The most recent release for `repo` — the one the freeze and the schedule read."""
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM releases WHERE repo = ? ORDER BY id DESC LIMIT 1", (repo,)
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def releases_in(statuses: tuple[str, ...]) -> list[dict]:
+    """Every release in one of `statuses`, oldest first."""
+    marks = ", ".join("?" for _ in statuses)
+    async with connect() as conn:
+        async with conn.execute(
+            f"SELECT * FROM releases WHERE status IN ({marks}) ORDER BY id", statuses
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def transition_release(release_id: int, to_status: str, **fields: Any) -> dict:
+    """Move a release along an allowed edge, or raise `ValueError`.
+
+    Guarded on the status it read, like `transition_improvement`: the schedule, a deploy
+    finishing and a human clicking "reviewed" can all reach the same row, and the slower of two
+    must be told it lost rather than silently overwrite the faster.
+    """
+    unknown = sorted(set(fields) - RELEASE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown releases column(s): {', '.join(unknown)}")
+    release = await get_release(release_id)
+    if release is None:
+        raise ValueError(f"no such release: {release_id}")
+    current = release["status"]
+    if to_status not in RELEASE_TRANSITIONS.get(current, ()):
+        raise ValueError(f"cannot move release {release_id} from {current} to {to_status}")
+    updates: dict[str, Any] = {"status": to_status, "updated_at": utcnow(), **fields}
+    sets = ", ".join(f"{k} = ?" for k in updates)
+    async with connect() as conn:
+        cur = await conn.execute(
+            f"UPDATE releases SET {sets} WHERE id = ? AND status = ?",
+            (*updates.values(), release_id, current),
+        )
+        await conn.commit()
+        if not cur.rowcount:
+            raise ValueError(
+                f"cannot move release {release_id} from {current} to {to_status}: "
+                f"it changed underneath this request"
+            )
+    release.update(updates)
+    return release
+
+
+async def unreleased_items(repo: str) -> list[dict]:
+    """Merged factory work on `repo` that no release has carried yet, oldest merge first.
+
+    One row per squash commit. The newest run that recorded it wins, so a pull request whose
+    merge was recorded twice (a reconcile and a retry) is still one item.
+    """
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT issue_number, issue_title, pr_url, merged_sha, MAX(finished_at) AS merged_at "
+            "FROM runs WHERE repo = ? AND merged_sha IS NOT NULL AND merged_sha NOT IN ("
+            "  SELECT i.merged_sha FROM release_items i JOIN releases r ON r.id = i.release_id"
+            "  WHERE r.repo = ?"
+            ") GROUP BY merged_sha ORDER BY merged_at",
+            (repo, repo),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def add_release_items(release_id: int, items: list[dict]) -> None:
+    async with connect() as conn:
+        await conn.executemany(
+            "INSERT OR IGNORE INTO release_items "
+            "(release_id, issue_number, issue_title, pr_url, merged_sha, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (release_id, i.get("issue_number") or 0, i.get("issue_title"), i.get("pr_url"),
+                 i["merged_sha"], i.get("summary"))
+                for i in items
+            ],
+        )
+        await conn.commit()
+
+
+async def release_items(release_id: int) -> list[dict]:
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM release_items WHERE release_id = ? ORDER BY issue_number",
+            (release_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]

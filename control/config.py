@@ -234,6 +234,24 @@ class Settings:
     # before letting them merge into the repos the factory works on.
     learn_autoqueue: bool = os.environ.get("FACTORY_LEARN_AUTOQUEUE", "0") == "1"
 
+    # --- releases
+    #
+    # At fixed moments of the day, promote each repo's integration branch onto its release
+    # branch (`test`) once CI is green on it, and freeze that repo's releases until a human has
+    # marked the release reviewed. Off by default: it writes to a branch other people read.
+    release_enabled: bool = os.environ.get("FACTORY_RELEASE", "0") == "1"
+    # When, in FACTORY_RELEASE_TZ wall-clock time. Four a working day, so a human reviewing at
+    # their own pace sees at most a morning's worth of change in one packet.
+    release_times: str = os.environ.get("FACTORY_RELEASE_TIMES", "09:00,11:30,14:00,16:00")
+    release_tz: str = os.environ.get("FACTORY_RELEASE_TZ", "Europe/Amsterdam")
+    # The branch a verified version is promoted to. Fast-forward only, never forced.
+    release_branch: str = os.environ.get("FACTORY_RELEASE_BRANCH", "test")
+    # Seconds a standing release may wait for a human before it expires and lifts the freeze.
+    # A day: a release nobody read by the next morning should not hold the next one back.
+    release_review_timeout: int = int(os.environ.get("FACTORY_RELEASE_REVIEW_TIMEOUT", "86400"))
+    # Seconds between schedule checks. The moments are minutes apart, so a minute is plenty.
+    release_tick: int = int(os.environ.get("FACTORY_RELEASE_TICK", "60"))
+
     # Issue polling. The repos this deployment starts up watching — see `_repos()`.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"

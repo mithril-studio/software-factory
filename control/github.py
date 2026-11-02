@@ -395,6 +395,83 @@ async def ref_sha(repo: str, ref: str) -> str | None:
         return None
 
 
+async def branch_sha(repo: str, branch: str) -> str | None:
+    """The commit `branch` points at, None when the branch does not exist. Raises otherwise.
+
+    Not `ref_sha`, which swallows every error into None: a release asks this to decide between
+    fast-forwarding a branch and creating it, and an outage read as "no such branch" would try
+    to create one that is already there.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{API}/repos/{repo}/git/ref/heads/{branch}", headers=_headers())
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()["object"]["sha"]
+
+
+async def update_branch(repo: str, branch: str, sha: str) -> None:
+    """Fast-forward `branch` to `sha`. Never forces.
+
+    GitHub answers 422 when the move is not a fast-forward — somebody committed to the branch
+    directly — and that is raised with GitHub's own sentence, for the caller to report rather
+    than repair. A release branch that has diverged needs a human to say which history wins.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.patch(
+            f"{API}/repos/{repo}/git/refs/heads/{branch}",
+            headers=_headers(),
+            json={"sha": sha, "force": False},
+        )
+    if resp.status_code >= 400:
+        raise httpx.HTTPStatusError(
+            f"could not move {branch}: {resp.status_code} {_api_error(resp)}",
+            request=resp.request,
+            response=resp,
+        )
+
+
+async def create_branch(repo: str, branch: str, sha: str) -> None:
+    """Create `branch` at `sha`."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            f"{API}/repos/{repo}/git/refs",
+            headers=_headers(),
+            json={"ref": f"refs/heads/{branch}", "sha": sha},
+        )
+    if resp.status_code >= 400:
+        raise httpx.HTTPStatusError(
+            f"could not create {branch}: {resp.status_code} {_api_error(resp)}",
+            request=resp.request,
+            response=resp,
+        )
+
+
+async def commits_between(repo: str, base: str, head: str) -> list[str]:
+    """The shas reachable from `head` and not from `base`, oldest first. Raises on failure.
+
+    GitHub caps a compare at 250 commits; a release range longer than that is a release
+    nobody can read anyway, and the items past the cap ride the next one.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{API}/repos/{repo}/compare/{base}...{head}",
+            headers=_headers(),
+            params={"per_page": 250},
+        )
+        resp.raise_for_status()
+    return [c["sha"] for c in resp.json().get("commits") or []]
+
+
+async def pull_request(repo: str, number: int) -> dict:
+    """A pull request's title and body."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{API}/repos/{repo}/pulls/{number}", headers=_headers())
+        resp.raise_for_status()
+    data = resp.json()
+    return {"title": data.get("title") or "", "body": data.get("body") or ""}
+
+
 async def merge_base_sha(repo: str, base: str, head_sha: str) -> str:
     """The commit a branch actually diverged from.
 

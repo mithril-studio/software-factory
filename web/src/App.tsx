@@ -10,6 +10,7 @@ import { Machines } from "@/pages/Machines"
 import { Telemetry } from "@/pages/Telemetry"
 import { Improvements } from "@/pages/Improvements"
 import { Digest } from "@/pages/Digest"
+import { Releases } from "@/pages/Releases"
 import { checkAuth } from "@/lib/api"
 
 /** Blocks the protected shell until the session is confirmed; bounces to /login otherwise. */
@@ -38,6 +39,7 @@ const router = createBrowserRouter([
       { path: "/runs/:runId", element: <RunDetail /> },
       { path: "/plan", element: <Plan /> },
       { path: "/projects", element: <Projects /> },
+      { path: "/releases", element: <Releases /> },
       { path: "/goldens", element: <Machines /> },
       { path: "/telemetry", element: <Telemetry /> },
       { path: "/digest", element: <Digest /> },

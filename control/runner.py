@@ -1950,6 +1950,7 @@ async def _merge(
     issue: dict,
     branch: str,
     cycle: int = 1,
+    run_id: str | None = None,
 ) -> MergeAttempt:
     """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
     than one we force, and the PR simply stays open for a human.
@@ -1994,7 +1995,7 @@ async def _merge(
                 log.write(f"[factory] not merging PR #{pr_number}, left open: {why}")
                 return MergeAttempt(False, why if failed else None, why, sha, ci_log)
             try:
-                await github.merge_pr(repo, pr_number, sha=sha)
+                merged = await github.merge_pr(repo, pr_number, sha=sha)
             except Exception as exc:  # noqa: BLE001 - re-raised below unless it is repairable
                 if reconciled or not github.is_merge_conflict(exc):
                     raise
@@ -2005,6 +2006,10 @@ async def _merge(
                     raise
                 continue
             log.write(f"[factory] merged PR #{pr_number} into {base} ({why})")
+            if run_id and isinstance(merged, dict) and merged.get("sha"):
+                # The squash commit, which is what a release later finds in the range it
+                # promotes. Without it a release could say what moved but not which issues.
+                await db.update_run(run_id, merged_sha=merged["sha"])
             if repos.configured_base(repo) and issue.get("number"):
                 # `Closes #n` only fires on a merge into the default branch, so a repo that
                 # integrates elsewhere would keep every finished issue open.
@@ -2804,7 +2809,7 @@ async def _execute(
                 merged = (
                     await _merge(
                         repo, pr_url, base, log,
-                        issue=issue, branch=branch, cycle=review_cycle,
+                        issue=issue, branch=branch, cycle=review_cycle, run_id=run_id,
                     )
                 ).merged
             await db.update_run(
@@ -2967,7 +2972,8 @@ async def _execute_review(
             merge_attempt = MergeAttempt(False, None, "auto-merge is off")
             if settings.auto_merge:
                 merge_attempt = await _merge(
-                    repo, pr_url, base, log, issue=issue, branch=branch, cycle=cycle
+                    repo, pr_url, base, log, issue=issue, branch=branch, cycle=cycle,
+                    run_id=run_id,
                 )
             outcome = merge_outcome(
                 settings.auto_merge, merge_attempt.merged, merge_attempt.ci_failure

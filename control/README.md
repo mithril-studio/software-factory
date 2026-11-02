@@ -46,6 +46,7 @@ One module per concern:
 | `goldens` | Periodic re-list of golden snapshots into the `snapshots` table |
 | `provision` | Build a repo's warm golden, as a run of `kind='provision'` |
 | `plan` | The goal loop: sync `.factory/goal.md`, plan the next feature toward it when the queue runs dry |
+| `release` | The release schedule: promote green integration heads onto `test`, freeze until reviewed |
 | `preflight` | Is a repo ready? Labels, token scopes, golden — boots nothing |
 | `github` | Every GitHub API call: issues, labels, PRs, checks, merge |
 | `memory` | The `.mem/` validator; a CI gate (§5) |

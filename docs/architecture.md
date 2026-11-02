@@ -247,6 +247,17 @@ a human editing the goal is a human asking, with the daily spend ceiling boundin
 A cooldown (`FACTORY_PLAN_COOLDOWN`) bounds the cadence, and the hook sits below the halt
 check — a halted repo never plans. `control/plan.py` holds the whole loop.
 
+**Releases** (`FACTORY_RELEASE`, off by default) sit downstream of all of that. At fixed
+wall-clock moments (`FACTORY_RELEASE_TIMES` in `FACTORY_RELEASE_TZ`) the control plane takes
+each repo's integration head, waits for CI to be green on that exact commit, and
+fast-forwards the release branch (`test`) onto it — never forced; a diverged `test` fails the
+release for a human. The `releases` row records the range and `release_items` the merged
+pull requests in it, found by the squash commit each merge wrote to `runs.merged_sha`. The
+repo is then frozen until a human marks the release `reviewed` or it expires; merges into the
+integration branch continue meanwhile. The schedule and the freeze are both read off the
+latest `releases` row, so a restart neither repeats nor loses a moment. `control/release.py`
+holds the loop.
+
 ## §5 What it deliberately does not have
 
 Named so they stay unbuilt until something proves they are needed:
