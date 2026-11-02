@@ -156,8 +156,39 @@ async def _poll_repo(repo: str) -> None:
         await _maybe_learn(repo)
         return
     issue = issues[0]  # lowest number
+    if settings.require_criteria and await _refuse_ungated(repo, issue["number"]):
+        return
     log.info("dispatching %s#%s", repo, issue["number"])
     await runner.create(repo, issue["number"])
+
+
+async def _refuse_ungated(repo: str, number: int) -> bool:
+    """Block `number` instead of dispatching it, when it carries nothing a reviewer can run.
+
+    Returns whether it was refused. Asked before any VM exists: an issue with no blocking
+    criterion can only end with a pull request stopped for a human, and knowing that costs one
+    GET here against a build and forty minutes there. The `agent:blocked` it leaves is what the
+    halt check above reads, so the repo stops behind it exactly as it does behind a review that
+    would not pass — the issue is the next thing in the sequence, and the ones after it assume
+    it was built.
+    """
+    issue = await github.get_issue(repo, number)
+    reason = runner.gate_reason(issue.get("body") or "")
+    if reason is None:
+        return False
+    log.info("%s#%s not dispatched: %s", repo, number, reason)
+    comment = (
+        f"Not dispatched: {reason}.\n\n"
+        f"The factory builds issues carrying {runner.CRITERIA_FORMAT}. Add the block, then "
+        f"swap `{github.LABEL_BLOCKED}` for `{github.LABEL_QUEUED}`."
+    )
+    try:
+        await github.remove_label(repo, number, github.LABEL_QUEUED)
+        await github.add_labels(repo, number, [github.LABEL_BLOCKED])
+        await github.add_comment(repo, number, comment)
+    except Exception:  # noqa: BLE001 - not dispatching is the decision; the labels mirror it
+        log.exception("could not label %s#%s blocked", repo, number)
+    return True
 
 
 async def _maybe_learn(repo: str) -> None:
