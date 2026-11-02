@@ -177,6 +177,7 @@ async def create(release_id: int) -> str:
         agent=agents.DEFAULT_AGENT,
         vm_name=facts["machine"],
         base_sha=sha,
+        release_id=release_id,
         log_path=str(log_path),
         created_at=db.utcnow(),
     )

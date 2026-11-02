@@ -773,6 +773,69 @@ async def api_assemble_release(body: AssembleRelease):
     return {"release": row, "reason": why}
 
 
+@app.get("/api/releases/{release_id}/packet")
+async def api_release_packet(release_id: int):
+    """Everything a human needs to review one release: what it carried and how each item was
+    verified, where it was deployed, what a browser made of it, and the feedback so far."""
+    body = await release.packet(release_id)
+    if body is None:
+        raise HTTPException(404, f"no such release: {release_id}")
+    return body
+
+
+class Feedback(BaseModel):
+    text: str
+
+
+@app.post("/api/releases/{release_id}/feedback")
+async def api_release_feedback(release_id: int, body: Feedback):
+    """Store a note on a release. Files nothing — that is a second, deliberate click.
+
+    The response says whether the note, filed as it stands, would be built: `gate_reason` is
+    what the poller would refuse it for, or null.
+    """
+    if await db.get_release(release_id) is None:
+        raise HTTPException(404, f"no such release: {release_id}")
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "feedback is empty")
+    row = await db.add_release_feedback(release_id, text)
+    return {**row, "gate_reason": runner.gate_reason(text)}
+
+
+class FileFeedback(BaseModel):
+    title: str | None = None
+
+
+@app.post("/api/releases/{release_id}/feedback/{feedback_id}/file")
+async def api_file_feedback(release_id: int, feedback_id: int, body: FileFeedback | None = None):
+    """File one note as an `agent:queued` issue on the release's repo. Exactly once: 409 after.
+
+    Never automatic. The issue is queued work the factory will pick up, so it is a human's
+    decision; the response carries `gate_reason` so a note without a blocking criterion — which
+    the poller would refuse and label `agent:blocked` — is visible as such at the moment of filing.
+    """
+    rel = await db.get_release(release_id)
+    note = await db.get_release_feedback(feedback_id)
+    if rel is None or note is None or note["release_id"] != release_id:
+        raise HTTPException(404, f"no feedback {feedback_id} on release {release_id}")
+    if not await db.claim_feedback(feedback_id):
+        raise HTTPException(
+            409, f"feedback {feedback_id} was already filed{' as ' + note['issue_url'] if note['issue_url'] else ''}"
+        )
+    title, text = release.feedback_issue(rel, note["text"], body.title if body else None)
+    try:
+        issue = await github.create_issue(rel["repo"], title, text, [github.LABEL_QUEUED])
+    except Exception as exc:  # noqa: BLE001 - GitHub refusing is a 400, not a 500
+        await db.unclaim_feedback(feedback_id)
+        raise HTTPException(400, f"could not file the issue: {exc}") from exc
+    await db.record_feedback_issue(feedback_id, issue.get("html_url"), issue.get("number"))
+    return {
+        **(await db.get_release_feedback(feedback_id)),
+        "gate_reason": runner.gate_reason(note["text"]),
+    }
+
+
 @app.post("/api/releases/{release_id}/deploy")
 async def api_release_deploy(release_id: int):
     """Deploy a promoted release now — the human retry.

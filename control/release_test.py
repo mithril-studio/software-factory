@@ -216,6 +216,13 @@ async def fake_pr(repo, number):
     return {"title": f"PR {number}", "body": "Adds the thing.\n\nCloses #2"}
 
 
+async def fake_get_issue(repo, number):
+    return {"number": number, "title": "", "labels": [], "body": (
+        "## Acceptance criteria\n```yaml\n- id: AC1\n  mode: test\n  statement: \"works\"\n"
+        "  verify: \"t.py\"\n```\n")}
+
+
+github.get_issue = fake_get_issue
 github.branch_sha = fake_branch_sha
 github.default_branch = fake_default
 github.checks_green = fake_checks
@@ -241,6 +248,8 @@ check("with no previous position recorded", row["base_sha_before"], None)
 first_items = run(db.release_items(row["id"]))
 check("the first release carries every unreleased item", [i["merged_sha"] for i in first_items], ["sha2"])
 check("each item quotes its pull request", first_items[0]["summary"], "Adds the thing. Closes #2")
+check("and freezes the issue's criteria as they stood",
+      __import__("json").loads(first_items[0]["criteria"])[0]["statement"], "works")
 
 try:
     run(release.assemble("acme/api"))

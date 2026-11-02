@@ -454,6 +454,11 @@ exhaustive list is `control/app.py`.
   `POST /api/releases/assemble {"repo"}` (now, out of schedule; 409 while frozen),
   `POST /api/releases/{id}/deploy` (deploy a promoted release now; the retry after a
   refusal), `POST /api/releases/{id}/reviewed` (lifts the freeze).
+  `GET /api/releases/{id}/packet` is the review packet — each item with the criteria it was
+  reviewed against and the evidence, the deploy, the browser acceptance, and the feedback.
+  `POST .../feedback {"text"}` stores a note and files nothing;
+  `POST .../feedback/{fid}/file` opens it as an `agent:queued` issue, exactly once (409 after).
+  Both answer `gate_reason` — why the poller would refuse that note as an issue, or null.
 - **Goals** — the goal itself is not an API: it is `.factory/goal.md`, committed in the
   repo, noticed by SHA within ~5 minutes. `POST .../replan` re-arms a `met` or `stalled`
   goal without editing the file. `POST /api/runs` with `kind: "plan"` plans now, ignoring

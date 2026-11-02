@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS runs (
     tokens_out      INTEGER,
     cost_usd        REAL,
     merged_sha      TEXT,
+    release_id      INTEGER,
     created_at      TEXT NOT NULL,
     started_at      TEXT,
     finished_at     TEXT
@@ -220,6 +221,19 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 CREATE INDEX IF NOT EXISTS releases_repo_idx ON releases (repo, created_at DESC);
 
+-- What a human said about a release while reading it. Stored the moment it is written and
+-- filed as an issue only when the human asks — a sentence typed into a review form is a note,
+-- and turning every note into queued work would make the factory build drafts.
+CREATE TABLE IF NOT EXISTS release_feedback (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_id   INTEGER NOT NULL,
+    text         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    issue_url    TEXT,
+    issue_number INTEGER,
+    filed_at     TEXT
+);
+
 -- The factory-built changes a release carried: one row per merged pull request whose squash
 -- commit was in the promoted range. Recorded at promotion, never before, so a release that
 -- failed on red CI claims nothing and its changes ride the next one.
@@ -230,6 +244,7 @@ CREATE TABLE IF NOT EXISTS release_items (
     pr_url       TEXT,
     merged_sha   TEXT NOT NULL,
     summary      TEXT,
+    criteria     TEXT,
     PRIMARY KEY (release_id, merged_sha)
 );
 """
@@ -310,6 +325,12 @@ MIGRATIONS = (
     # it promotes. Written on whichever run did the merge — the review, or the build when
     # review is switched off.
     "ALTER TABLE runs ADD COLUMN merged_sha TEXT",
+    # Which release a run worked on: a deploy putting it on the test server, an acceptance run
+    # checking it there. NULL for everything that works on an issue.
+    "ALTER TABLE runs ADD COLUMN release_id INTEGER",
+    # The issue's acceptance criteria as they stood when the release was promoted, JSON. Kept
+    # on the item so the review packet can say what each criterion *was* without asking GitHub.
+    "ALTER TABLE release_items ADD COLUMN criteria TEXT",
 )
 
 # Terminal states. Anything else means the run is still in flight.
@@ -1205,11 +1226,11 @@ async def add_release_items(release_id: int, items: list[dict]) -> None:
     async with connect() as conn:
         await conn.executemany(
             "INSERT OR IGNORE INTO release_items "
-            "(release_id, issue_number, issue_title, pr_url, merged_sha, summary) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(release_id, issue_number, issue_title, pr_url, merged_sha, summary, criteria) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
                 (release_id, i.get("issue_number") or 0, i.get("issue_title"), i.get("pr_url"),
-                 i["merged_sha"], i.get("summary"))
+                 i["merged_sha"], i.get("summary"), i.get("criteria"))
                 for i in items
             ],
         )
@@ -1239,3 +1260,112 @@ async def release_items(release_id: int) -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- the review packet
+
+
+async def add_release_feedback(release_id: int, text: str) -> dict:
+    """Store one note on a release. Never files anything."""
+    async with connect() as conn:
+        cur = await conn.execute(
+            "INSERT INTO release_feedback (release_id, text, created_at) VALUES (?, ?, ?)",
+            (release_id, text, utcnow()),
+        )
+        await conn.commit()
+        fid = cur.lastrowid
+    return await get_release_feedback(fid)
+
+
+async def get_release_feedback(feedback_id: int) -> dict | None:
+    async with connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM release_feedback WHERE id = ?", (feedback_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def claim_feedback(feedback_id: int) -> bool:
+    """Take the one right to file this note as an issue. False when it is already taken.
+
+    Claimed *before* the issue is created, by setting `filed_at` only where it is still NULL:
+    two clicks racing on "file as issue" must not both open an issue, and checking afterwards
+    would only tell the loser after its duplicate already existed.
+    """
+    async with connect() as conn:
+        cur = await conn.execute(
+            "UPDATE release_feedback SET filed_at = ? WHERE id = ? AND filed_at IS NULL",
+            (utcnow(), feedback_id),
+        )
+        await conn.commit()
+        return bool(cur.rowcount)
+
+
+async def record_feedback_issue(
+    feedback_id: int, issue_url: str | None, issue_number: int | None
+) -> None:
+    """The issue a claimed note became."""
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE release_feedback SET issue_url = ?, issue_number = ? WHERE id = ?",
+            (issue_url, issue_number, feedback_id),
+        )
+        await conn.commit()
+
+
+async def unclaim_feedback(feedback_id: int) -> None:
+    """Give the claim back after GitHub refused the issue, so the note can be filed again."""
+    async with connect() as conn:
+        await conn.execute(
+            "UPDATE release_feedback SET filed_at = NULL WHERE id = ? AND issue_url IS NULL",
+            (feedback_id,),
+        )
+        await conn.commit()
+
+
+async def release_packet(release_id: int) -> dict | None:
+    """Everything a human needs to review one release, from the tables alone.
+
+    The release row; each item it carried with the review verdict that let it merge — the run
+    whose `merged_sha` is the item's commit, falling back to the issue's latest review — so the
+    reviewer sees which criteria were checked and what the evidence was; the deploy and the
+    acceptance runs against this release, latest of each; and the feedback written so far.
+    Nothing here asks GitHub, so the packet is as fast and as available as the database.
+    """
+    release = await get_release(release_id)
+    if release is None:
+        return None
+    items = await release_items(release_id)
+    async with connect() as conn:
+        for item in items:
+            async with conn.execute(
+                "SELECT id, verdict, error, pr_url, created_at FROM runs "
+                "WHERE repo = ? AND kind = 'review' AND verdict IS NOT NULL "
+                "AND (merged_sha = ? OR issue_number = ?) "
+                "ORDER BY (merged_sha = ?) DESC, created_at DESC LIMIT 1",
+                (release["repo"], item["merged_sha"], item["issue_number"], item["merged_sha"]),
+            ) as cur:
+                review = await cur.fetchone()
+            item["review"] = dict(review) if review else None
+        latest = {}
+        for kind in ("deploy", "accept"):
+            async with conn.execute(
+                "SELECT id, status, error, verdict, vm_name, exit_code, cost_usd, created_at, "
+                "finished_at FROM runs WHERE release_id = ? AND kind = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (release_id, kind),
+            ) as cur:
+                row = await cur.fetchone()
+            latest[kind] = dict(row) if row else None
+        async with conn.execute(
+            "SELECT * FROM release_feedback WHERE release_id = ? ORDER BY id", (release_id,)
+        ) as cur:
+            feedback = [dict(r) for r in await cur.fetchall()]
+    return {
+        "release": release,
+        "items": items,
+        "deploy": latest["deploy"],
+        "acceptance": latest["accept"],
+        "feedback": feedback,
+    }
