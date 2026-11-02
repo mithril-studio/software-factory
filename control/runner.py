@@ -831,7 +831,9 @@ blindly repeat what failed."""
 
 FIX_HEADER = """This is fix cycle {cycle} of {max_cycles}. The earlier run on this issue did \
 not fail: it opened a pull request, and that pull request was sent back ({prior_error}). Read
-the detail below and fix exactly what it names — the rest of the change was accepted."""
+the detail below and fix exactly what it names — the rest of the change was accepted. Where
+the detail quotes a command as evidence, re-run that command yourself before and after your
+fix, and do not stop until it gives the answer its criterion asks for."""
 
 RETRY_TEMPLATE = """
 
@@ -1640,6 +1642,65 @@ def decide(verdict: dict | None, criteria: list[dict]) -> tuple[bool, str, list[
     if verdict.get("verdict") != "approve":
         return False, "reviewer requested changes", findings
     return True, f"{len(blocking)} criteria met", findings
+
+
+# How much of one criterion's evidence a fix run is handed. Enough for a command and the lines
+# of output that decided it; a reviewer that pasted a whole test log is not cut off mid-thought
+# so much as summarised, and the fix run can re-run the command for the rest.
+EVIDENCE_MAX = 600
+
+
+def review_detail(verdict: dict | None, criteria: list[dict], findings: list[str]) -> str:
+    """What a fix run is told about the review that sent its pull request back.
+
+    It used to be handed the findings list alone — "AC2 not met" with no statement, no command
+    and no output — so the agent began by re-deriving what the reviewer had already run. Every
+    criterion is listed here with its mode and statement, the status the reviewer reported (or
+    that it reported none, which `decide` counts as a failure), and the evidence it gave. Those
+    that did not pass come first, because they are the work; those that did are the part of the
+    change not to break.
+
+    Pure and total, like `decide`: it reads what an agent wrote, so anything malformed degrades
+    to "not reported" rather than raising.
+    """
+    reported: dict[str, dict] = {}
+    notes: list[str] = []
+    if isinstance(verdict, dict):
+        for item in verdict.get("criteria") or []:
+            if isinstance(item, dict) and item.get("id"):
+                reported[str(item["id"])] = item
+        notes = [str(n) for n in (verdict.get("notes") or []) if str(n).strip()][:20]
+
+    def entry(criterion: dict) -> tuple[bool, str]:
+        cid = str(criterion.get("id"))
+        got = reported.get(cid) or {}
+        status = str(got.get("status") or "not reported")
+        evidence = " ".join(str(got.get("evidence") or "").split())
+        if len(evidence) > EVIDENCE_MAX:
+            evidence = evidence[:EVIDENCE_MAX] + " …"
+        lines = [
+            f"- {cid} [{criterion.get('mode')}] {status}: {criterion.get('statement')}",
+        ]
+        if criterion.get("verify"):
+            lines.append(f"  verify: {criterion['verify']}")
+        lines.append(f"  evidence: {evidence or '(none given)'}")
+        return status == "met", "\n".join(lines)
+
+    entries = [entry(c) for c in criteria]
+    unmet = [text for met, text in entries if not met]
+    met = [text for met, text in entries if met]
+    parts = []
+    if unmet:
+        parts.append("Criteria not met:\n" + "\n".join(unmet))
+    if met:
+        parts.append("Criteria the reviewer confirmed — keep these true:\n" + "\n".join(met))
+    parts.append(
+        "Reviewer findings:\n"
+        + ("\n".join(f"- {f}" for f in findings) or "- (no specific findings recorded)")
+    )
+    if notes:
+        parts.append("Reviewer notes (advisory):\n" + "\n".join(f"- {n}" for n in notes))
+    return "\n\n".join(parts)
 
 
 def merge_outcome(auto_merge: bool, merged: bool, ci_failure: str | None) -> str:
@@ -2975,6 +3036,8 @@ async def _execute_review(
             )
             return
 
+        # The issue comment keeps the short list a human scans; the fix run gets every
+        # criterion with the reviewer's evidence, so it starts from what was run, not a guess.
         detail = "\n".join(f"- {f}" for f in findings) or "- (no specific findings recorded)"
         await _fix_cycle(
             repo,
@@ -2982,7 +3045,7 @@ async def _execute_review(
             cycle,
             log,
             reason=f"review requested changes: {why}",
-            detail=f"Reviewer findings:\n{detail}",
+            detail=review_detail(verdict, criteria, findings),
             going_back=f"Review {cycle} requested changes ({why}):\n{detail}\n\nFixing.",
             giving_up=(
                 f"Review still requesting changes after {cycle} cycles ({why}):\n{detail}"
