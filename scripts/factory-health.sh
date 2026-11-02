@@ -4,9 +4,8 @@
 # It runs in GitHub Actions and nowhere else on purpose. A monitor that lives on the control
 # plane dies with it — which is precisely the moment it was supposed to speak up: on
 # 2026-08-19 the boxd VM's root filesystem corrupted, the control plane served nothing for
-# hours, and the only thing that noticed was a human asking. GitHub is outside both boxd and
-# the Hetzner box the control plane is moving to, so this keeps working across that move;
-# only FACTORY_URL changes.
+# hours, and the only thing that noticed was a human asking. GitHub is outside wherever the
+# control plane runs, so this keeps working across every move; only FACTORY_URL changes.
 #
 # It asks two different questions, and for a while it only asked the first. *Could* the factory
 # dispatch — is the control plane up, is the fleet listable, is there a golden — and *is* it

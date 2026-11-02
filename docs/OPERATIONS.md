@@ -38,32 +38,42 @@ npm --prefix web run dev        # then open the URL Vite prints (:5173)
 
 ## Deploying
 
-The control plane lives on a **Hetzner** VM — a plain checkout under `~/software-factory`
-running uvicorn under systemd, not a container, behind Caddy for TLS. It moved off boxd on
-2026-08-19, after that VM's root filesystem corrupted and took the run history with it: the
-thing the factory boots VMs *from* should not also be the thing that remembers what it did.
+The control plane lives on a **boxd** machine, `mithril-factory` — a plain checkout under
+`~/software-factory` running uvicorn under systemd, published by boxd's own proxy with TLS at
+<https://mithril-factory.boxd.sh>. It is the same platform every run VM comes from, reached
+over the same SDK with its own `BOXD_API_KEY`.
 
-boxd is still where every run VM comes from. The Hetzner box reaches it purely over the API,
-so it needs `BOXD_API_KEY` and nothing else — but it does not inherit the two things boxd
-gave for free, so they are explicit here: TLS is Caddy's, and `.env` is a real file on the
-box rather than injected environment.
+It has been here before. On 2026-08-19 the first boxd control plane lost its root filesystem
+and the run history with it; the factory moved to a Hetzner box, which stopped answering on
+2026-11-02 (up according to Hetzner, unreachable on every port after a reboot), and it moved
+back. What is different this time is what the first machine lacked: daily disk backups
+(`backups.period 24h`) and a checkpoint before every deploy. The external health monitor
+(below) is what notices the next time.
 
 ```bash
-scripts/deploy.sh                 # pull the tracked branch, rebuild what moved, restart
-scripts/deploy.sh --ref main      # deploy a specific branch or tag
+scripts/deploy.sh                 # checkpoint, fast-forward to origin/main, rebuild what moved, restart
+scripts/deploy.sh --ref branch    # deploy a branch, tag or sha instead
+boxd machine checkpoint restore mithril-factory pre-deploy-<sha>   # roll back
 ```
 
 | | |
 |---|---|
-| Host | `factory@46.224.40.20` (Hetzner `cx23`, fsn1), ssh key `~/.ssh/hetzner` |
-| Service | `factory.service` — `systemctl status factory`, logs in `var/uvicorn.log` |
-| TLS | Caddy, `/etc/caddy/Caddyfile`, cert issued automatically for the configured host |
-| Backups | Hetzner daily snapshots, enabled on the server |
+| Machine | `mithril-factory` (2 vCPU / 8 GB), never suspends or hibernates, bot protection off |
+| Service | `factory.service` — `boxd machine exec mithril-factory -- 'systemctl status factory'`, logs in `var/uvicorn.log` |
+| URL | `https://mithril-factory.boxd.sh` (boxd proxy → port 8765) |
+| Backups | boxd disk backups every 24h; checkpoint `provisioned` and the last three `pre-deploy-*` |
+| Checkout | read-only deploy key on the machine; the control plane's `GITHUB_TOKEN` is not used for it |
 
-systemd, not `nohup`: the old deployment would not have survived a reboot even without the
-corruption. Secrets live in `.env` on the box and are in no other place — not in this repo,
-not in CI. Rebuilding them means `boxd env` plus a fresh `FACTORY_AUTH_PASSWORD`, which is
-also why `scripts/deploy.sh` never touches that file.
+The machine builds itself with `scripts/provision-boxd.sh`, from a laptop with the boxd CLI
+and a `gh` that may add deploy keys, and can again. Re-running it is safe. It mints the
+machine's own `BOXD_API_KEY` (that needs an interactive `boxd login`; an API-key session may
+not mint keys, and the script says what to run instead) and generates the UI login, and it
+writes no GitHub or agent credential. Those are handed over with `scripts/factory-secrets.sh`,
+which prompts for them hidden and moves them straight into the machine's `.env`. Secrets live
+in that `.env` and in no other place — not in this repo, not in CI.
+
+The boxd machine name doubles as its `.boxd.sh` subdomain and is unique across boxd, which is
+why it is not `software-factory` — that name belongs to somebody else.
 
 Schema changes apply themselves on boot (`db.init()` and `telemetry.store.init()` are both
 idempotent), so there is no migration step. To load telemetry for runs that finished before
@@ -73,9 +83,7 @@ that layer existed:
 .venv/bin/python -m telemetry.backfill      # replays every salvaged transcript
 ```
 
-The box built itself from `scripts/provision-hetzner.sh` and can again — it writes the
-systemd unit, the Caddyfile, and enables unattended upgrades, because rebuilding is fast and
-recovering is impossible. An external monitor, `scripts/factory-health.sh`, runs from a
+An external monitor, `scripts/factory-health.sh`, runs from a
 GitHub Actions cron every 10 minutes and opens (and closes) an alert issue when `/healthz`
 stops answering.
 
@@ -481,12 +489,13 @@ exhaustive list is `control/app.py`.
 | Script | |
 |---|---|
 | `verify.sh` | Every CI gate, in CI's order — ruff, all tests, the memory validator. The local pre-push command; CI runs this exact file. |
-| `deploy.sh` | Pull, rebuild what moved, restart. `--ref` deploys a branch or tag. |
+| `deploy.sh` | Checkpoint the boxd machine, fast-forward, rebuild what moved, restart. `--ref` deploys a branch or tag. |
 | `build-golden.sh` | Build the `golden-copy` base image (above). |
 | `refresh-golden.sh` | Refresh a repo's warm golden in place (above). |
 | `factory-health.sh` | External monitor; runs from a GitHub Actions cron every 10 minutes and manages an alert issue. |
 | `provision-test-server.sh` | Build a repo's persistent `test-<owner-repo>` machine: clone of the release branch over a read-only deploy key, systemd unit, the app's `.env` placed by hand, checkpoint `initial`. Prints the `## Deploy` section. |
-| `provision-hetzner.sh` | Build the control-plane box from nothing: systemd unit, Caddy, unattended upgrades. |
+| `provision-boxd.sh` | Build the control-plane machine from nothing: deploy key, checkout, build, `.env`, a minted boxd key, systemd, the proxy, backups. |
+| `factory-secrets.sh` | Hand the control plane its GitHub and agent credentials, hidden, straight into its `.env`. |
 | `planner-setup.sh` | Provision the `planner` box that runs `factory-compose`. |
 
 ## The UI

@@ -37,7 +37,7 @@ Nothing in this system calls a model except the agents running inside boxd VMs. 
 ## §2 Topology
 
 ```
-   Hetzner VM  (systemd, deployed by git pull)
+   boxd VM mithril-factory  (systemd)
    ┌─────────────────────────────────────────┐
    │  control (FastAPI) ──► telemetry        │
    │    │  polls GitHub        │             │
@@ -58,8 +58,8 @@ survives only as the rollback path). Goldens come in two tiers: a per-repo
 `golden-copy` base. Connecting a repo kicks off a provisioning run that builds its warm
 golden — `OPERATIONS.md` covers building and refreshing them.
 
-The control plane runs on a Hetzner VM under systemd and is deployed by `git pull`; it is not
-a container and it is not on boxd. Telemetry is fed in process: `control.runner._stream`
+The control plane runs on a long-lived boxd machine under systemd and is deployed by
+`scripts/deploy.sh` (checkpoint, fast-forward, restart); it is not a container. Telemetry is fed in process: `control.runner._stream`
 parses the agent's event log for the live view and hands the same events to a `Recorder` —
 no collector sits between the VM and the database.
 

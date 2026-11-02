@@ -1,6 +1,6 @@
 # control
 
-The control plane. Runs on a Hetzner VM under systemd. Watches GitHub for work, restores an
+The control plane. Runs on a boxd machine (`mithril-factory`) under systemd. Watches GitHub for work, restores an
 isolated boxd VM per task, runs an agent inside it, reviews and merges what it produces, and
 reaps the VM.
 
