@@ -252,6 +252,14 @@ class Settings:
     # Seconds between schedule checks. The moments are minutes apart, so a minute is plenty.
     release_tick: int = int(os.environ.get("FACTORY_RELEASE_TICK", "60"))
 
+    # Deploy each promoted release to its repo's stable test server, as the repo's `## Deploy`
+    # section in `.factory.md` describes. Off by default: it restarts a service other people use.
+    deploy_enabled: bool = os.environ.get("FACTORY_DEPLOY", "0") == "1"
+    # Ceiling on one deploy, install and build included, in seconds.
+    deploy_timeout: int = int(os.environ.get("FACTORY_DEPLOY_TIMEOUT", "1800"))
+    # How long a restarted service has to answer its health URL before the deploy rolls back.
+    deploy_health_wait: int = int(os.environ.get("FACTORY_DEPLOY_HEALTH_WAIT", "90"))
+
     # Issue polling. The repos this deployment starts up watching — see `_repos()`.
     repos: tuple[str, ...] = _repos()
     poll_enabled: bool = os.environ.get("FACTORY_POLL", "1") == "1"

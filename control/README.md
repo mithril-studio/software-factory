@@ -47,6 +47,7 @@ One module per concern:
 | `provision` | Build a repo's warm golden, as a run of `kind='provision'` |
 | `plan` | The goal loop: sync `.factory/goal.md`, plan the next feature toward it when the queue runs dry |
 | `release` | The release schedule: promote green integration heads onto `test`, freeze until reviewed |
+| `deploy` | Deploy a promoted release to its repo's persistent test server, as a run of `kind='deploy'` |
 | `preflight` | Is a repo ready? Labels, token scopes, golden — boots nothing |
 | `github` | Every GitHub API call: issues, labels, PRs, checks, merge |
 | `memory` | The `.mem/` validator; a CI gate (§5) |
@@ -93,7 +94,13 @@ would otherwise be stdout parsing against a binary that auto-updates underneath 
   Restored per task, never worked in directly. The run brings its own repo: it clones the one
   it was assigned into `$HOME/work/<name>` unless a checkout of that repo is already there,
   which is the whole difference between a warm `golden-<repo-slug>` and the base.
-- **No idle pool.** Restores are ~0.2s, so machines exist only while a run does.
+- **No idle pool.** Restores are ~0.2s, so machines exist only while a run does. The one
+  exception is not a run machine at all: each repo with releases has a persistent
+  `test-<owner-repo>` test server (`scripts/provision-test-server.sh`) that deploys land on.
+  Its name carries no run prefix, so the reconciler never sweeps it, and nothing in this
+  layer creates, starts or destroys it — a deploy run names it in `vm_name` and leaves
+  `vm_id` empty so that cancelling the deploy cannot delete the server. It holds one of the
+  20 slots permanently.
 - **`auto-suspend.timeout = 0` on every machine.** The default suspends after 30s without
   inbound TCP, and clocks freeze while suspended. A long build or test run with no network
   traffic looks idle and gets frozen mid-work.

@@ -396,6 +396,11 @@ export function assembleRelease(repo: string): Promise<{ release: Release | null
   return post<{ release: Release | null; reason: string }>("/api/releases/assemble", { repo })
 }
 
+/** Deploy a promoted release to its repo's test server now — the retry after a refusal. */
+export function deployRelease(id: number): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>(`/api/releases/${id}/deploy`)
+}
+
 /** Say a release has been read. Lifts its repo's freeze. */
 export function markReleaseReviewed(id: number): Promise<Release> {
   return post<Release>(`/api/releases/${id}/reviewed`)

@@ -87,6 +87,105 @@ def setup_command(profile: str | None) -> str:
     return ""
 
 
+# A `## Deploy` heading in the profile. What follows it is how a release reaches the repo's
+# stable test server — read by `deploy_facts`, executed by `control/deploy.py`.
+DEPLOY_SECTION = re.compile(r"^#{1,6}\s*deploy\b", re.I | re.M)
+
+# `key: value`, optionally a list item, optionally with the value in backticks. Values are one
+# line each, which is the point: a deploy step that needs a paragraph belongs in a script in
+# the repo, named here by one line.
+_DEPLOY_LINE = re.compile(r"^\s*[-*]?\s*`?([A-Za-z_]+)`?\s*:\s*(.+?)\s*$")
+
+DEPLOY_KEYS = ("machine", "path", "install", "build", "migrate", "service", "health", "url")
+# `migrate` is the one a repo may leave out: not every app has a schema.
+DEPLOY_REQUIRED = tuple(k for k in DEPLOY_KEYS if k != "migrate")
+
+
+def deploy_facts(profile: str | None) -> dict[str, str]:
+    """The `## Deploy` section of a repo's `.factory.md`, as `{key: value}`.
+
+    Keys outside `DEPLOY_KEYS` are ignored, the first occurrence of a key wins, and a value
+    wrapped in backticks is unwrapped. Like `setup_command`, nothing is ever guessed: a key the
+    repo did not write is absent, and `missing_deploy_facts` says so.
+
+        ## Deploy
+        - machine: test-acme-api
+        - path: /home/boxd/app
+        - install: `npm ci`
+        - build: `npm run build`
+        - migrate: `npm run db:migrate`
+        - service: acme-api
+        - health: http://localhost:3000/healthz
+        - url: https://test-acme-api.boxd.sh
+    """
+    started = False
+    out: dict[str, str] = {}
+    for line in (profile or "").splitlines():
+        if not started:
+            started = bool(DEPLOY_SECTION.match(line))
+            continue
+        if line.startswith("#"):
+            break
+        found = _DEPLOY_LINE.match(line)
+        if not found:
+            continue
+        key, value = found.group(1).lower(), found.group(2).strip()
+        if key not in DEPLOY_KEYS or key in out:
+            continue
+        if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+            value = value[1:-1].strip()
+        if value:
+            out[key] = value
+    return out
+
+
+def missing_deploy_facts(facts: dict[str, str]) -> list[str]:
+    """Which required deploy keys are absent, in the order the section lists them."""
+    return [k for k in DEPLOY_REQUIRED if not facts.get(k)]
+
+
+def deploy_problem(facts: dict[str, str]) -> str | None:
+    """Why these facts cannot be deployed with, or None when they can.
+
+    The machine name matters beyond existing. The reconciler destroys any machine whose name
+    carries a run prefix and has no run behind it, so a test server named `run-…` would be
+    reaped as an orphan between deploys. `test-<slug>` is the convention, and the guard is that
+    the name is not one the factory sweeps.
+    """
+    missing = missing_deploy_facts(facts)
+    if missing:
+        return f"the ## Deploy section is missing {', '.join(missing)}"
+    if runner.is_run_vm(facts["machine"]):
+        return (
+            f"machine {facts['machine']!r} carries a run prefix, and the reconciler destroys "
+            f"those between runs; name it test-<slug>"
+        )
+    return None
+
+
+def deploy_checks(profile: str | None) -> list[Check]:
+    """Whether the repo says how a release reaches its test server. Warnings, never blocking.
+
+    Silent when the repo has no `## Deploy` section and deploys are switched off — there is
+    nothing to be wrong about. With deploys on, a missing section is worth saying: releases of
+    this repo will be promoted and never deployed.
+    """
+    if not DEPLOY_SECTION.search(profile or ""):
+        if not settings.deploy_enabled:
+            return []
+        return [Check(
+            f"{runner.PROFILE_PATH} says how to deploy", False,
+            "no `## Deploy` section, so releases are promoted to the release branch and never "
+            "deployed",
+            fatal=False,
+        )]
+    problem = deploy_problem(deploy_facts(profile))
+    return [Check(
+        f"{runner.PROFILE_PATH} says how to deploy", problem is None,
+        problem or "## Deploy names every step", fatal=False,
+    )]
+
+
 def profile_checks(profile: str | None) -> list[Check]:
     """What the repo's `.factory.md` says, and the one thing it most needs to say.
 
@@ -188,7 +287,9 @@ async def _repo_checks(repo: str, base: str) -> list[Check]:
             fatal=settings.merge_require_checks and settings.auto_merge,
         )
     )
-    checks.extend(profile_checks(await github.file(repo, runner.PROFILE_PATH, base)))
+    profile = await github.file(repo, runner.PROFILE_PATH, base)
+    checks.extend(profile_checks(profile))
+    checks.extend(deploy_checks(profile))
     try:
         await github.ensure_labels(repo)
         checks.append(Check("lifecycle labels", True, "present or created"))

@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import db, github, repos
+from . import db, deploy, github, repos
 from .config import settings
 
 log = logging.getLogger("factory.release")
@@ -337,9 +337,34 @@ async def mark_reviewed(release_id: int) -> dict:
 # --------------------------------------------------------------------------- the loop
 
 
+async def deploy_promoted() -> list[int]:
+    """Start a deploy for every promoted release that has not been refused one. Returns ids.
+
+    A refusal — the repo has no usable `## Deploy` section — is noted on the release by
+    `deploy.create` and not retried every tick; `POST /api/releases/{id}/deploy` clears it and
+    tries again once the profile is fixed.
+    """
+    started = []
+    for release in await db.releases_in(("promoted",)):
+        if release.get("error"):
+            continue
+        try:
+            await deploy.create(release["id"])
+            started.append(release["id"])
+        except ValueError as exc:
+            log.info("release %s not deployed: %s", release["id"], exc)
+        except Exception:  # noqa: BLE001 - one repo's deploy must not stop another's
+            log.exception("could not start a deploy of release %s", release["id"])
+    return started
+
+
 async def _tick() -> None:
     now = _now()
     await expire_stale(now)
+    # Before the release switch, not behind it: a release assembled by hand deploys like a
+    # scheduled one. FACTORY_DEPLOY is the switch that governs this half.
+    if settings.deploy_enabled:
+        await deploy_promoted()
     if not settings.release_enabled:
         return
     times = parse_times(settings.release_times)
