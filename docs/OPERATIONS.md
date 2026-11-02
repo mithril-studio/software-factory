@@ -393,8 +393,10 @@ Every key but `migrate` is required. `machine` must not carry a run prefix (`run
 — the reconciler destroys those between runs — so it is `test-<owner-repo>`, which is what
 `scripts/provision-test-server.sh` builds and what it prints this section for.
 
-A deploy (`control/deploy.py`, a run of `kind='deploy'`) refuses a dirty checkout or the wrong
-branch, fast-forwards to the release sha, then runs install, build, migrate, restarts the
+Each command runs in its own subshell from the checkout root, so `cd web && npm ci` is fine and
+does not move the next step. One deploy runs at a time per machine (`flock`); a second one
+refuses rather than interleaving. A deploy (`control/deploy.py`, a run of `kind='deploy'`)
+refuses a dirty checkout or the wrong branch, fast-forwards to the release sha, then runs install, build, migrate, restarts the
 service and waits `FACTORY_DEPLOY_HEALTH_WAIT` seconds for `health`. If anything after the
 fast-forward fails it resets the checkout to where it started, rebuilds, restarts and checks
 health again. **A migration is not rolled back** — only the checkout is. The factory never
@@ -461,7 +463,9 @@ exhaustive list is `control/app.py`.
   `GET /api/releases/{id}/packet` is the review packet — each item with the criteria it was
   reviewed against and the evidence, the deploy, the browser acceptance, and the feedback.
   `POST .../feedback {"text"}` stores a note and files nothing;
-  `POST .../feedback/{fid}/file` opens it as an `agent:queued` issue, exactly once (409 after).
+  `POST .../feedback/{fid}/file` opens it as an issue, exactly once (409 after) —
+  `agent:queued` when it carries a blocking criterion, a plain issue otherwise, since a queued
+  issue the poller blocks would halt the repo.
   Both answer `gate_reason` — why the poller would refuse that note as an issue, or null.
 - **Goals** — the goal itself is not an API: it is `.factory/goal.md`, committed in the
   repo, noticed by SHA within ~5 minutes. `POST .../replan` re-arms a `met` or `stalled`

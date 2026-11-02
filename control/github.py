@@ -134,11 +134,15 @@ async def find_pr(repo: str, branch: str) -> str | None:
     return data[0]["html_url"] if data else None
 
 
-async def file(repo: str, path: str, ref: str) -> str | None:
+async def file(repo: str, path: str, ref: str, strict: bool = False) -> str | None:
     """Fetch one file's raw contents from `repo` at `ref`. None when it is not there.
 
     Used for a repo's `.factory.md` profile, which is why a missing file is an ordinary
     answer rather than an error: most repos will not have one, and the caller has a default.
+
+    `strict` raises on anything but 200 and 404, for the caller that must not read a GitHub
+    outage as "the file says nothing" — a deploy refused for a missing `## Deploy` section is
+    noted and not retried, so a 502 there would park a release until somebody noticed.
     """
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(
@@ -147,6 +151,8 @@ async def file(repo: str, path: str, ref: str) -> str | None:
             params={"ref": ref},
             follow_redirects=True,
         )
+    if strict and resp.status_code not in (200, 404):
+        resp.raise_for_status()
     if resp.status_code != 200:
         return None
     return resp.text
@@ -448,29 +454,32 @@ async def create_branch(repo: str, branch: str, sha: str) -> None:
         )
 
 
-async def commits_between(repo: str, base: str, head: str) -> list[str]:
-    """The shas reachable from `head` and not from `base`, oldest first. Raises on failure.
+async def is_ancestor(repo: str, sha: str, head: str) -> bool:
+    """Whether `sha` is in `head`'s history. Raises on failure.
 
-    GitHub caps a compare at 250 commits; a release range longer than that is a release
-    nobody can read anyway, and the items past the cap ride the next one.
+    Asked per commit rather than as one range compare, because a range is only as good as its
+    start: a release that crashed between moving the branch and recording its items, or a range
+    past GitHub's 250-commit cap, would leave merged work outside every later range for good.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{API}/repos/{repo}/compare/{base}...{head}",
-            headers=_headers(),
-            params={"per_page": 250},
-        )
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{API}/repos/{repo}/compare/{sha}...{head}", headers=_headers())
         resp.raise_for_status()
-    return [c["sha"] for c in resp.json().get("commits") or []]
+    return resp.json().get("status") in ("ahead", "identical")
 
 
 async def pull_request(repo: str, number: int) -> dict:
-    """A pull request's title and body."""
+    """A pull request's title, body, and whether and where it merged."""
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(f"{API}/repos/{repo}/pulls/{number}", headers=_headers())
         resp.raise_for_status()
     data = resp.json()
-    return {"title": data.get("title") or "", "body": data.get("body") or ""}
+    return {
+        "title": data.get("title") or "",
+        "body": data.get("body") or "",
+        "merged": bool(data.get("merged")),
+        "merge_commit_sha": data.get("merge_commit_sha"),
+        "base": (data.get("base") or {}).get("ref"),
+    }
 
 
 async def merge_base_sha(repo: str, base: str, head_sha: str) -> str:

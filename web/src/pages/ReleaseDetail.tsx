@@ -118,15 +118,15 @@ function FeedbackRow({ releaseId, note, onDone }: { releaseId: number; note: Fee
         ) : (
           <>
             {note.gate_reason && (
-              <span className="text-warn" title="The poller labels such an issue agent:blocked instead of building it">
-                would not be built: {note.gate_reason}
+              <span className="text-warn" title="Filed as a plain issue rather than agent:queued: the poller would block it, and a blocked issue halts the repo's queue">
+                filed for a human, not queued: {note.gate_reason}
               </span>
             )}
             <Button
               variant="ghost"
               size="sm"
               disabled={busy}
-              title="Open this note as an agent:queued issue on the repo"
+              title={note.gate_reason ? "Open this note as a plain issue on the repo" : "Open this note as an agent:queued issue the factory will build"}
               onClick={async () => {
                 setBusy(true)
                 setError(null)

@@ -271,6 +271,15 @@ async def create(release_id: int) -> str:
         raise ValueError(why)
 
     await db.transition_release(release_id, "accepting", error=None)
+    try:
+        return await _start(release_id, release)
+    except BaseException as exc:
+        # See `deploy.create`: a release left `accepting` with no task freezes its repo.
+        await _fail_release(release_id, f"acceptance could not start: {exc!r}"[:300])
+        raise
+
+
+async def _start(release_id: int, release: dict) -> str:
     run_id = uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"
     log_path.touch()
