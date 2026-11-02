@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { Link } from "react-router-dom"
 import { Rocket } from "lucide-react"
 import {
   assembleRelease,
@@ -150,7 +151,11 @@ export function Releases() {
             <TableBody>
               {rows.map((r) => (
                 <TableRow key={r.id}>
-                  <TableCell className="font-mono">#{r.id}</TableCell>
+                  <TableCell className="font-mono">
+                    <Link to={`/releases/${r.id}`} className="text-primary underline-offset-4 hover:underline">
+                      #{r.id}
+                    </Link>
+                  </TableCell>
                   <TableCell className="whitespace-nowrap font-mono">{r.repo}</TableCell>
                   <TableCell className="font-mono text-xs">
                     {sha(r.base_sha_before)} → {sha(r.test_sha)}

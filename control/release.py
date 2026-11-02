@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 from collections.abc import Iterable
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import db, deploy, github, repos
+from . import db, deploy, github, repos, runner
 from .config import settings
 
 log = logging.getLogger("factory.release")
@@ -318,15 +319,116 @@ async def _items_in_range(
                           before[:8], head[:8], repo)
     out = []
     for item in chosen:
-        summary = None
+        summary = criteria = None
         try:
             number = int(str(item.get("pr_url") or "").rstrip("/").split("/")[-1])
             pr = await github.pull_request(repo, number)
             summary = " ".join(pr["body"].split())[:SUMMARY_MAX] or None
         except Exception:  # noqa: BLE001 - an excerpt is a convenience
             pass
-        out.append({**item, "summary": summary})
+        try:
+            # The contract the item was reviewed against, frozen as it stood at promotion, so
+            # the packet says what each criterion was even if the issue is edited later.
+            issue = await github.get_issue(repo, item["issue_number"])
+            criteria = json.dumps(runner.parse_criteria(issue.get("body") or ""))
+        except Exception:  # noqa: BLE001 - the verdict still carries ids and evidence
+            pass
+        out.append({**item, "summary": summary, "criteria": criteria})
     return out
+
+
+# --------------------------------------------------------------------------- the packet
+
+
+def _json(raw: str | None, default):
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
+def packet_criteria(criteria: list[dict], verdict: dict | None) -> list[dict]:
+    """Each criterion as the issue stated it, beside what the reviewer found.
+
+    Pure. Criteria the issue carried come first, in its order, with the reviewer's status and
+    evidence (or `not reported`); anything the reviewer reported on that the issue no longer
+    carries follows, so nothing it said is hidden. Unmet first within each, because that is
+    what a human reading the packet is looking for.
+    """
+    reported = {}
+    if isinstance(verdict, dict):
+        for c in verdict.get("criteria") or []:
+            if isinstance(c, dict) and c.get("id"):
+                reported[str(c["id"])] = c
+    rows = []
+    for c in criteria or []:
+        if not isinstance(c, dict):
+            continue
+        got = reported.pop(str(c.get("id")), {})
+        rows.append({
+            "id": str(c.get("id")),
+            "mode": c.get("mode"),
+            "statement": c.get("statement"),
+            "verify": c.get("verify"),
+            "status": got.get("status") or "not reported",
+            "evidence": got.get("evidence"),
+        })
+    for cid, got in reported.items():
+        rows.append({
+            "id": cid, "mode": None, "statement": None, "verify": None,
+            "status": got.get("status") or "not reported", "evidence": got.get("evidence"),
+        })
+    return sorted(rows, key=lambda r: r["status"] == "met")
+
+
+async def packet(release_id: int) -> dict | None:
+    """The review packet: `db.release_packet`, with every stored JSON decoded and joined.
+
+    Each feedback row carries `gate_reason`, so the form can warn before a note without a
+    blocking criterion is filed as an issue the poller would refuse to build.
+    """
+    raw = await db.release_packet(release_id)
+    if raw is None:
+        return None
+    items = []
+    for item in raw["items"]:
+        review = item.pop("review")
+        verdict = _json(review.get("verdict") if review else None, {})
+        items.append({
+            **item,
+            "criteria": packet_criteria(_json(item.get("criteria"), []), verdict),
+            "review": None if review is None else {
+                "run_id": review["id"],
+                "verdict": verdict.get("verdict"),
+                "findings": verdict.get("findings") or [],
+                "notes": verdict.get("notes") or [],
+            },
+        })
+    acceptance = raw["acceptance"]
+    if acceptance is not None:
+        acceptance = {**acceptance, "verdict": _json(acceptance.get("verdict"), {})}
+    return {
+        **raw,
+        "items": items,
+        "acceptance": acceptance,
+        "feedback": [
+            {**f, "gate_reason": runner.gate_reason(f["text"])} for f in raw["feedback"]
+        ],
+    }
+
+
+def feedback_issue(release: dict, text: str, title: str | None = None) -> tuple[str, str]:
+    """The issue a note becomes: (title, body). The note verbatim, then where it came from."""
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "feedback")
+    title = (title or "").strip() or first.lstrip("#").strip()[:80]
+    where = f" — {release['test_url']}" if release.get("test_url") else ""
+    body = (
+        f"{text.strip()}\n\n---\n\n"
+        f"*Filed from the review packet of release #{release['id']} of {release['repo']} "
+        f"({(release.get('test_sha') or '')[:8]}{where}), by a human.*\n"
+    )
+    return title, body
 
 
 async def mark_reviewed(release_id: int) -> dict:

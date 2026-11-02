@@ -386,9 +386,77 @@ export type ReleaseItem = {
   pr_url: string | null
   merged_sha: string
   summary: string | null
+  /** The issue's criteria at promotion, as stored JSON. */
+  criteria?: string | null
 }
 
 export type ReleaseDetail = Release & { items: ReleaseItem[] }
+
+/** One acceptance criterion as the issue stated it at promotion, beside what was found. */
+export type PacketCriterion = {
+  id: string
+  mode: string | null
+  statement: string | null
+  verify: string | null
+  /** `met`, `not_met`, `cannot_verify`, or `not reported` — which counts as not met. */
+  status: string
+  evidence: string | null
+}
+
+export type PacketItem = Omit<ReleaseItem, "criteria"> & {
+  criteria: PacketCriterion[]
+  review: { run_id: string; verdict: string | null; findings: string[]; notes: string[] } | null
+}
+
+export type PacketRun = {
+  id: string
+  status: string
+  error: string | null
+  vm_name: string | null
+  exit_code: number | null
+  cost_usd: number | null
+  created_at: string
+  finished_at: string | null
+}
+
+/** What a browser made of the release on the test server, per item. */
+export type AcceptanceVerdict = {
+  verdict?: "accept" | "reject"
+  items?: { issue: number; status: string; evidence: string }[]
+  findings?: string[]
+  notes?: string[]
+}
+
+export type Feedback = {
+  id: number
+  release_id: number
+  text: string
+  created_at: string
+  issue_url: string | null
+  issue_number: number | null
+  filed_at: string | null
+  /** Why the poller would refuse this note as an issue, or null when it would build it. */
+  gate_reason: string | null
+}
+
+/** Everything a human needs to review one release. */
+export type Packet = {
+  release: Release
+  items: PacketItem[]
+  deploy: PacketRun | null
+  acceptance: (PacketRun & { verdict: AcceptanceVerdict }) | null
+  feedback: Feedback[]
+}
+
+/** Store a note on a release. Files nothing. */
+export function addFeedback(releaseId: number, text: string): Promise<Feedback> {
+  return post<Feedback>(`/api/releases/${releaseId}/feedback`, { text })
+}
+
+/** File a stored note as an `agent:queued` issue. Exactly once. */
+export function fileFeedback(releaseId: number, feedbackId: number): Promise<Feedback> {
+  return post<Feedback>(`/api/releases/${releaseId}/feedback/${feedbackId}/file`, {})
+}
 
 /** Assemble a release now. `release` is null when there is nothing new, with the reason;
  *  a frozen repo throws (409). */
