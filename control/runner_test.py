@@ -416,6 +416,32 @@ check("poller: waits while another factory PR is open", next_issue([4], ["factor
 check("poller: but an issue may continue its own open PR", next_issue([4], ["factory/issue-4"]), 4)
 check("poller: independent issues do not wait", next_issue([4], ["factory/issue-3"], False), 4)
 
+# ---------- mandatory verification cannot be skipped by a successful builder
+from unittest.mock import patch
+from control import verification_runner
+
+for action, status in (("request_fixes", "failed"), ("ready_for_review", "succeeded")):
+    boxd, gh = FakeBoxd(stdout=events()), FakeGitHub()
+    contract = {"enabled": True, "version": "frozen"}
+
+    async def verify(run_id, plan, sha, remote, machine, env, log):
+        check("verification: plan persisted before harness starts",
+              json.loads((await db.get_run(run_id))["verification_plan"]), contract)
+        check("verification: uses the PR commit", sha, "new")
+        check("verification: runs before VM teardown", remote.deleted, [])
+        decision = {"action": action, "reason": "test_result"}
+        await db.update_run(run_id, verification=json.dumps({"decision": decision, "results": []}))
+        return decision
+
+    with patch.object(runner.verification, "freeze", return_value=contract), \
+         patch.object(verification_runner, "execute", side_effect=verify):
+        row = run_one(boxd, gh)
+    check("verification: successful builder obeys " + action, row["status"], status)
+    check("verification: still keeps the PR", bool(row["pr_url"]))
+    check("verification: tears the VM down afterwards", len(boxd.deleted), 1)
+    check("verification: closing report includes the decision", action in gh.comments[-1])
+
+
 tmp.cleanup()
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
