@@ -23,7 +23,7 @@ from boxd import AsyncBoxd, _mappers as _boxd_mappers
 from telemetry import backfill as telemetry_backfill
 from telemetry.recorder import Recorder
 
-from . import agents, db, github, repos
+from . import agents, db, github, repos, verification
 from .config import settings
 
 # boxd reports snapshot timestamps in milliseconds, but the SDK's snapshot mapper reads them
@@ -229,12 +229,8 @@ DEFAULT_PROJECT_NOTES = """- Nothing is installed for this repo yet. Work out th
 
 
 async def project_notes(repo: str, ref: str) -> str:
-    """The repo's `.factory.md` at `ref`, or the generic default. Never fails a run."""
-    try:
-        text = await github.file(repo, PROFILE_PATH, ref)
-    except Exception:  # noqa: BLE001 - a profile is an improvement, never a precondition
-        _log.exception("could not read %s from %s", PROFILE_PATH, repo)
-        return DEFAULT_PROJECT_NOTES
+    """Missing profile is optional; an unreadable profile must not silently disable gates."""
+    text = await github.file(repo, PROFILE_PATH, ref)
     return text.strip() if text and text.strip() else DEFAULT_PROJECT_NOTES
 
 
@@ -598,6 +594,11 @@ async def _report(run_id: str, repo: str, number: int, log: RunLog) -> None:
     if link:
         details += f" · [log]({link})"
     lines.append(details)
+    if run.get("verification"):
+        receipt = json.loads(run["verification"])
+        decision = receipt["decision"]
+        lines.append(f"Verification: {decision['action']} ({decision['reason']}). "
+                     "Merge remains a human decision.")
     await _mirror(
         repo,
         number,
@@ -626,7 +627,11 @@ async def _guarded(run_id: str, repo: str, issue: dict, branch: str) -> None:
         elif exit_code == 0 and pr:
             await db.finish_run(run_id, "succeeded", pr_url=pr_url, error=None)
         else:
-            reason = f"agent exited {exit_code}" if exit_code != 0 else "no pull request opened"
+            saved = await db.get_run(run_id) or {}
+            receipt = json.loads(saved.get("verification") or "{}")
+            decision = receipt.get("decision", {})
+            reason = (f"verification {decision['action']}: {decision['reason']}" if decision
+                      else f"agent exited {exit_code}" if exit_code != 0 else "no pull request opened")
             await db.finish_run(run_id, "failed", pr_url=pr_url, error=reason)
     except asyncio.CancelledError:
         if _stopping:
@@ -666,6 +671,8 @@ async def _execute(
     try:
         base = await repos.ensure_target(repo)
         notes = await project_notes(repo, base)
+        plan = verification.freeze(notes, issue)
+        await db.update_run(run_id, verification_plan=json.dumps(plan))
         # Both raise on a GitHub error: what they answer decides whether a branch is deleted.
         latest = await github.latest_pr(repo, branch)
         tip = await github.branch_sha(repo, branch)
@@ -722,6 +729,12 @@ async def _execute(
             if pr else "[factory] no open pull request"
         )
         ok = exit_code == 0 and pr is not None and not pr["draft"]
+        if ok and plan.get("enabled"):
+            from .verification_runner import execute
+            decision = await execute(run_id, plan, pr["head_sha"], boxd, machine, env, log)
+            ok = decision["action"] == "ready_for_review"
+            if not ok:
+                exit_code = 94
         return exit_code, pr
     finally:
         await _reap(boxd, machine, log, keep=settings.keep_failed and not ok)

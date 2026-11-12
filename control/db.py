@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS repos (
 # Columns a database created by an older version may lack. Only "duplicate column" is
 # tolerated; any other error is a real problem and is raised.
 MIGRATIONS = (
+    "ALTER TABLE runs ADD COLUMN verification_plan TEXT",
+    "ALTER TABLE runs ADD COLUMN verification TEXT",
     "ALTER TABLE runs ADD COLUMN base_sha TEXT",
     "ALTER TABLE runs ADD COLUMN over_budget INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE repos ADD COLUMN base_branch TEXT",

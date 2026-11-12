@@ -266,6 +266,8 @@ async def file(repo: str, path: str, ref: str) -> str | None:
             params={"ref": ref},
             follow_redirects=True,
         )
+    if resp.status_code != 404:
+        resp.raise_for_status()
     if resp.status_code != 200:
         return None
     return resp.text

@@ -44,6 +44,10 @@ npm --prefix web install && npm --prefix web run build
 
 Then open <http://localhost:8765> and log in with the credentials you set.
 
+An optional [post-build verification step](docs/verification.md) runs the versioned browser
+harness before VM teardown. It records required/advisory verdicts and a deterministic next
+action; merging and re-queuing remain human decisions.
+
 ## Docs
 
 Everything operational, including deploying, building golden VMs, and connecting repos, lives in [docs/OPERATIONS.md](docs/OPERATIONS.md). Architecture is in [docs/architecture.md](docs/architecture.md).

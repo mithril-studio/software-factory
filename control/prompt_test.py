@@ -76,7 +76,7 @@ for lock, install in (
 check("the default points at the repo's own rules files", "CLAUDE.md" in d)
 
 
-# ---------- fetching: a missing profile is an answer, an outage is not a failure
+# ---------- fetching: a missing profile is optional; an outage cannot silently disable verification
 async def fetch(stub):
     real, github.file = github.file, stub
     try:
@@ -103,8 +103,11 @@ async def found(repo, path, ref):
 
 check("no .factory.md -> the default", asyncio.run(fetch(missing)), runner.DEFAULT_PROJECT_NOTES)
 check("an empty .factory.md -> the default", asyncio.run(fetch(blank)), runner.DEFAULT_PROJECT_NOTES)
-check("GitHub down -> the default, not a dead run",
-      asyncio.run(fetch(outage)), runner.DEFAULT_PROJECT_NOTES)
+try:
+    asyncio.run(fetch(outage))
+    check("unreadable profile refuses to silently disable verification", False)
+except RuntimeError:
+    check("unreadable profile refuses to silently disable verification", True)
 check("a profile is read from the run's base branch",
       asyncio.run(fetch(found)).startswith("# a/repo:.factory.md@test"))
 
