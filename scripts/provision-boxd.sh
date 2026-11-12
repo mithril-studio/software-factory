@@ -161,6 +161,17 @@ sed -i "s|^BOXD_API_KEY=.*|BOXD_API_KEY=$KEY|" .env
 echo "boxd key installed"'
 fi
 
+# Public resolvers behind boxd's own. On 2026-11-12 the boxd resolver failed three lookups in
+# five for an hour; every GitHub call failed with it, so the poller saw no queue at all.
+# glibc moves to the next nameserver on a failure, so boxd's still answers first.
+say "dns fallback"
+on_vm -- 'set -eu
+grep -q "^nameserver 1.1.1.1" /etc/resolv.conf || {
+  sudo cp -n /etc/resolv.conf /etc/resolv.conf.boxd-orig
+  printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee -a /etc/resolv.conf >/dev/null
+}
+sync'
+
 # systemd, so a reboot brings it back. `sync` after anything written, because boxd reboots
 # are cold and an unflushed file can vanish in one.
 say "factory.service"

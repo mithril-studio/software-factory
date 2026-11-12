@@ -96,6 +96,35 @@ try:
 finally:
     runner.create = real_create
 
+# ---------- the queue: a GitHub failure is an error, and queueing is a label
+from control import github  # noqa: E402
+
+labelled = []
+
+
+async def broken_plan(repo, limit=100):
+    raise OSError("Temporary failure in name resolution")
+
+
+async def fake_add_labels(repo, number, labels):
+    labelled.append((repo, number, labels))
+
+
+real_plan, real_add = github.plan, github.add_labels
+github.plan, github.add_labels = broken_plan, fake_add_labels
+try:
+    resp = client.get("/api/plan?repo=acme/api", cookies=COOKIE)
+    check("queue: an unreadable repo is a 502, not an empty queue",
+          (resp.status_code, "name resolution" in resp.text), (502, True))
+    resp = client.post("/api/plan/queue", cookies=COOKIE, json={"repo": "acme/api", "number": 5})
+    check("queue: queueing labels the issue agent:queued",
+          (resp.status_code, labelled), (200, [("acme/api", 5, [github.LABEL_QUEUED])]))
+    resp = client.post("/api/plan/queue", cookies=COOKIE, json={"repo": "other/repo", "number": 1})
+    check("queue: an unwatched repo is refused and nothing is labelled",
+          (resp.status_code, len(labelled)), (400, 1))
+finally:
+    github.plan, github.add_labels = real_plan, real_add
+
 # ---------- the log stream resumes instead of replaying
 log_path = Path(tmp.name) / "r1.log"
 log_path.write_text("one\ntwo\nthree\n")

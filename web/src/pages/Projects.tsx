@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { PageHeader, Empty, ErrorNote } from "@/components/Page"
+import { PageHeader, Empty, ErrorNote, Loading } from "@/components/Page"
 
 function gitUrl(repo: string): string {
   return `https://github.com/${repo}`
@@ -211,6 +211,7 @@ export function Projects() {
       />
       {connecting && <Connect onDone={refresh} onClose={() => setConnecting(false)} />}
       {error && <ErrorNote message={error} />}
+      {!projects && !error && <Loading />}
       {projects && projects.length === 0 && !connecting && (
         <Empty>No repos connected yet. Connect one — it can take issues immediately.</Empty>
       )}

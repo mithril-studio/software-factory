@@ -42,6 +42,11 @@ export function Empty({ children }: { children: ReactNode }) {
   )
 }
 
+/** Shown until a page's first answer arrives, so a slow endpoint never reads as an empty page. */
+export function Loading() {
+  return <div className="py-12 text-center font-mono text-xs text-muted-foreground">Loading…</div>
+}
+
 export function ErrorNote({ message }: { message: string }) {
   return (
     <div className="mb-5 border border-border bg-bad/15 px-4 py-3 font-mono text-xs text-bad shadow-hard-sm">

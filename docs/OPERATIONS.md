@@ -342,8 +342,9 @@ The exhaustive list is `control/app.py`.
 - **Runs** — `POST /api/runs {"repo", "issue_number"}` starts one (409 if the repo is busy).
   `GET /api/runs`, `GET /api/runs/{id}`, `POST .../cancel`, `GET .../stream` (SSE, resumes on
   reconnect), `GET .../telemetry`.
-- **Queue** — `GET /api/plan?repo=` (open issues with their factory state), `GET /api/issues`,
-  `GET /api/config`
+- **Queue** — `GET /api/plan?repo=` (open issues with their factory state; 502 when GitHub
+  cannot be read), `POST /api/plan/queue {"repo", "number"}` (labels the issue
+  `agent:queued`), `GET /api/issues`, `GET /api/config`
 - **Telemetry** — `GET /api/telemetry`, `GET /api/digest?repo=&days=`
 - **Repos** — `POST`/`DELETE /api/repos`, `PATCH /api/repos/{owner}/{name}` (`base_branch`:
   where its PRs go), `GET /api/projects`, `GET /api/github/repos`, `GET /api/preflight?repo=`

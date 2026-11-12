@@ -218,7 +218,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return resp.json()
 }
 
-function get<T>(url: string): Promise<T> {
+export function get<T>(url: string): Promise<T> {
   return request<T>(url)
 }
 
@@ -244,8 +244,9 @@ export function del<T>(url: string): Promise<T> {
 
 // ---- runs ----
 
-export function startRun(repo: string, issueNumber: number): Promise<{ run_id: string }> {
-  return post<{ run_id: string }>("/api/runs", { repo, issue_number: issueNumber })
+/** Label an issue `agent:queued`, the same as doing it on GitHub. The poller starts it. */
+export function queueIssue(repo: string, number: number): Promise<{ ok: boolean }> {
+  return post<{ ok: boolean }>("/api/plan/queue", { repo, number })
 }
 
 export function cancelRun(runId: string): Promise<{ ok: boolean }> {

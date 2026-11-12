@@ -285,15 +285,42 @@ async def api_issues(repo: str):
 
 @app.get("/api/plan")
 async def api_plan(repo: str | None = None):
-    """The queue: open issues with their factory state, for one repo or every watched one."""
-    targets = [repo] if repo else list(repos.watched())
+    """The queue: open issues with their factory state, for one repo or every watched one.
+
+    For one repo, a GitHub failure is a 502: an empty list would say the repo has no open
+    issues, which is how a DNS outage once passed for a quiet queue.
+    """
+    if repo:
+        try:
+            return await github.plan(repo)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"could not read issues for {repo}: {exc}") from exc
     out: list[dict] = []
-    for target in targets:
+    for target in repos.watched():
         try:
             out.extend(await github.plan(target))
         except Exception as exc:  # noqa: BLE001 - one unreadable repo must not blank the rest
             log.warning("could not read issues for %s: %r", target, exc)
     return out
+
+
+class QueueIssue(BaseModel):
+    repo: str
+    number: int
+
+
+@app.post("/api/plan/queue")
+async def api_queue_issue(body: QueueIssue):
+    """Label an issue `agent:queued`, exactly what doing it on GitHub does. The poller picks
+    it up on its next pass; a failed issue queued again continues from its pushed commits."""
+    repo = body.repo.strip()
+    if repo not in repos.watched():
+        raise HTTPException(400, f"{repo} is not watched")
+    try:
+        await github.add_labels(repo, body.number, [github.LABEL_QUEUED])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"could not label {repo}#{body.number}: {exc}") from exc
+    return {"ok": True}
 
 
 def _checks_json(checks) -> list[dict]:
