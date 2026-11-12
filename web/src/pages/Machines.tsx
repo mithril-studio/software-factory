@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { PageHeader, Empty, ErrorNote } from "@/components/Page"
+import { PageHeader, Empty, ErrorNote, Loading } from "@/components/Page"
 
 /** What this deployment can boot, and what is running. The goldens table is first because an
  *  empty one explains an empty second table, and never the other way round. */
@@ -115,6 +115,7 @@ export function Machines() {
           subtitle="Snapshots this deployment can boot: the base every repo falls back to, plus any warm ones built with scripts/refresh-golden.sh."
         />
         {goldensError && <ErrorNote message={goldensError} />}
+        {!goldens && !goldensError && <Loading />}
         {goldens && goldens.length === 0 && (
           <Empty>
             <Boxes className="mx-auto mb-2 size-6" />
@@ -137,6 +138,7 @@ export function Machines() {
         />
         {error && <ErrorNote message={error} />}
         {reconcileError && <ErrorNote message={`Reconcile failed: ${reconcileError}`} />}
+        {!machines && !error && <Loading />}
         {machines && machines.length === 0 && <Empty>No machines running.</Empty>}
         {machines && machines.length > 0 && <MachineTable machines={machines} />}
       </div>

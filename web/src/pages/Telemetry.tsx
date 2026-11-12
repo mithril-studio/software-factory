@@ -3,7 +3,7 @@ import { usePoll, type Telemetry as TelemetryData } from "@/lib/api"
 import { cost } from "@/lib/format"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { PageHeader, Empty, ErrorNote } from "@/components/Page"
+import { PageHeader, Empty, ErrorNote, Loading } from "@/components/Page"
 import { Meter, StatTile } from "@/components/Meter"
 
 /** Panel masthead: serif title over a hairline, the same voice as the page header one
@@ -65,6 +65,7 @@ export function Telemetry() {
         subtitle="Every model call and tool call the factory has made, priced against model_prices."
       />
       {error && <ErrorNote message={error} />}
+      {!data && !error && <Loading />}
 
       {empty && (
         <Empty>

@@ -73,7 +73,8 @@ class Stream:
 
 
 class ExecResult:
-    stdout = ""
+    def __init__(self, stdout=""):
+        self.stdout = stdout
 
 
 class FakeBoxd:
@@ -81,8 +82,9 @@ class FakeBoxd:
 
     instances: list = []
 
-    def __init__(self, stdout="", exit_code=0, ready_error=None, hang=False):
+    def __init__(self, stdout="", exit_code=0, ready_error=None, hang=False, transcript=""):
         self.stdout, self.exit_code, self.ready_error, self.hang = stdout, exit_code, ready_error, hang
+        self.transcript = transcript
         self.machines = self
         self.snapshots = self
         self.created, self.deleted, self.env = [], [], None
@@ -105,7 +107,8 @@ class FakeBoxd:
         return Stream(self.stdout, self.exit_code, self.hang)
 
     async def exec(self, machine_id, script, timeout):
-        return ExecResult()
+        # The only exec a run makes is the transcript salvage.
+        return ExecResult(self.transcript)
 
     async def delete(self, machine_id):
         self.deleted.append(machine_id)
@@ -242,6 +245,31 @@ check("happy: the agent was told to open a PR into test",
       "gh pr create --base test" in boxd.env["FACTORY_PROMPT"])
 check("happy: the agent recorded is what the golden announced", row["agent"], "claude")
 check("happy: the repo is free again", asyncio.run(db.has_active_run(REPO)), False)
+
+# ---------- telemetry comes from the transcript, not the live stream
+# The live stream reports a message's usage as it starts (3 output tokens); the transcript
+# has the final count (400). The run's rows must end up with the transcript's.
+def assistant(output_tokens):
+    return json.dumps({"type": "assistant", "message": {
+        "id": "msg-1", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "hi"}],
+        "usage": {"input_tokens": 10, "output_tokens": output_tokens,
+                  "cache_read_input_tokens": 1000}}})
+
+
+async def output_tokens(run_id):
+    async with telemetry_store.connect() as conn:
+        cur = await conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(output_tokens), 0) FROM llm_calls WHERE run_id = ?",
+            (run_id,))
+        return tuple(await cur.fetchone())
+
+
+live = events().replace("\n", "\n" + assistant(3) + "\n", 1)
+boxd, gh = FakeBoxd(stdout=live, transcript=assistant(400) + "\n"), FakeGitHub()
+row = run_one(boxd, gh)
+check("telemetry: the transcript was saved", bool(row["transcript_path"]))
+check("telemetry: its final output tokens replace the live stream's",
+      asyncio.run(output_tokens(row["id"])), (1, 400))
 
 # ---------- no PR
 boxd, gh = FakeBoxd(stdout=events()), FakeGitHub(after=None)

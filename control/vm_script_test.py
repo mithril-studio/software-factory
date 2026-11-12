@@ -40,9 +40,9 @@ REPO = "acme/api"
 
 check("the prelude carries the cd into the checkout", 'cd "$dir"' in PRELUDE)
 check("the prelude carries the clone", "gh repo clone" in PRELUDE)
-check("the prelude carries the fetch", "git fetch --prune origin" in PRELUDE)
+check("the prelude carries the fetch", "git fetch --prune --quiet origin" in PRELUDE)
 check("the script starts with the prelude", VM_SCRIPT.startswith(PRELUDE))
-check("the script fetches once", VM_SCRIPT.count("git fetch --prune origin"), 1)
+check("the script fetches once", VM_SCRIPT.count("git fetch --prune --quiet origin"), 1)
 check("the script asserts the toolchain once", VM_SCRIPT.count(NODE_GUARD), 1)
 check("the toolchain assertion runs after the checkout",
       VM_SCRIPT.find("git checkout -B") < VM_SCRIPT.find(NODE_GUARD))

@@ -2,14 +2,14 @@ import { useMemo, useRef, useState, useEffect } from "react"
 import { Link } from "react-router-dom"
 import { Filter, ChevronDown, Check } from "lucide-react"
 import { usePoll, type Run } from "@/lib/api"
-import { ago, cost, duration, shortId, tokens } from "@/lib/format"
+import { ago, cost, duration, shortId } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { StateBadge } from "@/components/StateBadge"
-import { PageHeader, Empty, ErrorNote } from "@/components/Page"
+import { PageHeader, Empty, ErrorNote, Loading } from "@/components/Page"
 
 function ProjectFilter({
   projects,
@@ -92,39 +92,44 @@ function ProjectFilter({
   )
 }
 
+/** The PR's number, read off its URL, so the column says which PR rather than "open". */
+function prLabel(url: string): string {
+  const n = url.match(/\/pull\/(\d+)/)?.[1]
+  return n ? `#${n}` : "open"
+}
+
 function RunRow({ run }: { run: Run }) {
   return (
     <TableRow>
       <TableCell>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-col items-start gap-1">
           <StateBadge state={run.status} />
           {run.over_budget ? <Badge variant="warn">over budget</Badge> : null}
         </div>
       </TableCell>
       <TableCell>
-        <Link to={`/runs/${run.id}`} className="font-mono text-primary underline-offset-4 hover:underline">
-          {shortId(run.id)}
+        {/* The whole issue cell opens the run: its log, its cost, its machine. */}
+        <Link to={`/runs/${run.id}`} className="group block">
+          <div className="flex flex-wrap items-center gap-x-2">
+            <span className="font-mono">{run.repo}</span>
+            {run.issue_number > 0 && (
+              <span className="font-mono text-muted-foreground">#{run.issue_number}</span>
+            )}
+            {run.kind !== "build" && <Badge variant="outline">{run.kind}</Badge>}
+          </div>
+          <div className="max-w-md truncate text-[12px] text-primary underline-offset-4 group-hover:underline">
+            {run.issue_title || `run ${shortId(run.id)}`}
+          </div>
+          {run.status !== "succeeded" && run.error && (
+            <div className="max-w-md truncate text-[11px] text-bad">{run.error}</div>
+          )}
         </Link>
       </TableCell>
-      <TableCell>
-        <div className="flex flex-wrap items-center gap-x-2">
-          <span className="font-mono">{run.repo}</span>
-          {run.issue_number > 0 && (
-            <span className="font-mono text-muted-foreground">#{run.issue_number}</span>
-          )}
-          {run.kind !== "build" && <Badge variant="outline">{run.kind}</Badge>}
-        </div>
-        <div className="max-w-80 truncate text-[11px] text-muted-foreground">{run.issue_title}</div>
-        {run.status !== "succeeded" && run.error && (
-          <div className="max-w-80 truncate text-[11px] text-bad">{run.error}</div>
-        )}
-      </TableCell>
       <TableCell className="font-mono tabular-nums">{duration(run)}</TableCell>
-      <TableCell className="font-mono tabular-nums">
-        {tokens((run.tokens_in ?? 0) + (run.tokens_out ?? 0) || null)}
-      </TableCell>
       <TableCell className="font-mono tabular-nums">{cost(run.cost_usd)}</TableCell>
-      <TableCell className="font-mono text-muted-foreground">{ago(run.started_at ?? run.created_at)}</TableCell>
+      <TableCell className="whitespace-nowrap font-mono text-muted-foreground">
+        {ago(run.started_at ?? run.created_at)}
+      </TableCell>
       <TableCell>
         {run.pr_url ? (
           <a
@@ -133,7 +138,7 @@ function RunRow({ run }: { run: Run }) {
             rel="noreferrer"
             className="font-mono text-primary underline-offset-4 hover:underline"
           >
-            open
+            {prLabel(run.pr_url)}
           </a>
         ) : (
           <span className="text-muted-foreground">—</span>
@@ -178,6 +183,7 @@ export function Runs() {
         }
       />
       {error && <ErrorNote message={error} />}
+      {!runs && !error && <Loading />}
       {runs && runs.length === 0 && <Empty>No runs yet. Label an issue `agent:queued` to start one.</Empty>}
       {runs && runs.length > 0 && filtered.length === 0 && <Empty>No runs match the selected projects.</Empty>}
       {filtered.length > 0 && (
@@ -186,10 +192,8 @@ export function Runs() {
             <TableHeader>
               <TableRow>
                 <TableHead>Status</TableHead>
-                <TableHead>Run</TableHead>
                 <TableHead>Issue</TableHead>
                 <TableHead>Duration</TableHead>
-                <TableHead>Tokens</TableHead>
                 <TableHead>Cost</TableHead>
                 <TableHead>Started</TableHead>
                 <TableHead>PR</TableHead>

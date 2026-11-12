@@ -20,6 +20,7 @@ from pathlib import Path
 
 from boxd import AsyncBoxd, _mappers as _boxd_mappers
 
+from telemetry import backfill as telemetry_backfill
 from telemetry.recorder import Recorder
 
 from . import agents, db, github, repos
@@ -275,7 +276,7 @@ if [ -d "$dir/.git" ]; then
 else
   echo "FACTORY: cloning $FACTORY_REPO into $dir"
   mkdir -p "$workdir" || { echo "FACTORY: cannot create $workdir" >&2; exit 90; }
-  gh repo clone "$FACTORY_REPO" "$dir" -- --filter=blob:none \
+  gh repo clone "$FACTORY_REPO" "$dir" -- --filter=blob:none --quiet \
     || { echo "FACTORY: clone of $FACTORY_REPO failed" >&2; exit 90; }
 fi
 
@@ -284,7 +285,7 @@ git config --global --add safe.directory "$dir" 2>/dev/null || true
 git config user.name  "software-factory" 2>/dev/null || true
 git config user.email "factory@users.noreply.github.com" 2>/dev/null || true
 echo "FACTORY: fetching origin"
-git fetch --prune origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
+git fetch --prune --quiet origin || { echo "FACTORY: git fetch failed" >&2; exit 91; }
 """
 
 # Install the Node major the repo pins before refusing: the base image serves every repo,
@@ -485,6 +486,10 @@ FORMATTERS = {
 
 RAW_EVENT_MAX = 300
 
+# Known events with nothing for a reader: a heartbeat every 30s while a tool runs, and the
+# account's rate-limit status. Logged raw they were a third of a run's log.
+QUIET_EVENTS = {"tool_progress", "rate_limit_event"}
+
 
 def format_event(event: dict) -> list[str]:
     formatter = FORMATTERS.get(event.get("type"))
@@ -494,6 +499,8 @@ def format_event(event: dict) -> list[str]:
 def stream_lines(event: dict, raw: str) -> list[str]:
     """What one JSON line contributes to the log. An unrecognised event is logged raw rather
     than dropped, so a new runtime never streams a silent log."""
+    if event.get("type") in QUIET_EVENTS:
+        return []
     if event.get("type") in FORMATTERS:
         return format_event(event)
     raw = raw.strip()
@@ -838,8 +845,25 @@ async def _salvage_transcript(
             path.write_text(result.stdout, encoding="utf-8")
             await db.update_run(run_id, transcript_path=str(path))
             log.write(f"[factory] transcript saved ({len(result.stdout)} bytes)")
+            await _rebuild_telemetry(path, manifest, log)
     except Exception as exc:  # noqa: BLE001
         log.write(f"[factory] transcript salvage skipped: {exc!r}")
+
+
+async def _rebuild_telemetry(path: Path, manifest: dict | None, log: RunLog) -> None:
+    """Swap the run's live-stream telemetry rows for ones replayed from its transcript.
+
+    The live stream reports each message's usage as it starts, so its output token counts
+    are a few tokens per call instead of the real total: 690 against 48,872 on one run. The
+    transcript holds the final usage. Only Claude Code transcripts can be replayed.
+    """
+    if ((manifest or {}).get("events") or "claude-code") != "claude-code":
+        return
+    try:
+        found = await telemetry_backfill.replay(path)
+        log.write(f"[factory] telemetry rebuilt from the transcript ({found['turns']} model calls)")
+    except Exception as exc:  # noqa: BLE001 - the live rows stay; a worse number beats none
+        log.write(f"[factory] telemetry rebuild skipped: {exc!r}")
 
 
 async def _salvage_usage(run_id: str, log: RunLog) -> None:
