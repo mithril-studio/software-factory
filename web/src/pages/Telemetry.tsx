@@ -82,8 +82,8 @@ export function Telemetry() {
       {data && !empty && (
         <div className="space-y-6">
           {/* Asymmetric on purpose. Cost per shipped issue is the figure the run table
-              could never produce — an issue costs its build plus every retry, review and
-              fix, and only the ones that opened a PR count as delivered — so it takes
+              could never produce — an issue costs every run it took, and only the ones that
+              opened a PR count as delivered — so it takes
               half the row and the accent shadow, and the other three report to it. */}
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
             <StatTile

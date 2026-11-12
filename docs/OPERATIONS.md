@@ -93,44 +93,39 @@ stops answering.
 
 ## What a run does
 
-The poller only gets this far for an issue whose `## Acceptance criteria` block holds at least
-one `test`, `probe` or `structure` criterion. Anything else is labelled `agent:blocked` with a
-comment naming what is missing, and never gets a VM (`FACTORY_REQUIRE_CRITERIA`).
+1. The poller finds the lowest open issue labelled `agent:queued` on a watched repo with no
+   run in flight. With `FACTORY_SEQUENTIAL=1` it also waits while another factory PR into the
+   target branch is still open.
+2. The run takes `agent:queued` off the issue (the claim — if that fails, the run stops before
+   it spends a VM), labels it `agent:running`, and comments where the PR will go.
+3. It makes sure the target branch exists (`FACTORY_TARGET_BRANCH`, default `test`), creating
+   it from the default branch if not.
+4. It restores a VM from the golden snapshot (~0.2s), clones the repo (or reuses a warm
+   golden's checkout), and checks out `factory/issue-<n>`:
+   - an **open PR** on that branch is continued — the agent reads its comments first;
+   - a branch whose PR was **closed or merged** is deleted and started fresh from the target;
+   - a branch with **no PR at all** (an earlier run that died) is continued.
+5. It runs the agent — `factory-agent`, the launch line the golden carries — with the issue as
+   the prompt, streaming the log live and feeding telemetry.
+6. It finds the open PR, salvages the transcript, and destroys the VM, on every path.
+7. It labels the issue `agent:done` or `agent:failed` and comments with the PR, the cost, and
+   whether the run passed the soft budget.
 
-1. Fetch the issue from GitHub
-2. Restore a VM from the golden snapshot (~0.2s), with idle-suspend disabled and a
-   self-destruct timer set
-3. Clone the assigned repo (or reuse the warm golden's checkout), then check out
-   `factory/issue-<n>` from the default branch — a retry or fix cycle **resumes** that
-   branch rather than resetting it
-4. Run the agent — `factory-agent`, the launch line the golden carries
-   (`../control/README.md` §2.3; `claude -p` is the legacy fallback) — with the issue as the
-   prompt, streaming its event log back live
-5. Find the PR the agent opened; salvage the session transcript; harvest memory candidates
-6. Destroy the VM
-7. Dispatch a **review run** on a fresh VM and record its verdict, record what **CI** decided, and — with auto-merge on — squash-merge
-   pinned to the tested sha, repairing a conflict once by merging base into the branch. A
-   rejecting review or red CI starts a fix cycle back at step 2.
+Nothing merges. You review the PR into `test`, merge it, and the next queued issue starts.
 
-Every step is a status transition on a row in `runs`, which is what makes the reconciler
-possible: fleet state lives in a table, not in an agent's context window. The state machine
-— run kinds, budgets, criteria — is [architecture.md](architecture.md) §4.
+## Labels, retries, restarts
 
-## Retry, halt, and labels
+Four labels: `agent:queued`, `agent:running`, `agent:done`, `agent:failed`. Adding
+`agent:queued` is how work enters; the factory writes the rest. Nothing halts a repo: a
+failed issue is labelled and the queue moves on.
 
-The issue mirrors the factory's state as five labels — `agent:queued`, `agent:running`,
-`agent:blocked`, `agent:done`, `agent:failed`. Dropping `agent:queued` on an open issue is
-how work enters; everything else the factory writes.
-
-Two budgets: a crashed build retries on a fresh VM up to `FACTORY_MAX_ATTEMPTS` times, and a
-rejecting review or red CI re-dispatches up to `FACTORY_MAX_REVIEW_CYCLES` fix cycles.
-When either runs out the issue is labelled `agent:failed`, and an open `agent:failed` or
-`agent:blocked` issue **halts that repo's queue** (`FACTORY_HALT_ON_FAILURE`) so the factory
-never builds on top of a failure. Unblock by fixing the issue and relabelling it
-`agent:queued`, or closing it.
-
-For a post-mortem, `FACTORY_KEEP_FAILED=1` keeps a failed run's VM around to SSH into
-instead of reaping it.
+- **Retry or iterate:** re-add `agent:queued`. The next run continues the branch, and if its
+  PR is open, it addresses the PR's comments. That is also how you give feedback.
+- **Restart:** a run interrupted by a deploy or crash is closed on boot and its issue goes back
+  to `agent:queued` automatically, continuing from whatever was pushed.
+- **Budget:** a run past `FACTORY_RUN_BUDGET_EUR` (default €100) is flagged in the UI and the
+  issue comment. It is not stopped.
+- **Post-mortem:** `FACTORY_KEEP_FAILED=1` keeps a failed run's VM around to SSH into.
 
 ## The golden VM
 
@@ -145,7 +140,7 @@ The name is the whole registry. There is no list of goldens anywhere else:
 |---|---|
 | `golden-copy` | The **base image**. Tooling, skills, an agent login, warm toolchain caches — and no repo. Serves every repo. |
 | `golden-<owner-repo>` | The **warm tier**: the same image with one repo already cloned at `$HOME/work/<name>` and installed. |
-| `golden-tester` | The **acceptance image**: `golden-copy` plus Playwright and Chromium in `~/tester`. Booted only by browser-acceptance runs, by name; never resolved for a build or review. Built with `scripts/build-golden.sh --name golden-tester --playwright --no-login`, which refuses `--playwright` for any other name. |
+| `golden-tester` | `golden-copy` plus Playwright and Chromium, for a browser harness. Never resolved for a run in v1. |
 
 A run resolves in that order, most specific first (`agents.resolve_snapshot`):
 
@@ -170,8 +165,7 @@ on the backlog, deliberately, since nothing needs it yet.
 **The warm tier is only a speed-up.** Every run installs the repo for itself either way — the
 prompt says so, and says nothing about dependencies being present. So a repo with no warm
 snapshot is not broken, and a warm snapshot that has gone stale costs minutes, not
-correctness. That is what lets a repo be connected and dispatched in the same minute, with
-provisioning catching up afterwards.
+correctness. That is what lets a repo be connected and dispatched in the same minute.
 
 ### Building the base: `scripts/build-golden.sh`
 
@@ -196,39 +190,6 @@ for a deployment that sets `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` inst
 An agent the script has never seen needs `--cli-install`, `--launch` and `--manifest`, and
 `--name` to keep it off `golden-copy`. It refuses rather than guessing: a wrong launch line
 produces a golden that looks built and dies at the first dispatch.
-
-### Warming one from the control plane: `POST /api/repos/<owner>/<name>/golden`
-
-Connecting a repo starts this automatically. It is a run like any other — `kind: provision`, a
-streamed log you can tail, a cancel button, a VM the reconciler recognises — and it restores
-`golden-copy`, clones, installs, captures `golden-<slug>`, **waits for the capture to be
-written**, and only then destroys the machine.
-
-That wait is load-bearing, and it cost a golden to learn. The SDK's `snapshots.create` returns
-once boxd has *queued* the capture; destroying the machine at that point aborts it, and the
-name is left in the fleet at `pending` with no version behind it — which `agents.available()`
-correctly refuses to dispatch onto and which nothing can repair. The symptom is a repo the
-Projects page calls warm whose every run still boots the base. `scripts/build-golden.sh` never
-hit it because the `boxd snapshots save` CLI blocks until the capture lands. A capture that
-never lands (`FACTORY_CAPTURE_TIMEOUT`, 20 minutes) is deleted rather than left looking like
-progress.
-
-It never blocks the repo it was started for: warm-ups have their own concurrency budget
-(`FACTORY_MAX_PROVISION`), and the poller does not count one as work in flight.
-
-Always from the base, even when the repo already has a golden. Updating one in place is
-faster and is what the shell script below does, but it also carries forward whatever the last
-capture got wrong: building from `golden-copy` every time makes re-provisioning the *repair*
-for a bad snapshot rather than another way to inherit it. `DELETE` the same path to drop a
-repo's golden and send its runs back to the base.
-
-The install command is the one the repo names in its own `## Setup` section, never a guess. A
-repo that names none still gets a golden — the clone, captured without an install, because the
-clone is the half that can be done without inventing anything and it is worth minutes on its
-own. What the control plane will not do is infer an install command from a lock file: that is
-how one project's command becomes every project's. `control/preflight.py`'s reader and
-`refresh-golden.sh`'s `awk`/`sed` pipeline are pinned against each other in
-`control/golden_scripts_test.py`, so the two cannot install the same repo differently.
 
 ### Refreshing a warm one by hand: `scripts/refresh-golden.sh <owner/repo>`
 
@@ -260,27 +221,10 @@ Never `boxd machine share` a golden: sharing deletes the in-VM agent credentials
 
 ### Knowing which goldens work
 
-There used to be an hourly sweep that `exec`d into every golden and asked how far behind its
-checkout was and whether a dependency manifest had moved. A golden is a snapshot now: there is
-no machine to ask, and a stale warm tier is re-provisioned rather than diagnosed — so all of
-that stopped being worth asking at once, and the thing that actually kills a golden was never
-on the list. What kills one is credential expiry, and the only real test of a credential is
-using it.
-
-So the control plane grades by evidence instead. Every `FACTORY_AGENT_REFRESH` seconds (300
-by default) it re-lists the golden snapshots — one API call, no VM — and records a row per
-name in the `snapshots` table: which repo it was warmed for, its snapshot version, what its
-last run did on it, and what that run's manifest announced (including which agent it runs).
-`POST /api/goldens/refresh` runs one on demand.
-
-The column that matters is `verified_at`: **when a run last finished on that snapshot having
-produced usage.** A golden that emitted tokens authenticated, so its `claude` login and its
-`gh` token both still worked as of that moment. It costs nothing to know, because the runs
-were happening anyway. A golden with no `verified_at` is unproven, not broken — nothing has
-used it yet.
-
-Repairing one is still manual and still project-specific: re-authenticate on a fork and
-re-snapshot it under the same name.
+What kills a golden is credential expiry, and the only real test of a credential is using it.
+A run that produced usage authenticated, so the Runs page is the evidence: a golden whose runs
+fail at once with an auth error needs re-authenticating on a fork and re-snapshotting under the
+same name. The Goldens page lists what the fleet holds and whether each one has a ready version.
 
 ## Adding a repo
 
@@ -293,37 +237,24 @@ re-snapshot it under the same name.
    /api/github/repos`), and it is still free text: a repo created a minute ago, or any repo at
    all when GitHub is unreachable, is connected by typing its slug. Check shows what preflight
    says, Connect commits it; a blocking check refuses the connection and says which one. On
-   success the repo is in the register, its lifecycle labels exist, **a golden starts warming**,
-   and the poller picks it up on its next tick — **no restart and no `.env` edit.**
-   Disconnecting keeps the repo's runs, because they are the ledger of what was spent and
-   shipped rather than configuration.
-
-   The warm-up does not hold the repo up. It runs under its own concurrency budget
-   (`FACTORY_MAX_PROVISION`), the poller does not count it as work in flight, and the repo
-   dispatches onto `golden-copy` from the moment it is registered. A repo that names no `##
-   Setup` command still gets a golden — the clone, without the install, which is the half that
-   can be done without guessing how the project installs. Adding a `## Setup` section and
-   rebuilding bakes the install in too.
+   success the repo is in the register, its lifecycle labels exist, and the poller picks it up
+   on its next tick — **no restart and no `.env` edit.** Disconnecting keeps the repo's runs.
 
    `FACTORY_REPOS` is the *seed* for that register: entries are added on boot if they are
    not already there, and removing one does not unwatch the repo.
-3. Optionally point it at an **integration branch** — **Projects → Base branch**, or
-   `PATCH /api/repos/{owner}/{name} {"base_branch": "develop"}`. Runs then branch from it,
-   open their pull requests against it and merge into it, the planner reads its goal file
-   from it, and its golden is warmed on it. Empty reverts to the GitHub default. The branch
-   must already exist (it is checked before it is stored), and CI has to run on pushes and
-   pull requests to it. Because GitHub only honours `Closes #n` on the default branch, the
-   factory closes an issue itself after merging it into an integration branch.
-4. Give the repo a `.factory.md` (below) and CI that reports at least one check run —
-   without checks, auto-merge can never pass its gate and every pull request waits for a
-   human.
+3. Optionally point its pull requests somewhere other than `FACTORY_TARGET_BRANCH` —
+   **Projects → PRs go into**, or `PATCH /api/repos/{owner}/{name} {"base_branch": "develop"}`.
+   The first run creates the branch from the default branch if it does not exist. Because
+   GitHub only honours `Closes #n` on the default branch, issues stay open (labelled
+   `agent:done`) until the work reaches it.
+4. Give the repo a `.factory.md` (below).
 5. Ask, before trusting any of it:
 
    ```bash
    .venv/bin/python -m control.preflight mithril-studio/legal-ai-app
    ```
 
-   It reports on the repo — readable, pushable, has CI, has a `.factory.md`, has a `##
+   It reports on the repo — readable, pushable, target branch, has a `.factory.md`, has a `##
    Setup` section, labels — and on one thing outside it: whether a golden snapshot exists
    for this repo to resolve onto. Exit status 0 means ready. Same answers over HTTP at
    `/api/preflight?repo=owner/repo`, which is what the Check button calls.
@@ -335,7 +266,7 @@ re-snapshot it under the same name.
 ## What a watched repo tells the factory: `.factory.md`
 
 A repo can describe itself to the agent in a `.factory.md` at its root. The control plane
-reads it from the base branch at dispatch and splices it into the build and review prompts,
+reads it from the target branch at dispatch and splices it into the prompt,
 so it is the one place that says how *this* project is set up and how it is verified:
 
 ```markdown
@@ -359,9 +290,8 @@ before it touches any code — the difference between one install and a run that
 discovering it needs one, guessing a command, and re-reading its whole context between each
 guess.
 
-It is also what warming this repo's own golden runs, so a repo that names one gets that install
-done once into a snapshot instead of once per run. A repo that names none still gets a golden,
-with the clone in it and no install — never one provisioned with a guess.
+It is also what `scripts/refresh-golden.sh` runs when it bakes this repo's warm golden, so a
+repo that names one can get that install done once into a snapshot instead of once per run.
 
 Name the command, and say roughly how long it takes so the agent picks a sane timeout. Put it
 above the verify commands: it runs first, and a file is read in the order it is written.
@@ -382,122 +312,53 @@ Keep harness invariants out of it. Anything that would hang or corrupt *any* run
 background long commands, commit and push as you go) belongs in the prompt, not here; see
 `../discussion.md` §"Where rules live".
 
-### `## Deploy`
-
-How a promoted release reaches the repo's stable test server. Read by the control plane, not
-by agents, at the release's own commit — so a release deploys the way that version says it
-deploys. One `key: value` line per step, values optionally in backticks:
-
-```markdown
-## Deploy
-
-- machine: test-acme-api
-- path: /home/boxd/app
-- install: `npm ci`
-- build: `npm run build`
-- migrate: `npm run db:migrate`
-- service: test-acme-api
-- health: http://localhost:3000/healthz
-- url: https://test-acme-api.boxd.sh
-```
-
-Every key but `migrate` is required. `machine` must not carry a run prefix (`run-`, `rev-`, …)
-— the reconciler destroys those between runs — so it is `test-<owner-repo>`, which is what
-`scripts/provision-test-server.sh` builds and what it prints this section for.
-
-Each command runs in its own subshell from the checkout root, so `cd web && npm ci` is fine and
-does not move the next step. One deploy runs at a time per machine (`flock`); a second one
-refuses rather than interleaving. A deploy (`control/deploy.py`, a run of `kind='deploy'`)
-refuses a dirty checkout or the wrong branch, fast-forwards to the release sha, then runs install, build, migrate, restarts the
-service and waits `FACTORY_DEPLOY_HEALTH_WAIT` seconds for `health`. If anything after the
-fast-forward fails it resets the checkout to where it started, rebuilds, restarts and checks
-health again. **A migration is not rolled back** — only the checkout is. The factory never
-creates, starts or destroys the machine: a missing or stopped test server fails the deploy
-for a human. If a deploy ever leaves the box beyond what its rollback fixes,
-`boxd machine checkpoint restore test-<owner-repo> initial` is the reset.
-
 ## Configuration
 
-The ~12 variables an operator actually decides about. Every variable, with its default and
-the reasoning behind it, is annotated in `../.env.example`; defaults live in
-`control/config.py`.
+The variables an operator actually decides about. Every variable is annotated in
+`../.env.example`; defaults live in `control/config.py`.
 
 | Variable | |
 |---|---|
 | `BOXD_API_KEY` | **Required.** Run VMs come from boxd. |
-| `FACTORY_AUTH_EMAIL` / `FACTORY_AUTH_PASSWORD` | **Required.** UI login. No defaults: unset means nobody can log in. |
+| `FACTORY_AUTH_EMAIL` / `FACTORY_AUTH_PASSWORD` | **Required.** UI login. Unset means nobody can log in. |
 | `GITHUB_TOKEN` | Required on a server (`repo` + `workflow` scopes); falls back to `gh auth token` locally. |
 | `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | Durable agent auth; set one for unattended operation. |
-| `FACTORY_AUTO_MERGE` | Squash-merge a passing PR. Off by default. |
-| `FACTORY_REVIEW` | Dispatch a review run per PR. **On by default.** |
-| `FACTORY_REQUIRE_CRITERIA` | Refuse to dispatch an issue with no `test`/`probe`/`structure` acceptance criterion; it is labelled `agent:blocked` instead. **On by default.** |
-| `FACTORY_MAX_REVIEW_CYCLES` | Fix cycles per issue (2). |
-| `FACTORY_MAX_ATTEMPTS` | Crash retries per issue (3). |
-| `FACTORY_HALT_ON_FAILURE` | Halt a repo's queue on an open `agent:failed`/`agent:blocked` issue. On by default. |
-| `FACTORY_PLAN` | The goal loop: plan new issues toward a repo's committed `.factory/goal.md` when its queue runs dry, one feature per pass. **Off by default** — it files issues, which is autonomous spend. Cadence and caps: `FACTORY_PLAN_COOLDOWN` (900s), `FACTORY_PLAN_MAX_STALLS` (2), `FACTORY_PLAN_MAX_ISSUES` (6). |
-| `FACTORY_RELEASE` | Promote each repo's green integration head onto `FACTORY_RELEASE_BRANCH` (`test`) at `FACTORY_RELEASE_TIMES` (`09:00,11:30,14:00,16:00`, `FACTORY_RELEASE_TZ` `Europe/Amsterdam`), then freeze until reviewed or `FACTORY_RELEASE_REVIEW_TIMEOUT` (86400s). **Off by default.** |
-| `FACTORY_DEPLOY` | Deploy each promoted release to its repo's test server per its `## Deploy` section. `FACTORY_DEPLOY_TIMEOUT` (1800s), `FACTORY_DEPLOY_HEALTH_WAIT` (90s). **Off by default.** |
-| `FACTORY_ACCEPT` | After a deploy, check the release in a browser on its test server (`golden-tester`); a seen failure files one `agent:queued` repair issue, and after `FACTORY_ACCEPT_MAX_REPAIRS` (1) in a row a further one stops for a human. **Off by default.** |
-| `FACTORY_SKILL_LOOP` | Require the skill loop (`FACTORY_SKILL_LOOP_REQUIRED`, default `slob-detection,simplification,design-check`) before review: a build missing a `FACTORY_SKILL` receipt is sent back as a fix cycle. Receipts are recorded either way. **Off by default** — the skills must exist in agent-skills first. |
-| `FACTORY_MAX_CONCURRENT` | Concurrent runs (3). Provisioning has its own budget, `FACTORY_MAX_PROVISION` (2). |
+| `FACTORY_TARGET_BRANCH` | Where pull requests go (`test`). Created on first use. |
+| `FACTORY_SEQUENTIAL` | Wait for the factory's open PR into the target to be merged or closed before the next issue (on). |
+| `FACTORY_RUN_BUDGET_EUR` | Soft per-run budget (€100): flagged, not stopped. `FACTORY_USD_PER_EUR` converts. |
+| `FACTORY_VM_PREFIX` | Prefix of every VM this control plane creates and the only ones it reaps (`job-`). |
+| `FACTORY_MAX_CONCURRENT` | Concurrent runs across all repos (3). Always one per repo. |
+| `FACTORY_RUN_TIMEOUT` | Hard ceiling per run (5400s). |
 | `FACTORY_KEEP_FAILED` | Keep a failed run's VM for a post-mortem. |
-| `FACTORY_LEARN` | The improvement loop. **Off by default** — it edits its own inputs. |
-| `FACTORY_LEARN_EVERY` | Issues a repo must finish before its next learning run (5). |
-| `FACTORY_LEARN_AUTOQUEUE` | Label what the loop files `agent:queued`, so the factory builds it. Off by default. |
 | `FACTORY_LOG_LEVEL` | Control-plane log verbosity. |
 
 ## API surface
 
-All under `/api`, all behind the session auth gate except `/api/login` and `/healthz`. The
-exhaustive list is `control/app.py`.
+All under `/api`, all behind the session auth gate except `/api/login` and `/healthz`.
+State-changing requests from another site (another `*.boxd.sh` machine included) are refused.
+The exhaustive list is `control/app.py`.
 
 - **Auth** — `POST /api/login`, `POST /api/logout`, `GET /api/me`
-- **Runs** — `POST /api/runs` starts one by repo + issue number; the body also takes `kind`,
-  `pr_url`, `branch`, `attempt`, which is the documented way to hand-start a review or retry
-  a blocked issue. `GET /api/runs`, `GET /api/runs/{id}`, `POST .../cancel`,
-  `GET .../stream` (SSE), `GET .../telemetry`.
-- **Work** — `GET /api/attempts` (build → CI → review grouped per attempt),
-  `GET /api/issues`, `GET /api/config`, `GET /api/telemetry`
-- **The improvement loop** — `GET /api/digest?repo=&days=` is what went wrong lately, the
-  same evidence a learning run is handed. `GET /api/improvements` and
-  `GET /api/improvements/{id}` are the ledger of what the loop changed and why — read-only,
-  because a status is moved by the factory as work actually happens to it.
-- **Repos & goldens** — `POST`/`DELETE /api/repos`, `PATCH /api/repos/{owner}/{name}`
-  (`base_branch`), `GET /api/github/repos`,
-  `GET /api/preflight?repo=`, `POST`/`DELETE /api/repos/{owner}/{name}/golden`,
-  `POST /api/goldens/refresh`, `GET /api/goldens`, `GET /api/machines`,
-  `POST /api/reconcile`
-- **Releases** — `GET /api/releases?repo=`, `GET /api/releases/{id}` (with its items),
-  `POST /api/releases/assemble {"repo"}` (now, out of schedule; 409 while frozen),
-  `POST /api/releases/{id}/deploy` (deploy a promoted release now; the retry after a
-  refusal), `POST /api/releases/{id}/accept` (check a deployed release in a browser now),
-  `POST /api/releases/{id}/reviewed` (lifts the freeze).
-  `GET /api/releases/{id}/packet` is the review packet — each item with the criteria it was
-  reviewed against and the evidence, the deploy, the browser acceptance, and the feedback.
-  `POST .../feedback {"text"}` stores a note and files nothing;
-  `POST .../feedback/{fid}/file` opens it as an issue, exactly once (409 after) —
-  `agent:queued` when it carries a blocking criterion, a plain issue otherwise, since a queued
-  issue the poller blocks would halt the repo.
-  Both answer `gate_reason` — why the poller would refuse that note as an issue, or null.
-- **Goals** — the goal itself is not an API: it is `.factory/goal.md`, committed in the
-  repo, noticed by SHA within ~5 minutes. `POST .../replan` re-arms a `met` or `stalled`
-  goal without editing the file. `POST /api/runs` with `kind: "plan"` plans now, ignoring
-  the cooldown.
-- **Memory** — `GET /api/memory/candidates`, `POST /api/memory/candidates/{id}/accept`
-  or `.../reject` — the triage queue for learnings the agent proposed. No UI consumer yet;
-  it is curl territory.
+- **Runs** — `POST /api/runs {"repo", "issue_number"}` starts one (409 if the repo is busy).
+  `GET /api/runs`, `GET /api/runs/{id}`, `POST .../cancel`, `GET .../stream` (SSE, resumes on
+  reconnect), `GET .../telemetry`.
+- **Queue** — `GET /api/plan?repo=` (open issues with their factory state), `GET /api/issues`,
+  `GET /api/config`
+- **Telemetry** — `GET /api/telemetry`, `GET /api/digest?repo=&days=`
+- **Repos** — `POST`/`DELETE /api/repos`, `PATCH /api/repos/{owner}/{name}` (`base_branch`:
+  where its PRs go), `GET /api/projects`, `GET /api/github/repos`, `GET /api/preflight?repo=`
+- **Fleet** — `GET /api/goldens`, `GET /api/machines`, `POST /api/reconcile`
 - **Health** — `GET /healthz`, unauthenticated, for the external monitor
 
 ## Scripts
 
 | Script | |
 |---|---|
-| `verify.sh` | Every CI gate, in CI's order — ruff, all tests, the memory validator. The local pre-push command; CI runs this exact file. |
+| `verify.sh` | Every Python CI gate, in CI's order — ruff, all tests, the memory validator. CI runs this exact file, plus a separate `web` build job. |
 | `deploy.sh` | Checkpoint the boxd machine, fast-forward, rebuild what moved, restart. `--ref` deploys a branch or tag. |
 | `build-golden.sh` | Build the `golden-copy` base image (above). |
 | `refresh-golden.sh` | Refresh a repo's warm golden in place (above). |
 | `factory-health.sh` | External monitor; runs from a GitHub Actions cron every 10 minutes and manages an alert issue. |
-| `provision-test-server.sh` | Build a repo's persistent `test-<owner-repo>` machine: clone of the release branch over a read-only deploy key, systemd unit, the app's `.env` placed by hand, checkpoint `initial`. Prints the `## Deploy` section. |
 | `provision-boxd.sh` | Build the control-plane machine from nothing: deploy key, checkout, build, `.env`, a minted boxd key, systemd, the proxy, backups. |
 | `factory-secrets.sh` | Hand the control plane its GitHub and agent credentials, hidden, straight into its `.env`. |
 | `planner-setup.sh` | Provision the `planner` box that runs `factory-compose`. |
@@ -531,27 +392,20 @@ change them there, not in a component.
 - **Optical padding.** `p-optical` / `p-optical-lg` carry more top and left than bottom and
   right, because equal padding reads bottom-heavy once type sits in it.
 
-- **Runs** — every run: state, id, agent, project, duration, token spend, cost, PR link.
-  Start a run by repo + issue number.
-- **Run detail** — live agent output over SSE, tool calls and errors highlighted. The single
-  biggest visibility win: a run silent for six minutes is otherwise indistinguishable from
-  one that has hung.
-- **Plan** — open issues across watched repos with their factory state, in the order the
-  poller works them.
-- **Projects** — watched repos with run tallies and the golden each one boots, and where a
-  repo is connected: name it, read what preflight says, connect. Per row: warm or rebuild its
-  golden, drop it, or disconnect the repo.
-- **Goldens** — two tables, because they stopped being one question when goldens became
-  snapshots. What the factory *can boot*: every golden snapshot (`/api/goldens`), its version,
-  its telemetry adapter, and whether a run has ever proved its credentials. What *is* running:
-  the boxd machines (`/api/machines`), by role, orphans flagged, with a reconcile button.
-- **Telemetry** — where the money and the time go: cost by token class (cache reads are most
-  of the bill), spend by day, tools by wall time, cost per shipped issue against spend on
-  runs that shipped nothing, and whether runs are reading memory.
+- **Runs** — every run: state, issue, duration, tokens, cost, over-budget flag, PR link.
+- **Run detail** — live agent output over SSE, the run's telemetry (model calls, cache, derived
+  cost, unpriced calls), and a cancel button.
+- **Queue** — open issues across watched repos with their factory state, lowest number first.
+- **Projects** — watched repos with run tallies, the golden each one boots, and where its PRs
+  go. Connect a repo by naming it and reading what preflight says.
+- **Goldens** — the golden snapshots the fleet holds, and the boxd machines running now, with
+  orphans flagged and a reconcile button.
+- **Telemetry** — cost by token class, spend by day, tools by wall time, cost per shipped issue.
+- **Digest** — what shipped, how runs failed, and what it cost over a window.
 
 ## Docs
 
-- [architecture.md](architecture.md) — layers, topology, the pipeline, and the contracts
+- [architecture.md](architecture.md) — what v1 is, the contracts, and what comes next
 - [../control/README.md](../control/README.md) — control plane design notes
 - [../telemetry/README.md](../telemetry/README.md) — trace layer design notes
 - [agent-skills](https://github.com/mithril-studio/agent-skills) — the skills the in-VM agent loads

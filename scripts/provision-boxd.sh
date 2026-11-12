@@ -178,7 +178,7 @@ User=$(id -un)
 WorkingDirectory=$HOME/software-factory
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=BOXD_VM_NAME=$VM
-ExecStart=$HOME/software-factory/.venv/bin/uvicorn control.app:app --host 0.0.0.0 --port 8765
+ExecStart=$HOME/software-factory/.venv/bin/uvicorn control.app:app --host 0.0.0.0 --port 8765 --timeout-graceful-shutdown 10
 Restart=always
 RestartSec=5
 StandardOutput=append:$HOME/software-factory/var/uvicorn.log

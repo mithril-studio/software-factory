@@ -1,7 +1,7 @@
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import { ArrowLeft } from "lucide-react"
-import { post, usePoll, useRunLog, TERMINAL, runOutcome, type Run, type RunTelemetry } from "@/lib/api"
+import { cancelRun, usePoll, useRunLog, TERMINAL, type Run, type RunTelemetry } from "@/lib/api"
 import { cost, duration, shortId, tokens } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -33,10 +33,9 @@ function lineClass(line: string): string {
 export function RunDetail() {
   const { runId = "" } = useParams()
   const { data: run, error, refresh } = usePoll<Run>(`/api/runs/${runId}`, 3000)
-  // Whether this run was a thing that ran on a machine. `ci` is the only kind that is not:
-  // it records what GitHub's checks decided about a commit, which the factory observed
-  // rather than executed.
+  // A `ci` row (written before v1) recorded what GitHub's checks decided; nothing ran.
   const dispatched = run?.kind !== "ci"
+  const [cancelError, setCancelError] = useState<string | null>(null)
   const { data: trace } = usePoll<RunTelemetry>(`/api/runs/${runId}/telemetry`, 10000)
   const { lines, done } = useRunLog(runId)
   const logRef = useRef<HTMLDivElement>(null)
@@ -70,7 +69,12 @@ export function RunDetail() {
               <Button
                 variant="outline"
                 onClick={async () => {
-                  await post(`/api/runs/${runId}/cancel`)
+                  setCancelError(null)
+                  try {
+                    await cancelRun(runId)
+                  } catch (e) {
+                    setCancelError(e instanceof Error ? e.message : String(e))
+                  }
                   refresh()
                 }}
               >
@@ -82,21 +86,21 @@ export function RunDetail() {
       />
 
       {error && <ErrorNote message={error} />}
+      {cancelError && <ErrorNote message={`Could not cancel: ${cancelError}`} />}
 
       {run && (
         <Card className="mb-6 p-optical-lg">
           <div className="grid grid-cols-2 gap-x-6 gap-y-6 sm:grid-cols-4">
             <Field label="Status">
-              <StateBadge state={runOutcome(run)} />
+              <StateBadge state={run.status} />
             </Field>
             {/* No issue behind a provisioning run — it warms the repo's golden. */}
             <Field label={run.issue_number > 0 ? "Issue" : "Repo"}>
               {run.repo}
               {run.issue_number > 0 && `#${run.issue_number}`}
             </Field>
-            <Field label="Kind">{run.kind}</Field>
             <Field label="Branch">{run.branch || "—"}</Field>
-            <Field label="Cycle">{run.cycle ?? 1}</Field>
+            <Field label="Golden">{run.golden || "—"}</Field>
             <Field label="Duration">{duration(run)}</Field>
             {/* A CI phase is not a dispatch: no machine, no agent, no tokens, no exit code.
                 Rendering those as em dashes would say the run had them and reported nothing,
@@ -104,9 +108,11 @@ export function RunDetail() {
             {!dispatched || (
               <>
                 <Field label="Machine">{run.vm_name || "—"}</Field>
-                <Field label="Attempt">{run.attempt ?? 1}</Field>
                 <Field label="Tokens">{tokens(totalTokens)}</Field>
-                <Field label="Cost">{cost(run.cost_usd)}</Field>
+                <Field label="Cost">
+                  {cost(run.cost_usd)}
+                  {run.over_budget ? <span className="text-warn"> · over budget</span> : null}
+                </Field>
                 <Field label="Exit">{run.exit_code ?? "—"}</Field>
                 <Field label="Agent">{run.agent ?? "—"}</Field>
               </>
@@ -126,7 +132,7 @@ export function RunDetail() {
               )}
             </Field>
           </div>
-          {run.error && (
+          {run.status !== "succeeded" && run.error && (
             <div className="mt-6 border border-border bg-bad/15 px-4 py-3 font-mono text-xs text-bad">
               {run.error}
             </div>
@@ -146,7 +152,12 @@ export function RunDetail() {
             <Field label="Cache read">{tokens(trace.totals.cache_read_tokens ?? null)}</Field>
             <Field label="Cache write">{tokens(trace.totals.cache_write_tokens ?? null)}</Field>
             <Field label="Output tokens">{tokens(trace.totals.output_tokens ?? null)}</Field>
-            <Field label="Derived cost">{cost(trace.totals.derived_cost_usd ?? null)}</Field>
+            <Field label="Derived cost">
+              {cost(trace.totals.derived_cost_usd ?? null)}
+              {(trace.totals.unpriced_calls ?? 0) > 0 && (
+                <span className="text-warn"> · {trace.totals.unpriced_calls} unpriced</span>
+              )}
+            </Field>
             <Field label="Models">{trace.by_model.map((m) => m.model).join(", ") || "—"}</Field>
             <Field label="Tool calls">
               {trace.tools.reduce((s, t) => s + t.calls, 0)}

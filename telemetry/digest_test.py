@@ -61,28 +61,11 @@ async def seed_runs(rows):
             " kind TEXT, verdict TEXT, error TEXT, pr_url TEXT, attempt INTEGER,"
             " cycle INTEGER, base_sha TEXT, created_at TEXT)"
         )
-        await conn.execute(
-            "CREATE TABLE IF NOT EXISTS memory_candidates ("
-            " id TEXT PRIMARY KEY, run_id TEXT, repo TEXT, domain TEXT, type TEXT,"
-            " title TEXT, body TEXT, evidence TEXT, confidence TEXT, status TEXT,"
-            " created_at TEXT, updated_at TEXT)"
-        )
         await conn.executemany(
             "INSERT OR REPLACE INTO runs (id, repo, issue_number, status, kind, error,"
             " pr_url, attempt, cycle, base_sha, created_at)"
             " VALUES (:id, :repo, :issue, :status, :kind, :error, :pr, :attempt, :cycle,"
             " :base_sha, :created_at)",
-            rows,
-        )
-        await conn.commit()
-
-
-async def seed_candidates(rows):
-    async with aiosqlite.connect(config.db_path) as conn:
-        await conn.executemany(
-            "INSERT OR REPLACE INTO memory_candidates"
-            " (id, run_id, repo, domain, type, title, status, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         await conn.commit()
@@ -136,21 +119,6 @@ run(store.write([
     # itself uses is not evidence that the repo's builds need it.
     normalize.ToolCall(id="t4", run_id="l1", turn=1, ts=ago(1), tool=normalize.SKILL_TOOL,
                        ok=True, duration_ms=5, error=None, detail="digest-reading"),
-]))
-
-run(seed_candidates([
-    # Two runs noticed the same thing independently. That repetition is the signal.
-    ("c1", "b1", "acme/web", "repository", "failure", "verify.sh is the only gate list",
-     "pending", ago(9), ago(9)),
-    ("c2", "b2", "acme/web", "repository", "failure", "verify.sh is the only gate list",
-     "pending", ago(3), ago(3)),
-    ("c3", "b3", "acme/web", "repository", "convention", "tests are plain __main__ modules",
-     "pending", ago(2), ago(2)),
-    # Already decided, so no longer waiting on anything.
-    ("c4", "b1", "acme/web", "repository", "pattern", "already triaged", "accepted",
-     ago(4), ago(4)),
-    ("c5", "o1", "acme/api", "repository", "failure", "another repo's candidate", "pending",
-     ago(1), ago(1)),
 ]))
 
 run(store.write_memory_receipt("b1", 40, ["repository"], ago(1)))
@@ -254,33 +222,6 @@ check("records opened are attributed to the runs that opened them",
 check("tool failures are grouped by tool",
       [(t["tool"], t["failures"], t["runs"]) for t in d["tool_errors"]], [("Bash", 2, 2)])
 
-
-# ---------- AC6: the candidate queue, which is evidence somebody already wrote down
-
-cands = {c["title"]: c for c in d["candidates"]}
-# The repetition is the point: two runs filing the same learning independently is the repo
-# stating something about itself more plainly than any single failure does.
-check("a candidate filed twice is reported with its count",
-      cands["verify.sh is the only gate list"]["filed"], 2)
-check("a candidate filed once is still reported",
-      cands["tests are plain __main__ modules"]["filed"], 1)
-check("repeated candidates sort first", d["candidates"][0]["filed"], 2)
-check("already-triaged candidates are not still waiting", "already triaged" in cands, False)
-
-# An unscoped digest is fleet-wide and reports every repo's queue; a scoped one must not.
-check("an unscoped digest reports both repos' candidates",
-      {c["repo"] for c in d["candidates"]}, {"acme/web", "acme/api"})
-check("a scoped digest reports only its own",
-      {c["repo"] for c in one["candidates"]}, {"acme/api"})
-
-# Deliberately not windowed. A candidate has no outcome and does not go stale the way a run
-# does — one filed months ago and never decided is more worth surfacing, not less. `c1` was
-# filed nine days ago and must survive a one-day window.
-narrow = run(digest.build(repo="acme/web", days=1))
-check("a candidate older than the window is still surfaced",
-      cands["verify.sh is the only gate list"]["last_filed"] < narrow["window"]["since"], True)
-check("and still carries its full count, not the part inside the window",
-      {c["title"]: c["filed"] for c in narrow["candidates"]}["verify.sh is the only gate list"], 2)
 
 # Attribution: the column that makes "did that change help?" answerable at all.
 check("the window reports how many context versions it spans", web["context_versions"], 1)

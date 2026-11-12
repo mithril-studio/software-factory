@@ -54,8 +54,7 @@ async def replay(path: Path) -> dict:
             skipped += 1
     rows.extend(adapter.flush())
 
-    await store.clear_run(run_id)
-    await store.write(rows)
+    await store.replace_calls(run_id, rows)
     return {"run_id": run_id, "rows": len(rows), "turns": adapter.turn, "skipped": skipped}
 
 

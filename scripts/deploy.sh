@@ -114,6 +114,14 @@ chmod 600 .env
 # Schema changes apply themselves on boot — db.init() and telemetry.store.init() are both
 # idempotent — so a restart is the whole migration step. `sync` because boxd reboots are cold.
 sync
+# An open live-log stream holds uvicorn open until the run ends, and systemd then kills the
+# process before the control plane can destroy its VMs. Units built before this flag existed
+# are patched in place; a no-op once it is there.
+unit=/etc/systemd/system/factory.service
+if [ -f "$unit" ] && ! grep -q -- "--timeout-graceful-shutdown" "$unit"; then
+  sudo sed -i "s|--port 8765$|--port 8765 --timeout-graceful-shutdown 10|" "$unit"
+  sudo systemctl daemon-reload
+fi
 sudo systemctl restart factory
 for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8765/healthz && break; sleep 1; done
 systemctl is-active factory
