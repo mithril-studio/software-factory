@@ -56,6 +56,12 @@ def _sign(expiry: int) -> str:
     return hmac.new(_SECRET, str(expiry).encode(), hashlib.sha256).hexdigest()
 
 
+def configured() -> bool:
+    """Whether a login exists. Without one the signing key would be derivable from public
+    source, so no token is issued or accepted at all."""
+    return bool(AUTH_EMAIL and AUTH_PASSWORD)
+
+
 def issue_token() -> str:
     """A fresh session token: an expiry stamp plus its signature."""
     expiry = int(time.time()) + SESSION_TTL
@@ -63,7 +69,7 @@ def issue_token() -> str:
 
 
 def valid_token(token: str | None) -> bool:
-    if not token or "." not in token:
+    if not configured() or not token or "." not in token:
         return False
     stamp, _, sig = token.partition(".")
     if not stamp.isdigit():

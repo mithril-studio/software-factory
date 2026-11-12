@@ -1,127 +1,128 @@
 # Software Factory
 
-An agentic development system. GitHub issues go in; reviewed pull requests come out.
+GitHub issues go in; pull requests into `test` come out.
 
-A control plane watches repos for work, restores an isolated boxd VM per task, runs a coding
-agent inside it, and reaps the VM when done. The control
-plane is deterministic and contains no LLM. All intelligence lives in the agent, inside the
-VM.
+A control plane watches repos for issues labelled `agent:queued`, restores an isolated boxd VM
+per issue, runs a coding agent inside it, and destroys the VM when done. The control plane is
+deterministic and contains no LLM. All intelligence lives in the agent, inside the VM.
 
-> **Status:** V0, started 2026-07-30. Second attempt. The first failed on scope — see
-> `../learnings.md`. The governing constraint of this build is *smallness*.
+> **Status:** v1, 2026-11-12. A deliberate step back. The previous version grew an AI review,
+> CI gating, auto-merge, scheduled releases, test-server deploys, browser acceptance, a planner
+> and a learning loop — about 13,000 lines — faster than it was used. v1 keeps the one
+> primitive everything else was built on and makes it reliable. The rest is in git history.
 
 ---
 
-## §1 The three layers
+## §1 The primitive
 
-One repo, one deployable. Each layer gets a folder so it can be split into its own repo
-once it has earned an independent release cycle — build it working first, fragment later.
+```
+issue (agent:queued) ──► VM from a golden ──► agent ──► branch + PR into test ──► VM destroyed
+```
+
+That is the whole product. A human reviews the pull request and merges it into `test`; with
+`FACTORY_SEQUENTIAL` on, the next queued issue starts once that PR is merged or closed, so
+issues that depend on each other build on each other. `test` → `main` is a human decision.
+
+What makes it usable rather than merely working:
+
+- **The issue is the interface.** Labels say where it is (`queued`, `running`, `done`,
+  `failed`); one comment says where the PR goes and links the live log; one comment at the end
+  names the PR, the cost, and whether the run passed the budget.
+- **Iterate by re-queuing.** Re-adding `agent:queued` continues the branch. If its PR is open,
+  the agent reads the PR's comments first — review feedback is a comment and a label.
+- **Nothing is lost on a restart.** Interrupted runs are re-queued on boot and continue from
+  what was pushed.
+- **Cost is visible per run.** A soft budget (`FACTORY_RUN_BUDGET_EUR`, €100) flags a run that
+  passes it without stopping it.
+
+## §2 The layers
 
 | Folder | Layer | Responsibility | Contains an LLM? |
 |---|---|---|---|
-| `control/` | Control plane | Watch issues, provision VMs, dispatch agents, reap, serve the UI | No |
-| `telemetry/` | Trace | Ingest OTLP, normalize, store runs and token usage | No |
+| `control/` | Control plane | Watch issues, provision VMs, dispatch the agent, report, reap | No |
+| `telemetry/` | Trace | Normalize agent events; store model calls, tool calls and cost | No |
+| `web/` | UI | React SPA, built to `web/dist` and served by `control` | No |
+| `scripts/` | Operations | Goldens, deploy, the CI gate list, health monitoring | No |
 
-`control/` rather than `exec/`: `exec` is a Python keyword and cannot name a package.
-
-Skills are **not** a folder here. They live in [agent-skills](https://github.com/mithril-studio/agent-skills) because they
-ship into the VM rather than onto the server — they are the agent's code, installed when a
-golden is built, and are reused by agents that have nothing to do with this project.
-
-Nothing in this system calls a model except the agent running inside a boxd VM. This is the
-**passive-layer principle**: the tools read and write, the caller has the intelligence.
-
-## §2 Topology
+Skills live in [agent-skills](https://github.com/mithril-studio/agent-skills) because they
+ship into the VM, installed when a golden is built.
 
 ```
-        boxd VM "software-factory"  (long-lived)
+   boxd VM mithril-factory  (systemd)
    ┌─────────────────────────────────────────┐
-   │  control (FastAPI)       telemetry      │
-   │    │  polls GitHub         ▲  events    │
-   │    │                       │            │
-   │    └────── SQLite ─────────┘            │
+   │  control (FastAPI) ──► telemetry        │
+   │    │  polls GitHub        │             │
+   │    └────── SQLite ────────┘             │
    └────┬────────────────────────────────────┘
-        │ boxd SDK (gRPC)             ▲
-        ▼                             │ agent event stream
-   ┌─────────────────────────────┐    │
-   │  boxd VM (from a golden)    │────┘
+        │ boxd SDK
+        ▼
+   ┌─────────────────────────────┐
+   │  boxd VM job-<id>           │
+   │  (from golden-<repo> or     │
+   │   golden-copy)              │
    │    agent + skills           │
    │    → pushes branch, opens PR│
    └─────────────────────────────┘
 ```
 
-One short-lived boxd machine per task, restored from a golden snapshot. The control plane
-runs on a Hetzner VM under systemd and is deployed by `git pull`; it is not a container and it
-is not on boxd.
+## §3 Contracts
 
-One machine per task. Restoring one takes ~0.2s, so there is **no warm pool** — provision on
-demand, destroy on completion. The agent's isolation boundary is the VM.
+### §3.1 `run.id`
 
-## §3 Contracts between layers
-
-These are the only things the layers share. They are written down even inside one repo,
-because they are what makes splitting the layers out later cheap. Change them deliberately.
-
-### §3.1 `run.id` — the correlation key
-
-A UUID minted by `exec` when a task is dispatched. It is the join key across every layer.
-
-`control` injects it into the agent VM as an OTel resource attribute:
+`uuid4().hex`, minted when a run is claimed. The VM is `FACTORY_VM_PREFIX` + its first 8
+characters. It is the join key across layers, and the one telemetry variable the VM gets:
 
 ```
-OTEL_RESOURCE_ATTRIBUTES=run.id=<uuid>,issue=<owner/repo#123>,repo=<owner/repo>,vm=<box-name>
+OTEL_RESOURCE_ATTRIBUTES=run.id=<id>,issue=<owner/repo#123>,repo=<owner/repo>,vm=<box-name>
 ```
 
-Every span, metric, and log the agent runtime emits carries these attributes. `telemetry`
-uses `run.id` to attach usage to a run without the two layers calling each other.
-**They communicate only through the database and this attribute.**
+### §3.2 The telemetry adapter
 
-### §3.2 The adapter — the model-agnostic boundary
+Runtime specifics are confined to `telemetry/normalize.py`. `control` hands the agent's event
+stream to a `Recorder` in process; the dependency runs one way (`control` imports `telemetry`,
+never the reverse). Cost is a join against `model_prices`, so prices are data, and a call to a
+model with no price is counted as `unpriced_calls` rather than silently costing $0.
 
-Runtime specifics are confined to one adapter (`telemetry/normalize.py`); no table names a
-runtime. Today the adapter is fed in process from the event stream `control` already parses,
-and from salvaged transcripts replayed after the fact. OTLP remains the intended wire format
-for producers outside this process — it becomes a third caller of the same adapter rather
-than a second implementation. See `telemetry/README.md` §2 for why the transport was
-deferred and the boundary built first.
+### §3.3 The golden launch contract
 
-The dependency runs one way: `control` imports `telemetry`, never the reverse. The layers
-still share only the database and `run.id`.
+A golden owes the control plane two files: `/usr/local/bin/factory-agent`, which reads
+`$FACTORY_PROMPT` and emits its event stream on stdout, and `/etc/factory/agent.json`, the
+manifest naming the agent, its transcript glob and its event format. `control/README.md` §2.3.
 
-### §3.3 The memory record schema
+### §3.4 The issue
 
-Defined by the `memory` skill in [agent-skills](https://github.com/mithril-studio/agent-skills) §3. The agent appends records to `.mem/domains/*.jsonl`
-**in the target repo**, and they ship inside the pull request. No service reads or writes
-memory — it travels with the code, and it is reviewed like code.
+The issue body is the agent's whole brief, so its shape is the contract between the person
+writing it and the run. `docs/ISSUE_TEMPLATE.md` is the shape: what and why, acceptance
+criteria as checkboxes, out of scope, how to verify. The agent is told to make every criterion
+true, respect what is out of scope, and run the verification. Nothing in the control plane
+parses it — an issue that does not follow it still runs.
 
-## §4 What V0 deliberately does not have
+## §4 What comes next, and the rule for adding it
 
-Named so they stay unbuilt until something proves they are needed:
+Two ideas are queued behind v1 being used for real:
 
-- No test agent or review agent. One agent, a few skills. Those come after V0 works.
-- No warm VM pool. Forks are ~0.2s.
-- No `mem` binary. Memory is a skill writing JSONL; the binary is extracted later, once the
-  format is proven against real records. See `../memory-engine-spec.md`.
-- No `ExecutionBackend` abstraction. `exec` talks to boxd concretely. The interface gets
-  extracted when a second backend exists, not before.
-- No GitHub webhooks. Polling at 5 concurrent projects is simpler and sufficient.
-- No queue broker. Postgres `SELECT ... FOR UPDATE SKIP LOCKED` until it hurts.
+1. **An issue grill loop.** Before an issue is queued, an agent asks the questions that would
+   otherwise blindside the build: it answers what the code can answer, posts the rest as a
+   comment, a human answers, and a judge checks the issue against §3.4 before splitting it into
+   task issues. The human answering is the point: an agent that answers its own questions
+   writes guesses into the brief.
+2. **Harnesses after a build.** A label on the issue (`frontend`, `needs-e2e`) starts a second
+   run on the same branch with a design, end-to-end or browser harness as its prompt.
 
-## §5 Build order
+The rule: **each of these is a prompt and a skill on the same primitive, chained by labels on
+issues — never a new state machine in the control plane.** The previous version broke that
+rule once per feature, and that is how it became 13,000 lines nobody used.
 
-Revised from layer-by-layer to a vertical slice: build the thinnest path from issue to PR
-first, then thicken it. Layer-by-layer means the system only works at the very end, which is
-the big-bang shape that killed the first attempt.
+## §5 What it deliberately does not have
 
-1. **`memory` skill** — a markdown file, now in its own repo. Complete.
-2. **`control`** — fork, dispatch, collect, reap, plus a UI to watch it. **Done.**
-3. **Golden VM + first real run** — the highest-risk unknown: does an agent in a fork
-   actually take an issue and open a PR? **Done.**
-4. **`telemetry`** — once runs exist to observe. **Done**, minus the OTLP ingest (§3.2).
+- **No merge.** A human merges every pull request.
+- **No retries.** A failed run is labelled; re-queuing is a human (or a restart) deciding.
+- **No model calls in `control/`.**
+- **No halting.** A failed issue does not stop the queue behind it.
 
 ## §6 Related documents
 
-- `../learnings.md` — why the first attempt failed and what to carry forward
-- `../execution-backends.md` — the isolation ladder and the deferred backend interface
-- `../memory-engine-spec.md` — the full `mem` spec, deferred to a future standalone repo
-- `../firecracker-vm-pool.md` — the deferred sovereignty layer
+- [OPERATIONS.md](OPERATIONS.md) — deploying, goldens, connecting repos, configuration
+- [ISSUE_TEMPLATE.md](ISSUE_TEMPLATE.md) — the shape of an issue the factory builds well
+- [../control/README.md](../control/README.md) — control plane design notes
+- [../telemetry/README.md](../telemetry/README.md) — trace layer design notes

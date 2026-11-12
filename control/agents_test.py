@@ -21,18 +21,15 @@ Run it directly, no framework needed:
 import asyncio
 import sys
 
-from control import db, goldens, runner
 from control.agents import (
     BASE,
     BASE_SNAPSHOT,
     GOLDEN_PREFIX,
-    api_rows,
     available,
     forget,
     golden_name,
     is_golden,
     listed,
-    wait_until_captured,
     parse_golden,
     resolve_snapshot,
     slug,
@@ -135,73 +132,6 @@ check("resolve_snapshot: an empty fleet resolves to nothing", resolve_snapshot(R
 check("resolve_snapshot: an unprovisioned repo still dispatches",
       bool(resolve_snapshot("brand/new", (BASE_SNAPSHOT,))), True)
 
-# ---------- api rows
-# What the fleet page is handed. The rows come from the refresh loop's table, which is the
-# only registry there is — so this is a pure function over rows, and the whole thing is
-# testable without a database, a fleet or a clock.
-
-KNOWN = {
-    BASE_SNAPSHOT: {
-        "repo": None, "agent": "claude", "version": "3", "events": "claude-code",
-        "agent_version": "2.1", "ok": 1, "error": None,
-        "verified_at": "2026-08-18T10:00:00+00:00",
-        "manifest": "{}", "checked_at": "2026-08-18T12:00:00+00:00",
-    },
-    "golden-acme-api": {
-        "repo": "acme-api", "agent": "codex", "version": "1", "events": "codex",
-        "agent_version": None, "ok": 0, "error": "boom", "verified_at": None,
-        "manifest": None, "checked_at": "2026-08-18T12:00:00+00:00",
-    },
-    WARM: {
-        "repo": "mithril-studio-software-factory", "agent": None, "version": "7",
-        "events": None, "agent_version": None, "ok": 0, "error": None, "verified_at": None,
-        "manifest": None, "checked_at": "2026-08-18T12:00:00+00:00",
-    },
-}
-
-rows = api_rows(KNOWN)
-check("api rows: the base sorts first, because an empty list below it is explained by it",
-      [r["snapshot"] for r in rows], [BASE_SNAPSHOT, "golden-acme-api", WARM])
-check("api rows: nothing is invented and nothing is dropped", len(rows), len(KNOWN))
-check("api rows: the base is marked as one, and only the base",
-      {r["snapshot"]: r["base"] for r in rows},
-      {BASE_SNAPSHOT: True, "golden-acme-api": False, WARM: False})
-check("api rows: each row carries what the refresh recorded",
-      {k: rows[0][k] for k in ("agent", "version", "events", "agent_version", "ok", "error")},
-      {"agent": "claude", "version": "3", "events": "claude-code", "agent_version": "2.1",
-       "ok": True, "error": None})
-check("api rows: verified_at is passed through as the evidence it is",
-      rows[0]["verified_at"], "2026-08-18T10:00:00+00:00")
-check("api rows: a golden no run has proved reads unproven, not broken",
-      (rows[2]["ok"], rows[2]["error"], rows[2]["verified_at"]), (False, None, None))
-check("api rows: a golden whose last run failed carries that error",
-      (rows[1]["ok"], rows[1]["error"]), (False, "boom"))
-check("api rows: the columns are exactly what the page asks for",
-      sorted(rows[0]),
-      ["agent", "agent_version", "base", "error", "events", "ok", "ready", "repo", "snapshot",
-       "status", "verified_at", "version"])
-check("api rows: a golden with a version is bootable whatever it is currently doing",
-      [(r["snapshot"], r["ready"]) for r in api_rows({
-          BASE_SNAPSHOT: {"version": "1", "status": "ready"},
-          "golden-a-b": {"version": "3", "status": "pending"},
-          "golden-c-d": {"version": None, "status": "pending"},
-      })],
-      [(BASE_SNAPSHOT, True), ("golden-a-b", True), ("golden-c-d", False)])
-check("api rows: the base row names no repo, because it serves every repo",
-      rows[0]["repo"], None)
-check("api rows: a row that recorded no agent says so rather than guessing one from the name",
-      rows[2]["agent"], None)
-check("api rows: the repo falls back to the slug its name carries",
-      api_rows({"golden-acme-api": {}})[0]["repo"], "acme-api")
-
-# The registry is the name. A row for something that is not a golden is a row the refresh
-# should never have written, and rendering it would put a machine in a table of goldens.
-check("api rows: a row whose name is not a golden is dropped",
-      [r["snapshot"] for r in api_rows({"goldenrod": {}, BASE_SNAPSHOT: {}})],
-      [BASE_SNAPSHOT])
-check("api rows: an empty table is an empty list, not an error", api_rows({}), [])
-
-
 # ---------- available
 
 class FakeSnapshot:
@@ -281,13 +211,6 @@ check("re-save: and the repo still resolves onto it",
 check("re-save: the version reported is the ready one, not the one in flight",
       version(WARM), "3")
 
-# ---------- waiting for a capture to land
-
-# The bug: `snapshots.create` returns when the capture is *queued*, and `provision` used to
-# destroy the machine on that answer — which aborts the capture and leaves the name `pending`
-# with no version, permanently unbootable. The wait is what turns "queued" into "written".
-
-
 class CapturingBoxd(FakeBoxd):
     """A fleet where `name` gains `lands` after `after` listings. `lands=None` never finishes."""
 
@@ -302,35 +225,6 @@ class CapturingBoxd(FakeBoxd):
             self.detail[self._name] = (self._lands, "ready")
         return rows
 
-
-forget()
-landing = CapturingBoxd([BASE_SNAPSHOT, WARM], WARM, after=3)
-check("wait: it blocks until the fleet publishes a version",
-      asyncio.run(wait_until_captured(landing, WARM, "", timeout=5, poll=0)), "2")
-check("wait: and it kept asking until it did", landing.calls >= 3, True)
-check("wait: after which the golden is one a run can boot",
-      resolve_snapshot(REPO, asyncio.run(available(landing))), WARM)
-
-# A re-save publishes a *new* version under a name that already has one, so "does it have a
-# version" is true before the capture even starts. Testing that instead would return
-# immediately and reap the machine exactly as the original bug did.
-forget()
-resave = CapturingBoxd([BASE_SNAPSHOT, WARM], WARM, after=2, lands="4")
-resave.detail[WARM] = ("3", "pending")
-check("wait: a re-save waits for the version to change, not merely to exist",
-      asyncio.run(wait_until_captured(resave, WARM, "3", timeout=5, poll=0)), "4")
-
-# A capture that never lands must time out rather than hold the machine forever. `provision`
-# catches this and deletes the fragment, because a name with no version behind it is the one
-# shape no dispatch can ever resolve onto.
-forget()
-stuck = CapturingBoxd([BASE_SNAPSHOT, WARM], WARM, after=1, lands=None)
-try:
-    asyncio.run(wait_until_captured(stuck, WARM, "", timeout=0, poll=0))
-    check("wait: a capture that never lands times out", False)
-except TimeoutError as exc:
-    check("wait: a capture that never lands times out", True)
-    check("wait: and the message says what it was still doing", "pending" in str(exc), True)
 
 forget()
 before_calls = capturing.calls
@@ -353,112 +247,6 @@ check("vanished: the snapshots that remain are untouched",
       asyncio.run(available(boxd)), (BASE_SNAPSHOT,))
 forget()
 
-
-# ---------- refresh
-# The loop that replaced the freshness sweep. It reads the fleet and writes what it saw; the
-# grading is done from rows the runs already wrote, so nothing here boots a VM. Both the
-# database and boxd are stubbed — a golden's health is a question about evidence, and
-# evidence is exactly what a test can hand it.
-
-recorded: dict[str, dict] = {}
-evidence: dict[str, dict] = {}
-
-
-async def fake_record_snapshot(name, **fields):
-    recorded[name] = fields
-
-
-async def fake_evidence():
-    return evidence
-
-
-def run_refresh(names, seen=None):
-    """Run one refresh against a stubbed fleet and a stubbed database."""
-    recorded.clear()
-    evidence.clear()
-    evidence.update(seen or {})
-    real = (runner.client, db.record_snapshot, db.snapshot_evidence)
-    runner.client = lambda: FakeBoxd(names)
-    db.record_snapshot, db.snapshot_evidence = fake_record_snapshot, fake_evidence
-    try:
-        return asyncio.run(goldens.refresh())
-    finally:
-        runner.client, db.record_snapshot, db.snapshot_evidence = real
-        forget()
-
-
-FLEET_ROWS = [BASE_SNAPSHOT, WARM, "golden-acme-api", "goldenrod", "software-factory"]
-
-rows = run_refresh(FLEET_ROWS)
-check("refresh: one row per discovered golden, and none for anything else",
-      sorted(recorded), sorted([BASE_SNAPSHOT, WARM, "golden-acme-api"]))
-check("refresh: what it returns is what it wrote", sorted(rows), sorted(recorded))
-check("refresh: each row names the repo its snapshot name carries",
-      recorded[WARM]["repo"], "mithril-studio-software-factory")
-check("refresh: and the base names none", recorded[BASE_SNAPSHOT]["repo"], None)
-check("refresh: and carries the version the listing saw", recorded[WARM]["version"], "1")
-check("refresh: a golden nothing has run on is unproven, not broken",
-      (recorded[WARM]["ok"], recorded[WARM]["error"], recorded[WARM]["verified_at"]),
-      (0, None, None))
-check("refresh: every row is stamped with when the fleet was listed",
-      all(r["checked_at"] for r in recorded.values()), True)
-
-# Upsert, not append: listing the same fleet twice is one row per name, still.
-before = sorted(recorded)
-rows = run_refresh(FLEET_ROWS)
-check("refresh: listing the same fleet again writes the same one row per name",
-      sorted(recorded), before)
-
-# The grade comes from the runs, including the manifest the golden announced on the way in.
-rows = run_refresh(FLEET_ROWS, {
-    BASE_SNAPSHOT: {
-        "last_run": "r1", "ok": 1, "error": None, "verified_at": "2026-08-18T10:00:00+00:00",
-        "manifest": '{"agent": "codex", "events": "codex", "transcript": "/t/*.jsonl", '
-                    '"version": "0.4.1"}',
-    },
-    "golden-acme-api": {"last_run": "r2", "ok": 0, "error": "boom", "manifest": None},
-})
-check("refresh: a golden a run finished on carries that run's verdict",
-      (recorded[BASE_SNAPSHOT]["ok"], recorded[BASE_SNAPSHOT]["last_run"]), (1, "r1"))
-check("refresh: verified_at is evidence from a run, not a probe",
-      recorded[BASE_SNAPSHOT]["verified_at"], "2026-08-18T10:00:00+00:00")
-check("refresh: the manifest the golden announced is unpacked into columns",
-      (recorded[BASE_SNAPSHOT]["events"], recorded[BASE_SNAPSHOT]["transcript"],
-       recorded[BASE_SNAPSHOT]["agent_version"]),
-      ("codex", "/t/*.jsonl", "0.4.1"))
-# The whole point of taking the agent out of the name: which agent an image runs is what the
-# image said, not what somebody called the snapshot.
-check("refresh: the agent comes from the manifest and from nowhere else",
-      (recorded[BASE_SNAPSHOT]["agent"], recorded["golden-acme-api"]["agent"]), ("codex", None))
-check("refresh: a failed last run is reported as the error it was",
-      (recorded["golden-acme-api"]["ok"], recorded["golden-acme-api"]["error"]), (0, "boom"))
-check("refresh: an unreadable manifest costs the columns, not the row",
-      (recorded["golden-acme-api"]["events"], recorded["golden-acme-api"]["agent_version"]),
-      (None, None))
-check("refresh: evidence for a snapshot the fleet no longer holds is not written",
-      "golden-gone" in recorded, False)
-
-
-# A fleet nobody can list is a refresh that recorded nothing, never a control plane that fell
-# over: this loop runs unattended every five minutes.
-class BrokenBoxd(FakeBoxd):
-    async def list(self):
-        raise RuntimeError("boxd unreachable")
-
-
-recorded.clear()
-real_client = runner.client
-real_record, real_evidence = db.record_snapshot, db.snapshot_evidence
-runner.client = lambda: BrokenBoxd([])
-db.record_snapshot, db.snapshot_evidence = fake_record_snapshot, fake_evidence
-try:
-    check("refresh: an unlistable fleet returns nothing and raises nothing",
-          asyncio.run(goldens.refresh()), {})
-finally:
-    runner.client = real_client
-    db.record_snapshot, db.snapshot_evidence = real_record, real_evidence
-    forget()
-check("refresh: and writes no rows", recorded, {})
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

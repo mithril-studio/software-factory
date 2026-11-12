@@ -37,6 +37,7 @@ manifest_file=""
 cli_install=""
 skip_login=0
 keep=0
+playwright=0
 
 usage() {
   cat >&2 <<'USAGE'
@@ -47,6 +48,8 @@ usage: build-golden.sh [agent] [options]
   --launch FILE       the /usr/local/bin/factory-agent to install (required for an unknown agent)
   --manifest FILE     the /etc/factory/agent.json to install (required for an unknown agent)
   --no-login          do not stop for the interactive login (for a deployment using a durable key)
+  --playwright        add Playwright and Chromium — only for --name golden-tester, the
+                      browser-acceptance image; never for an image builds or reviews boot
   --keep              leave the build machine running after saving the snapshot
 USAGE
   exit 2
@@ -63,6 +66,7 @@ while [ $# -gt 0 ]; do
     --launch)      launch_file=${2:?--launch needs a file}; shift 2 ;;
     --manifest)    manifest_file=${2:?--manifest needs a file}; shift 2 ;;
     --no-login)    skip_login=1; shift ;;
+    --playwright)  playwright=1; shift ;;
     --keep)        keep=1; shift ;;
     -h|--help)     usage ;;
     *)             echo "unknown option: $1" >&2; usage ;;
@@ -87,6 +91,17 @@ esac
 case ${snapshot#golden-} in
   -*|*-) echo "refusing: '$snapshot' is fringed with hyphens a slug can never carry" >&2; exit 1 ;;
 esac
+
+# Playwright belongs to the acceptance tester and nothing else (discussion.md, "Playwright out"):
+# a build or review VM that has a browser is one whose agent will reach for it. So the flag and
+# the name come as a pair — `control/agents.py` keeps `golden-tester` out of build resolution,
+# and this keeps the browser out of every other image.
+if [ "$playwright" = "1" ] && [ "$snapshot" != "golden-tester" ]; then
+  echo "refusing: --playwright is only for --name golden-tester, never for $snapshot" >&2; exit 1
+fi
+if [ "$snapshot" = "golden-tester" ] && [ "$playwright" = "0" ]; then
+  echo "refusing: golden-tester without --playwright is an acceptance image with no browser" >&2; exit 1
+fi
 
 if [ "$skip_login" = "0" ] && [ ! -t 0 ]; then
   echo "refusing: the agent login needs a terminal to pause for" >&2
@@ -209,6 +224,21 @@ exec_long "installing skills" "
 
 warm_caches
 
+# The tester's browser. Installed into a project of its own at ~/tester rather than globally,
+# because an ES module resolves `import "playwright"` from the script's directory and not from
+# NODE_PATH: the acceptance prompt tells the agent to write its scripts there.
+if [ "$playwright" = "1" ]; then
+  exec_long "installing Playwright and Chromium" "
+    set -e
+    export PATH=\"\$HOME/.local/share/fnm:\$HOME/.local/bin:\$PATH\"
+    eval \"\$(fnm env)\"
+    mkdir -p \$HOME/tester && cd \$HOME/tester
+    [ -f package.json ] || npm init -y > /dev/null
+    npm install --no-audit --no-fund playwright@1
+    npx playwright install --with-deps chromium
+  "
+fi
+
 say "installing factory-agent and the manifest"
 if [ -n "$launch_file" ]; then
   boxd machine cp "$launch_file" "$vm:/tmp/factory-agent"
@@ -242,7 +272,7 @@ fi
 # Checked here, while the machine is still alive, because every one of these is cheap now and
 # costs a forked VM and a dead run to discover later. A snapshot is only saved if they pass.
 say "checking"
-boxd machine exec "$vm" -e FACTORY_BUILD_AGENT="$agent" -- '
+boxd machine exec "$vm" -e FACTORY_BUILD_AGENT="$agent" -e FACTORY_BUILD_PLAYWRIGHT="$playwright" -- '
   fail=0
   note() { echo "  $1"; }
   [ -x /usr/local/bin/factory-agent ] || { note "FAIL factory-agent is not executable"; fail=1; }
@@ -260,6 +290,11 @@ boxd machine exec "$vm" -e FACTORY_BUILD_AGENT="$agent" -- '
     ls ~/.claude/.credentials.json > /dev/null 2>&1 || note "warn no agent login on disk"
   fi
   gh auth status > /dev/null 2>&1 || note "warn gh is not authenticated in the machine"
+  if [ "$FACTORY_BUILD_PLAYWRIGHT" = "1" ]; then
+    [ -d ~/tester/node_modules/playwright ] || { note "FAIL playwright is not installed in ~/tester"; fail=1; }
+  elif [ -d ~/tester/node_modules/playwright ]; then
+    note "FAIL a browser made it into an image builds may boot"; fail=1
+  fi
   [ "$fail" = "0" ] || { echo "checks failed" >&2; exit 1; }
   echo "  all checks passed"
 ' || { cleanup_hint; exit 1; }

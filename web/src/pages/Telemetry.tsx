@@ -3,7 +3,7 @@ import { usePoll, type Telemetry as TelemetryData } from "@/lib/api"
 import { cost } from "@/lib/format"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { PageHeader, Empty, ErrorNote } from "@/components/Page"
+import { PageHeader, Empty, ErrorNote, Loading } from "@/components/Page"
 import { Meter, StatTile } from "@/components/Meter"
 
 /** Panel masthead: serif title over a hairline, the same voice as the page header one
@@ -65,6 +65,7 @@ export function Telemetry() {
         subtitle="Every model call and tool call the factory has made, priced against model_prices."
       />
       {error && <ErrorNote message={error} />}
+      {!data && !error && <Loading />}
 
       {empty && (
         <Empty>
@@ -82,8 +83,8 @@ export function Telemetry() {
       {data && !empty && (
         <div className="space-y-6">
           {/* Asymmetric on purpose. Cost per shipped issue is the figure the run table
-              could never produce — an issue costs its build plus every retry, review and
-              fix, and only the ones that opened a PR count as delivered — so it takes
+              could never produce — an issue costs every run it took, and only the ones that
+              opened a PR count as delivered — so it takes
               half the row and the accent shadow, and the other three report to it. */}
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
             <StatTile

@@ -9,11 +9,10 @@ Use a dedicated pilot issue with this acceptance criterion:
 ```
 
 Put it under the issue's `## Acceptance criteria` heading. Add the following fenced YAML
-under `## Verification` in the base branch `.factory.md` **for this pilot**:
+under `## Verification` in the target branch (`test` by default) `.factory.md` **for this pilot**:
 
 ```yaml
 version: 1
-max_retries: 1
 e2e:
   required: false
   setup: >-

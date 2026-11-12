@@ -4,6 +4,8 @@ A golden is a boxd snapshot, and its *name* says which repo it was warmed for:
 
     golden-copy               the base image — tooling and the agent's auth, no repo
     golden-<repo-slug>        the base image with one repo already cloned and installed
+    golden-tester             the base image plus a browser, for a browser harness — the
+                              one `golden-*` name that is deliberately *not* a golden here
 
     resolution:  golden-<repo-slug>  →  golden-copy  →  nothing
 
@@ -16,7 +18,7 @@ convention to survive. Now the name carries the repo and only the repo.
 
 Which agent runs inside an image is a property of the image, and the image says so itself:
 each golden carries `/etc/factory/agent.json`, announced into the run log as
-`FACTORY-MANIFEST` and recorded on the run (`runner._stream_agent`). That is the registry,
+`FACTORY-MANIFEST` and recorded on the run (`runner._stream`). That is the registry,
 and it is the one that cannot drift from what actually booted. Running a *second* agent means
 a second base image and a way to choose between them; that is on the backlog, not here.
 
@@ -24,15 +26,13 @@ Two tiers, not one, and the fallback is what makes connecting a repo cheap: a re
 golden of its own still dispatches onto `golden-copy` and installs for itself. Provisioning is
 a speed-up that can finish later, never a gate on the first run.
 
-Everything here is a pure function over strings apart from the four that talk to boxd —
-`available()`, `listed()`, `captured_version()` and `wait_until_captured()` — which all go
-through the one listing. That is deliberate: dispatch decisions can then be tested without
+Everything here is a pure function over strings apart from the two that talk to boxd —
+`available()` and `listed()` — which go through the one listing. That is deliberate: dispatch decisions can then be tested without
 credentials, a VM, a database or a clock.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 import time
 from collections.abc import Iterable
@@ -45,6 +45,12 @@ GOLDEN_PREFIX = "golden-"
 # It cannot collide with a per-repo name. A slug is built from `owner/name`, and the `/` alone
 # guarantees at least one hyphen, so no repo slug is ever the single word `copy`.
 BASE_SNAPSHOT = f"{GOLDEN_PREFIX}copy"
+
+# The browser-acceptance image: `golden-copy` plus Playwright and a browser. It is a snapshot
+# the factory boots, but never for a build or a review — Playwright is kept out of those runs by
+# standing decision — so it is the one `golden-*` name `parse_golden` refuses (below). It cannot
+# collide with a repo slug for the reason `copy` cannot: a slug always carries a hyphen.
+TESTER_SNAPSHOT = f"{GOLDEN_PREFIX}tester"
 
 # What `parse_golden` returns for the base image: a golden that carries no repo. Empty rather
 # than `None` because `None` already means "not a golden at all", and those are different
@@ -98,7 +104,9 @@ def parse_golden(name: str) -> str | None:
     with the hyphens a slug can never begin with.
     """
     name = (name or "").strip()
-    if not name.startswith(GOLDEN_PREFIX):
+    # The one exception to the contract: the browser image is not a golden any run may
+    # resolve onto; a browser harness would boot it by name.
+    if not name.startswith(GOLDEN_PREFIX) or name == TESTER_SNAPSHOT:
         return None
     if name == BASE_SNAPSHOT:
         return BASE
@@ -127,52 +135,6 @@ def resolve_snapshot(repo: str | None, available: Iterable[str] = ()) -> str | N
     return BASE_SNAPSHOT if BASE_SNAPSHOT in names else None
 
 
-def api_rows(known: dict[str, dict]) -> list[dict]:
-    """One row per golden snapshot, for the fleet page.
-
-    `known` is `db.snapshots()` — what the refresh loop last saw, which is the only registry
-    there is. Shaped here rather than in the endpoint because it is a pure function over rows
-    and a name, and everything about the naming contract is testable without a database, a
-    fleet or a clock.
-
-    The base sorts first: an empty per-repo list is explained by the base being missing, and
-    never the other way round. Rows whose name is not a golden are dropped — the table is
-    keyed on snapshot names and a row that cannot be parsed as one is a row the refresh should
-    never have written.
-    """
-    out = []
-    for name, row in (known or {}).items():
-        repo_slug = parse_golden(name)
-        if repo_slug is None:
-            continue
-        out.append(
-            {
-                "snapshot": name,
-                "repo": row.get("repo") or repo_slug or None,
-                "base": repo_slug == BASE,
-                # Which agent this image actually launches, from the manifest it announced on
-                # the way into its last run. Read back from the run rather than from the
-                # machine, because asking the machine means booting it.
-                "agent": row.get("agent") or None,
-                "version": row.get("version") or None,
-                # `pending` with no version is a capture still being written; `pending` with
-                # one is a re-save, and the older version is still bootable. Only the first
-                # is a golden nothing can boot, which is why `ready` is not `status ==
-                # "ready"`.
-                "status": row.get("status") or None,
-                "ready": bool(row.get("version")),
-                "events": row.get("events") or None,
-                "agent_version": row.get("agent_version") or None,
-                # From the runs, not from a probe: `ok` is what the last run on this snapshot
-                # did, and `verified_at` is when one last finished on it having produced
-                # usage. Null `verified_at` is unproven, not broken.
-                "ok": bool(row.get("ok")),
-                "error": row.get("error") or None,
-                "verified_at": row.get("verified_at") or None,
-            }
-        )
-    out.sort(key=lambda r: (not r["base"], r["snapshot"]))
-    return out
 
 
 _cache: tuple[float, tuple[str, ...], tuple[str, ...]] | None = None
@@ -266,47 +228,5 @@ def forget() -> None:
     _statuses = {}
 
 
-async def captured_version(boxd, name: str) -> str:
-    """The restorable version `name` carries right now, re-read from the fleet.
-
-    Forces a fresh listing rather than trusting the memoised one, because every caller is
-    asking about a moment they are about to change: what was there *before* a capture, and
-    whether the capture has landed since.
-    """
-    forget()
-    await listed(boxd)
-    return version(name)
 
 
-async def wait_until_captured(
-    boxd, name: str, was: str, timeout: float, poll: float = 5.0
-) -> str:
-    """Block until `name` carries a restorable version newer than `was`. Returns that version.
-
-    `boxd.snapshots.create` returns when the capture has been *queued*, not when it has been
-    written — and destroying the machine underneath a queued capture aborts it for good. That
-    is not a hypothesis: `golden-mithril-studio-software-factory` sat at `v0 / pending / 0B`
-    with no machine behind it, unrestorable and unfixable, because `provision._execute`
-    reaped the VM the instant `create` returned. `scripts/build-golden.sh` never hit it
-    because the `boxd snapshots save` CLI blocks until the capture lands.
-
-    Compared against `was` rather than merely tested for existence, because a *rebuild*
-    re-saves a name that already has a ready version from last time: "has a version" is true
-    before the new capture starts, and waiting on it would return immediately and reap the
-    machine exactly as before. The question is whether the version moved.
-
-    `TimeoutError` is the caller's cue to delete the half-written snapshot — a name with no
-    version behind it is one no dispatch can ever resolve onto, and leaving it in the fleet
-    turns a slow provision into a permanent one.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        found = await captured_version(boxd, name)
-        if found and found != was:
-            return found
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"{name} was still {status(name) or 'unlisted'} after {timeout:.0f}s"
-                + (f" (version {was!r} unchanged)" if was else " with no version behind it")
-            )
-        await asyncio.sleep(poll)

@@ -31,7 +31,6 @@ from control import runner
 from control.runner import (
     CLAUDE_TRANSCRIPT_GLOB,
     MANIFEST_PREFIX,
-    REVIEW_SCRIPT,
     VM_SCRIPT,
     parse_manifest,
     transcript_glob,
@@ -237,17 +236,18 @@ check("not an event: a broken manifest says so in the log",
       any("manifest unreadable" in ln for ln in lines))
 
 
-# ---------- AC4: both scripts launch through the wrapper
+# ---------- AC4: the script launches through the wrapper
 
-for name, script in (("build", VM_SCRIPT), ("review", REVIEW_SCRIPT)):
+for name, script in (("build", VM_SCRIPT),):
     check(f"{name}: hands off to the wrapper as its last act",
           script.rstrip().endswith("exec factory-agent"))
     check(f"{name}: announces the manifest immediately before handing off",
           script.rstrip().splitlines()[-2].startswith(f'echo "{MANIFEST_PREFIX} '))
     check(f"{name}: strips the manifest's newlines, so it stays one line",
           "tr -d '\\n' < /etc/factory/agent.json" in script)
-    check(f"{name}: keeps one pre-wrapper fallback", script.count("command -v factory-agent"), 1)
-    check(f"{name}: the fallback exits with the agent's own status", "; exit $?; }" in script)
+    check(f"{name}: asks for the wrapper exactly once", script.count("command -v factory-agent"), 1)
+    check(f"{name}: a golden without the wrapper is a setup failure, not an agent one",
+          "has no factory-agent\" >&2; exit 90; }" in script)
     # The prompt is multi-kilobyte and contains arbitrary quoting, so nothing may re-quote
     # it through another shell — an executable on PATH is what makes that impossible. The
     # manifest itself is only ever echoed: never read into a variable, never parsed, never

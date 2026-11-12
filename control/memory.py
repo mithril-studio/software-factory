@@ -1,6 +1,7 @@
 """A deterministic validator for `.mem/`, the repository memory store.
 
-The memory skill (`.claude/skills/memory/SKILL.md`) describes a schema by convention: one
+The memory skill (`memory-skills/memory/SKILL.md` in mithril-studio/agent-skills, installed
+into every golden) describes a schema by convention: one
 short line per record in `.mem/index.jsonl`, the full record in `.mem/domains/<domain>.jsonl`,
 and retired records moved wholesale into `.mem/archive/<domain>.jsonl`. Nothing enforces that
 shape except discipline, and a store an agent trusts without checking is a store that can feed

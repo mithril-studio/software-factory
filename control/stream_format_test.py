@@ -139,6 +139,13 @@ check("unrecognised event: a huge one is truncated", len(line) <= RAW_EVENT_MAX 
 check("unrecognised event: truncation is visible", line.endswith("…"))
 
 
+# Known noise is dropped, not logged raw: a heartbeat every 30s per running tool.
+HEARTBEAT = {"type": "tool_progress", "tool_use_id": "t1", "elapsed_time_seconds": 30}
+RATE = {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}
+check("quiet: a tool heartbeat adds nothing to the log", log_of(json.dumps(HEARTBEAT)), [])
+check("quiet: nor does a rate-limit status", log_of(json.dumps(RATE)), [])
+
+
 # ---------- recognised events keep their formatting, and their silences
 
 SESSION = {"type": "system", "subtype": "init", "session_id": "s1"}

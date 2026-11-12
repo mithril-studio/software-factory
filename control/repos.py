@@ -1,29 +1,7 @@
-"""Which repos this deployment watches — a register, not a setting.
+"""The repo register: which repos this factory watches, and which branch their PRs target.
 
-Connecting a repo used to mean editing `FACTORY_REPOS` in `.env` on the box and restarting
-systemd. That is not something a web interface can do, and it made "add a repo" an operation
-that required shell access to a server. The register lives in the database now, and
-`FACTORY_REPOS` is what seeds it the first time a deployment boots.
-
-## Why there is a cache at all
-
-`settings.repos` was a frozen dataclass field read synchronously by the poller, the projects
-page, the plan page and preflight. Making all of those `await db.list_repos()` is a
-cross-cutting rewrite of code that has nothing to do with this change, and it would put a
-database round trip inside the poll loop's hot path.
-
-So the database is the truth and this module holds the last thing it said. Every write goes
-through here and reloads, which is the only way the two can disagree — a control plane that
-mutated the table behind this module's back would serve a stale list until the next write.
-There is one process, so that is a rule to keep rather than a race to defend against.
-
-## What `watched()` does not decide
-
-Nothing here says whether a repo can *run*. A repo is dispatchable the moment it is
-registered: with no golden of its own it boots `golden-copy` and installs for itself. The
-`golden` and `provision_status` columns record what provisioning did, and no dispatch reads
-them. That is deliberate — a repo that had to wait for a snapshot before its first run would
-make connecting one a minutes-long operation with a failure mode.
+Repos live in the database and are connected through the UI (`POST /api/repos`).
+`FACTORY_REPOS` only seeds the register on boot; taking an entry out does not unwatch it.
 """
 
 from __future__ import annotations
@@ -31,15 +9,16 @@ from __future__ import annotations
 import logging
 import re
 
-from . import db
+from . import db, github
 from .config import settings
 
 log = logging.getLogger("factory.repos")
 
-# `owner/name`, the way GitHub spells it. Deliberately strict: the whole point of validating
-# here is that a typo becomes a 400 with a message rather than a watched repo that 404s once a
-# poll, forever, in a log nobody reads.
+# `owner/name`, the way GitHub spells it.
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$")
+
+# A branch name GitHub would accept, narrowly.
+BRANCH_RE = re.compile(r"^(?!.*\.\.)(?!/)(?!.*//)[A-Za-z0-9._/-]+(?<![./])$")
 
 _cache: tuple[str, ...] = ()
 _rows: dict[str, dict] = {}
@@ -51,22 +30,20 @@ def valid(repo: str) -> bool:
 
 
 def watched() -> tuple[str, ...]:
-    """The watched repos, in the order they were added. Synchronous, and never raises.
-
-    Empty before `load()` has run, which is the honest answer during startup: the poller's
-    first tick happens after the lifespan has seeded and loaded, and every HTTP request
-    happens after that too.
-    """
+    """The watched repos, in the order they were added. Synchronous, never raises."""
     return _cache
 
 
 def rows() -> list[dict]:
-    """The full register row per watched repo — golden, provision status, when it was added."""
     return [_rows[r] for r in _cache]
 
 
+def row(repo: str) -> dict | None:
+    return _rows.get(repo)
+
+
 async def load() -> tuple[str, ...]:
-    """Re-read the register from the database into the cache. Returns the new list."""
+    """Re-read the register from the database into the cache."""
     global _cache, _rows
     found = await db.list_repos()
     _rows = {r["repo"]: r for r in found}
@@ -75,17 +52,7 @@ async def load() -> tuple[str, ...]:
 
 
 async def seed() -> None:
-    """Bring `FACTORY_REPOS` into the register, then load it.
-
-    Additive and idempotent: `add_repo` ignores a repo that is already there, so a deployment
-    that has since connected repos through the API does not have them clobbered by an `.env`
-    that predates them — and one that has never used the API keeps working with no migration
-    step at all.
-
-    Removing a repo from `FACTORY_REPOS` does *not* unwatch it. Deleting is an explicit act
-    (`DELETE /api/repos/...`), because the alternative is a deployment silently forgetting a
-    connected repo the first time somebody tidies an environment variable.
-    """
+    """Bring `FACTORY_REPOS` into the register, then load it. Additive and idempotent."""
     for repo in settings.repos:
         if not valid(repo):
             log.warning("FACTORY_REPOS entry %r is not owner/repo; skipped", repo)
@@ -95,20 +62,44 @@ async def seed() -> None:
     log.info("watching %s repo(s): %s", len(_cache), ", ".join(_cache) or "none")
 
 
-async def add(repo: str, agent: str | None = None) -> None:
-    """Watch `repo` from now on. Caller validates; this stores and reloads."""
-    await db.add_repo(repo.strip(), agent)
+async def add(repo: str) -> None:
+    await db.add_repo(repo.strip())
     await load()
 
 
 async def remove(repo: str) -> bool:
-    """Stop watching `repo`. Returns whether it was being watched."""
     removed = await db.remove_repo(repo.strip())
     await load()
     return removed
 
 
-async def record_golden(repo: str, golden: str | None, status: str) -> None:
-    """Record what provisioning did for `repo`, and refresh the cached row."""
-    await db.set_repo_golden(repo.strip(), golden, status)
+def target_branch(repo: str) -> str:
+    """The branch `repo`'s pull requests go into: its own setting, else FACTORY_TARGET_BRANCH."""
+    return (_rows.get(repo) or {}).get("base_branch") or settings.target_branch
+
+
+async def ensure_target(repo: str) -> str:
+    """The target branch for `repo`, created from the default branch if it does not exist."""
+    target = target_branch(repo)
+    if await github.branch_sha(repo, target) is not None:
+        return target
+    default = await github.default_branch(repo)
+    sha = await github.branch_sha(repo, default)
+    if sha is None:
+        raise RuntimeError(f"{repo} has no commits on {default}; nothing to branch {target} from")
+    await github.create_branch(repo, target, sha)
+    log.info("created %s on %s from %s", target, repo, default)
+    return target
+
+
+async def set_target_branch(repo: str, branch: str | None) -> dict:
+    """Point `repo` at another target branch, or back at the default with None or ""."""
+    repo = repo.strip()
+    if repo not in _rows:
+        raise ValueError(f"{repo} is not watched")
+    name = (branch or "").strip() or None
+    if name is not None and not BRANCH_RE.match(name):
+        raise ValueError(f"{name!r} is not a branch name")
+    await db.set_repo_base_branch(repo, name)
     await load()
+    return _rows[repo]

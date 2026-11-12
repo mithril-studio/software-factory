@@ -15,7 +15,7 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def freeze(profile: str, issue: dict, max_cycles: int) -> dict:
+def freeze(profile: str, issue: dict) -> dict:
     """Absent section opts out; a present but invalid contract refuses dispatch."""
     sections = re.findall(r"^## Verification\s*\n(.*?)(?=^## |\Z)", profile, re.M | re.S)
     if not sections:
@@ -30,9 +30,9 @@ def freeze(profile: str, issue: dict, max_cycles: int) -> dict:
         raise ValueError("unknown verification configuration")
     if type(config.get("version")) is not int or config["version"] != 1:
         raise ValueError("verification version must be 1")
-    retries = config.get("max_retries", 1)
-    if type(retries) is not int or not 0 <= retries <= 2:
-        raise ValueError("max_retries must be 0, 1 or 2")
+    retries = config.get("max_retries", 0)
+    if type(retries) is not int or retries != 0:
+        raise ValueError("automatic retries are disabled; re-queue the issue to retry")
     blocks = re.findall(r"^##\s*Acceptance criteria\s*\n+```ya?ml\n(.*?)^```",
                         issue.get("body") or "", re.M | re.S | re.I)
     criteria = yaml.safe_load(blocks[0]) if len(blocks) == 1 else None
@@ -47,10 +47,10 @@ def freeze(profile: str, issue: dict, max_cycles: int) -> dict:
                 or not isinstance(c.get("statement"), str) or not c["statement"].strip()):
             raise ValueError("invalid or duplicate acceptance criterion")
         ids.add(c["id"])
-    checks = [{"id": "review:approval", "verifier": "review", "required": True}]
-    checks += [{"id": "review:" + c["id"], "verifier": "review",
-                "required": c["mode"] != "inspect"} for c in criteria]
+    checks = []
     e2e = config.get("e2e")
+    if e2e is None:
+        raise ValueError("enabled verification requires e2e configuration")
     if e2e is not None:
         fields = {"required", "setup", "reset", "start", "cleanup", "ready_url", "flows"}
         if not isinstance(e2e, dict) or set(e2e) != fields:
@@ -85,7 +85,7 @@ def freeze(profile: str, issue: dict, max_cycles: int) -> dict:
             checks += [{"id": f"e2e:{flow['id']}:{cid}", "verifier": "e2e",
                         "required": e2e["required"]} for cid in selected]
     plan = {"enabled": True, "schema": 1, "criteria": criteria, "checks": checks,
-            "max_retries": retries, "max_cycles": max_cycles, "e2e": e2e,
+            "e2e": e2e,
             "issue": issue, "profile": profile}
     return {**plan, "version": digest(plan)}
 
@@ -126,47 +126,15 @@ def decide(plan, sha, results, *, attempt=1, cycle=1, completed=False):
     if problems["invalid"] or problems["conflict"]:
         action, code = "escalate", "invalid_or_conflicting_results"
     elif problems["fail"]:
-        action = "request_fixes" if cycle < plan["max_cycles"] else "escalate"
-        code = "product_failure" if action == "request_fixes" else "fix_limit"
+        action, code = "request_fixes", "product_failure"
     elif problems["missing"] and not completed:
         action, code = "run_verification", "missing_or_stale_results"
     elif problems["unknown"] or problems["missing"]:
-        action = "retry_verification" if attempt <= plan["max_retries"] else "escalate"
-        code = "verification_unresolved" if action == "retry_verification" else "retry_limit"
+        action, code = "escalate", "verification_unresolved"
     else:
-        action, code = "eligible_to_merge", "required_checks_passed"
+        action, code = "ready_for_review", "required_checks_passed"
     return {"action": action, "reason": code, "checks": problems,
             "commit": sha, "plan_version": plan["version"], "attempt": attempt, "cycle": cycle}
-
-
-def review_results(plan, sha, attempt, verdict, exit_code=0):
-    """Preserve duplicate answers so policy rejects them, instead of last-answer-wins."""
-    out = []
-    for check in (c for c in plan["checks"] if c["verifier"] == "review"):
-        if exit_code or not isinstance(verdict, dict):
-            out.append(result(plan, sha, attempt, check, "error", reason="review did not finish"))
-            continue
-        if check["id"] == "review:approval":
-            outcome = {"approve": "pass", "request_changes": "fail"}.get(str(verdict.get("verdict")), "error")
-            findings = verdict.get("findings", [])
-            if outcome == "fail" and not findings:
-                outcome = "inconclusive"
-            out.append(result(plan, sha, attempt, check, outcome, ["review.json"],
-                              json.dumps(findings)))
-            continue
-        answers = verdict.get("criteria")
-        if not isinstance(answers, list):
-            answers = []
-        matches = [a for a in answers if isinstance(a, dict)
-                   and "review:" + str(a.get("id")) == check["id"]]
-        for answer in matches:
-            outcome = {"met": "pass", "not_met": "fail", "cannot_verify": "inconclusive"}.get(
-                str(answer.get("status")), "error")
-            evidence = answer.get("evidence")
-            if not isinstance(evidence, str) or not evidence.strip():
-                outcome, evidence = "inconclusive", "no evidence supplied"
-            out.append(result(plan, sha, attempt, check, outcome, ["review.json"], evidence))
-    return out
 
 
 def e2e_results(plan, sha, attempt, flow, verdict, step_ids):

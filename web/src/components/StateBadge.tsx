@@ -5,30 +5,19 @@ const VARIANT: Record<string, "ok" | "warn" | "bad" | "muted" | "default"> = {
   // run statuses
   succeeded: "ok",
   running: "warn",
-  forking: "warn",
+  provisioning: "warn",
+  forking: "warn", // rows written before v1
   queued: "muted",
   failed: "bad",
   cancelled: "bad",
-  // A review that ran fine and refused the change. Its run status is `succeeded`; the
-  // outcome is not, and the list is where that difference has to be visible.
-  "changes requested": "bad",
-  // The two ways an *approved* review still does not end in a merge. Deliberately not red:
-  // the reviewer verified the change and signed it off, so the problem is downstream of the
-  // work — CI found something the run VM does not run, or the merge itself was refused.
-  // Colouring these the same as a rejection is what made #77 look like a rejected change.
-  "ci red": "warn",
-  "not merged": "warn",
-  // issue (plan) states
+  // issue states on the queue page
   done: "ok",
-  blocked: "warn",
   none: "muted",
+  blocked: "warn", // issues labelled before v1
   error: "bad",
 }
 
-/** The colour one state carries, for the places that need the hue without the badge —
- *  the phase strip on the runs list. Exported so a second reading of "is this state bad?"
- *  cannot drift away from the badge's, which is how a rejected review and an approved one
- *  came to look alike in the first place. */
+/** The colour one state carries, for places that need the hue without the badge. */
 export function stateVariant(state: string): "ok" | "warn" | "bad" | "muted" | "default" {
   return VARIANT[state] ?? "default"
 }

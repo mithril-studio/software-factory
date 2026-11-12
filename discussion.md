@@ -8,6 +8,21 @@ Newest first.
 
 ---
 
+## 2026-11-02 — The control plane moves back to boxd
+
+The Hetzner box stopped answering: up according to Hetzner, silent on every port including
+ping, and still silent after a reboot. Its disk held the only `.env` and the only run history.
+Rather than rescue it, the owner moved the control plane back to boxd (`mithril-factory`).
+
+The first boxd control plane was lost to a corrupted root filesystem on 2026-08-19, and that
+risk has not gone away. What changed is what a lost machine costs: daily boxd disk backups, a
+checkpoint before every deploy, a machine that rebuilds itself from `scripts/provision-boxd.sh`,
+and secrets that are re-issued (`scripts/factory-secrets.sh`, a newly minted boxd key) rather
+than restored. The run history from Hetzner is not carried over; the factory starts with an
+empty ledger.
+
+---
+
 ## 2026-08-12 — Run analysis session
 
 Analysed the last 10 runs on the `software-factory` boxd VM (target repo:
@@ -73,7 +88,10 @@ don't push it ahead of the mechanical fixes, which are cheaper and land sooner.
 ### Scope decisions: Playwright out, Sentry out
 
 - **Playwright belongs to a future tester agent, not the main factory.** It must not be
-  installed or run inside a factory run, and the golden must not warm the browser cache. The
+  installed or run inside a factory run, and the golden must not warm the browser cache.
+  *(2026-11-02: that tester is now browser acceptance — `control/accept.py`, booting its own
+  `golden-tester` image that no build or review can resolve onto. The rule above still holds
+  for every other run.)* The
   repo's e2e suite and its CI step stay — CI is where that coverage comes from for now.
 - **Sentry gets removed.** Joost is building his own telemetry layer to give insight into the
   logs, so a third-party error tracker is redundant. `pino` and the structured logging stay;
