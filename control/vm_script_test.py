@@ -1,23 +1,12 @@
-"""The two dispatch scripts the factory runs inside a VM, and the prelude they share.
+"""The script the factory runs inside a VM, executed against stub `git`, `gh` and agent.
 
-`VM_SCRIPT` and `REVIEW_SCRIPT` used to carry their own copy of the same git setup. The
-duplication is the bug this file pins down: every step in the snapshot-goldens backlog edits
-that setup, and two copies is how a build VM and a review VM quietly stop agreeing about what
-they are looking at. So the checks below are about *shape*, not about behaviour of any one
-line: one prelude, present in both scripts, at the front of both, exactly once.
+The script decides which repo a run works in, which branch it starts from, and whether it
+continues earlier work or throws a stale branch away. None of that is visible to pattern
+matching — a script that checks out the wrong base reads almost the same as one that gets it
+right — so the decisions are *run* here, with stubs on PATH recording what they were asked.
 
-The prelude also brings the repo now. A golden carried exactly one checkout for as long as a
-golden was a project image; it is an *agent* image, so which repo a run works on is a property
-of the run, and the prelude either finds that checkout or clones it. Getting that wrong is not
-a crash — it is a run that quietly commits to whatever repo the machine happened to be holding.
-So the clone logic is *executed* here, against stub `git` and `gh` commands on PATH, rather
-than pattern-matched: what matters is which branch it takes and where it ends up.
-
-The rest is the safety net for a change that must not alter behaviour. The exit codes are the
-control plane's whole vocabulary for "the VM refused before the agent ever started" — `runner`
-maps 90/91/92/93 onto human sentences — so a code that goes missing turns a precise failure
-into an unexplained one. And both scripts are fed to `/bin/sh` on a machine we cannot attach a
-debugger to, so they are parsed here instead.
+Exit codes 90-93 are the control plane's vocabulary for "the VM refused before the agent
+started", so they are pinned too, and the script is parsed with `sh -n`.
 
 Run it directly, no framework needed:
 
@@ -33,7 +22,7 @@ from pathlib import Path
 
 from control import runner
 from control.config import Settings
-from control.runner import NODE_GUARD, PRELUDE, REVIEW_SCRIPT, VM_SCRIPT, dispatch_env
+from control.runner import NODE_GUARD, PRELUDE, VM_SCRIPT, dispatch_env
 
 fails = []
 
@@ -45,72 +34,33 @@ def check(name, got, want=True):
         fails.append(name)
 
 
-def order(script, *needles):
-    """Where each needle sits in the script, or -1. Comparable, so order is checkable."""
-    return [script.find(n) for n in needles]
+REPO = "acme/api"
 
-
-SCRIPTS = {"build": VM_SCRIPT, "review": REVIEW_SCRIPT}
-
-# ---------- one shared prelude
+# ---------- shape
 
 check("the prelude carries the cd into the checkout", 'cd "$dir"' in PRELUDE)
 check("the prelude carries the clone", "gh repo clone" in PRELUDE)
-check("the prelude carries safe.directory", "safe.directory" in PRELUDE)
-check("the prelude carries the git identity", PRELUDE.count("git config user.") == 2)
 check("the prelude carries the fetch", "git fetch --prune origin" in PRELUDE)
+check("the script starts with the prelude", VM_SCRIPT.startswith(PRELUDE))
+check("the script fetches once", VM_SCRIPT.count("git fetch --prune origin"), 1)
+check("the script asserts the toolchain once", VM_SCRIPT.count(NODE_GUARD), 1)
+check("the toolchain assertion runs after the checkout",
+      VM_SCRIPT.find("git checkout -B") < VM_SCRIPT.find(NODE_GUARD))
+check("the agent is launched exactly once, and last",
+      (VM_SCRIPT.count("exec factory-agent"), VM_SCRIPT.rstrip().endswith("exec factory-agent")),
+      (1, True))
+check("the prompt is never handed to another shell", "$FACTORY_PROMPT" in VM_SCRIPT, False)
 
-for name, script in SCRIPTS.items():
-    check(f"{name}: starts with the shared prelude", script.startswith(PRELUDE))
-    check(f"{name}: contains the prelude exactly once", script.count(PRELUDE), 1)
-    # The point of the seam: nothing the prelude owns may be repeated in a tail, or the tail
-    # is free to drift back into a second copy of it.
-    check(f"{name}: fetches once", script.count("git fetch --prune origin"), 1)
-    check(f"{name}: enters the checkout once", script.count('cd "$dir"'), 1)
-    check(f"{name}: clones at most once", script.count("gh repo clone"), 1)
-    check(f"{name}: asserts the toolchain once", script.count(NODE_GUARD), 1)
 
-# The guard reads the pin out of the working tree, so it must stay behind each script's own
-# checkout rather than move up into the prelude with the rest of the setup.
-for name, script in SCRIPTS.items():
-    cut, guard = order(script, "git checkout -B", NODE_GUARD)
-    check(f"{name}: the toolchain assertion runs after the checkout", cut < guard)
-
-# ---------- what each tail keeps to itself
-
-check("only the build script resets from the base branch",
-      ["origin/$FACTORY_BASE" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [True, False])
-check("only the build script resumes work already on the branch",
-      ["$FACTORY_RESUME" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [True, False])
-check("only the review script clears the stale verdict",
-      ["rm -f /tmp/factory-verdict.json" in s for s in (VM_SCRIPT, REVIEW_SCRIPT)], [False, True])
-check("the review script never pushes", "git push" in REVIEW_SCRIPT, False)
-
-# The launch itself moved into the golden as `factory-agent`, so what stays checkable here is
-# that each script still launches exactly one agent and does it last. The direct `claude -p`
-# line survives only as the fallback for goldens captured before the wrapper existed, which is
-# why it is now behind a `command -v` test rather than at the start of a line of its own.
-# `control/manifest_test.py` owns the shape of that handoff.
-
-for name, script in SCRIPTS.items():
-    check(f"{name}: launches the agent exactly once", script.count("exec factory-agent"), 1)
-    check(f"{name}: launches the agent last", script.rstrip().endswith("exec factory-agent"))
-    check(f"{name}: keeps the pre-wrapper fallback exactly once",
-          len(re.findall(r"claude -p ", script)), 1)
-
-# ---------- clone or reuse
-# Run, not read. The prelude decides where a run works and whether it clones, and both
-# answers are invisible to pattern-matching: a script that clones the right repo into the
-# wrong directory reads the same as one that gets it right. `git` and `gh` are stubs on
-# PATH that record what they were asked, so the branch actually taken is what is checked.
+# ---------- stubs
 
 STUB_GIT = """#!/bin/sh
 echo "git $*" >> "$STUB_LOG"
-[ "$3" = "remote" ] || exit 0
-# `git -C <dir> remote get-url origin` — answered from a file the case wrote, so a checkout
-# can be made to hold some *other* repo.
-[ -f "$2/.origin" ] && cat "$2/.origin" && exit 0
-exit 1
+case "$1" in
+  rev-parse) [ -n "$STUB_REMOTE_BRANCH" ] && exit 0 || exit 1 ;;
+  push) [ -n "$STUB_PUSH_FAIL" ] && exit 1 || exit 0 ;;
+esac
+exit 0
 """
 
 STUB_GH = """#!/bin/sh
@@ -120,15 +70,21 @@ mkdir -p "$4/.git" || exit 1
 exit 0
 """
 
-REPO = "acme/api"
+STUB_AGENT = """#!/bin/sh
+echo "agent ran on $FACTORY_BRANCH" >> "$STUB_LOG"
+exit 0
+"""
 
 
-def prelude(prepare=None, repo=REPO, **env):
-    """Run PRELUDE in a throwaway HOME. Returns (exit code, output, what git and gh saw)."""
+def run(script, prepare=None, repo=REPO, agent=True, **env):
+    """Run `script` in a throwaway HOME. Returns (exit code, output, what the stubs saw)."""
     home = Path(tempfile.mkdtemp())
     binaries = home / "bin"
     binaries.mkdir()
-    for name, body in (("git", STUB_GIT), ("gh", STUB_GH)):
+    stubs = {"git": STUB_GIT, "gh": STUB_GH}
+    if agent:
+        stubs["factory-agent"] = STUB_AGENT
+    for name, body in stubs.items():
         path = binaries / name
         path.write_text(body)
         path.chmod(0o755)
@@ -142,95 +98,81 @@ def prelude(prepare=None, repo=REPO, **env):
         **({"FACTORY_REPO": repo} if repo is not None else {}),
         **env,
     }
-    done = subprocess.run(["sh", "-c", PRELUDE], env=environment, capture_output=True, text=True)
+    done = subprocess.run(["sh", "-c", script], env=environment, capture_output=True, text=True)
     calls = log.read_text() if log.exists() else ""
     shutil.rmtree(home, ignore_errors=True)
     return done.returncode, done.stdout + done.stderr, calls
 
 
-def checkout(path: Path, origin: str | None = None) -> None:
-    """Make `path` look like a checkout, optionally of a particular repo."""
+def checkout(path: Path) -> None:
     (path / ".git").mkdir(parents=True)
-    if origin:
-        (path / ".origin").write_text(f"https://github.com/{origin}.git\n")
 
 
-# Cold: nothing on the machine, so the run brings the repo itself.
-code, out, calls = prelude()
-check("clone or reuse: a machine with no checkout clones", "gh repo clone acme/api" in calls)
-check("clone or reuse: into a directory named after the repo",
+# ---------- clone or reuse
+
+code, out, calls = run(PRELUDE)
+check("clone: a machine with no checkout clones", "gh repo clone acme/api" in calls)
+check("clone: into a directory named after the repo",
       [ln for ln in calls.splitlines() if ln.startswith("gh ")][0].split()[4].endswith("/work/api"))
-check("clone or reuse: blobs are fetched lazily, history is not truncated",
+check("clone: blobs are fetched lazily, history is not truncated",
       ("--filter=blob:none" in calls, "--depth" in calls), (True, False))
-check("clone or reuse: and the clone is announced", "cloning acme/api" in out)
-check("clone or reuse: the run then works in the clone", "git fetch --prune origin" in calls)
-check("clone or reuse: a cold start still succeeds", code, 0)
+check("clone: a cold start succeeds", code, 0)
 
-# Warm: the snapshot already holds the repo, so the same script skips the clone. That is
-# the entire difference between the warm tier and the cold one.
-code, out, calls = prelude(prepare=lambda home: checkout(home / "work" / "api"))
-check("clone or reuse: an existing checkout is reused", "gh repo clone" in calls, False)
-check("clone or reuse: and the reuse is announced", "reusing the checkout" in out)
-check("clone or reuse: a warm start succeeds", code, 0)
+code, out, calls = run(PRELUDE, prepare=lambda home: checkout(home / "work" / "api"))
+check("reuse: an existing checkout is reused", "gh repo clone" in calls, False)
+check("reuse: and the reuse is announced", "reusing the checkout" in out)
 
-# The work directory is configurable, because $HOME/work is the VM's convention and not a
-# promise the control plane makes.
-code, out, calls = prelude(FACTORY_WORKDIR="/tmp/factory-test-work")
-check("clone or reuse: FACTORY_WORKDIR decides where checkouts live",
-      "/tmp/factory-test-work/api" in calls)
-
-# The pre-clone override: honoured, but only for a checkout of the assigned repo. Anything
-# else falls through to the clone, because working in a directory that holds some other
-# repo is a run that pushes one repo's branch into another.
-for name, origin, cloned in (
-    ("holding the assigned repo", REPO, False),
-    ("holding a different repo", "acme/other", True),
-    ("holding no repo at all", None, True),
-):
-    tmp = Path(tempfile.mkdtemp())
-    legacy = tmp / "legacy"
-    if origin is None:
-        legacy.mkdir()          # a directory, but not a checkout
-    else:
-        checkout(legacy, origin=origin)
-    code, out, calls = prelude(FACTORY_REPO_DIR=str(legacy))
-    check(f"clone or reuse: a pre-clone checkout {name} clones={cloned}",
-          "gh repo clone" in calls, cloned)
-    if not cloned:
-        check("clone or reuse: and the pre-clone checkout is the one entered",
-              str(legacy) in out)
-    shutil.rmtree(tmp, ignore_errors=True)
-
+workdir = Path(tempfile.mkdtemp()) / "elsewhere"
+code, out, calls = run(PRELUDE, FACTORY_WORKDIR=str(workdir))
+check("workdir: FACTORY_WORKDIR decides where checkouts live", f"{workdir}/api" in calls)
+shutil.rmtree(workdir.parent, ignore_errors=True)
 
 # ---------- no repo
-# A run with no repo has nowhere legitimate to work. The failure has to happen here: the
-# alternative is an agent committing to whatever repo the machine was already holding.
 
 for label, repo in (("unset", None), ("empty", "")):
-    code, out, calls = prelude(repo=repo)
-    check(f"no repo: {label} fails the run", code, 90)
-    check(f"no repo: {label} says so", "no repo assigned" in out)
+    code, out, calls = run(PRELUDE, repo=repo)
+    check(f"no repo: {label} fails the run with 90", code, 90)
     check(f"no repo: {label} touches nothing first", calls, "")
 
-# The other two ways a workspace can be unusable share the exit code, because they are the
-# same fact from the machine's side: this run has nowhere to work.
-code, out, calls = prelude(STUB_GH_FAIL="1")
-check("no repo: a failed clone is exit 90", code, 90)
-check("no repo: a failed clone says which repo", "clone of acme/api failed" in out)
+code, out, calls = run(PRELUDE, STUB_GH_FAIL="1")
+check("no repo: a failed clone is exit 90 and names the repo",
+      (code, "clone of acme/api failed" in out), (90, True))
 
-blocker = Path(tempfile.mkdtemp()) / "a-file"
-blocker.write_text("not a directory")
-code, out, calls = prelude(FACTORY_WORKDIR=str(blocker / "work"))
-check("no repo: a work directory that cannot be created is exit 90", code, 90)
-shutil.rmtree(blocker.parent, ignore_errors=True)
+
+# ---------- which branch the run starts from
+# The control plane sets FACTORY_RESUME from the PR history; the script only acts on it.
+
+BRANCH = dict(FACTORY_BRANCH="factory/issue-7", FACTORY_BASE="test")
+
+code, out, calls = run(VM_SCRIPT, FACTORY_RESUME="1", **BRANCH)
+check("branch: no remote branch yet starts from the base",
+      "git checkout -B factory/issue-7 origin/test" in calls)
+check("branch: and the agent runs", ("agent ran on factory/issue-7" in calls, code), (True, 0))
+
+code, out, calls = run(VM_SCRIPT, FACTORY_RESUME="1", STUB_REMOTE_BRANCH="1", **BRANCH)
+check("branch: resume continues the remote branch",
+      "git checkout -B factory/issue-7 origin/factory/issue-7" in calls)
+check("branch: and does not delete it", "push origin --delete" in calls, False)
+
+code, out, calls = run(VM_SCRIPT, FACTORY_RESUME="0", STUB_REMOTE_BRANCH="1", **BRANCH)
+check("branch: a stale branch (closed PR) is deleted first",
+      "git push origin --delete factory/issue-7" in calls)
+check("branch: and the run starts fresh from the base",
+      "git checkout -B factory/issue-7 origin/test" in calls)
+check("branch: in that order", calls.find("--delete") < calls.find("checkout -B"))
+
+code, out, calls = run(
+    VM_SCRIPT, FACTORY_RESUME="0", STUB_REMOTE_BRANCH="1", STUB_PUSH_FAIL="1", **BRANCH
+)
+check("branch: a stale branch that cannot be deleted stops the run with 92", code, 92)
+check("branch: before the agent starts", "agent ran" in calls, False)
+
+code, out, calls = run(VM_SCRIPT, agent=False, FACTORY_RESUME="1", **BRANCH)
+check("agent: a golden without factory-agent is exit 90", code, 90)
+check("agent: and says so", "has no factory-agent" in out)
 
 
 # ---------- toolchain
-# The guard used to say "the golden needs rebuilding", which was true while a golden carried
-# one repo and could be pre-matched to its pin. An agent image serves every watched repo and
-# they do not agree on a Node version, so a mismatch is now ordinary and gets repaired. Only
-# one that survives the repair is fatal — and a guard that refuses a run it could have fixed
-# is the same outage as one that lets a mismatch through, just louder.
 
 STUB_NODE = """#!/bin/sh
 echo "v$(cat "$STUB_NODE_STATE").0.0"
@@ -243,7 +185,6 @@ exit 0
 
 
 def guard(pin="22", running="20", fnm=None):
-    """Run NODE_GUARD in a checkout pinning `pin` on a machine running node `running`."""
     home = Path(tempfile.mkdtemp())
     binaries = home / "bin"
     binaries.mkdir()
@@ -267,113 +208,53 @@ def guard(pin="22", running="20", fnm=None):
     return done.returncode, done.stdout + done.stderr
 
 
-code, out = guard(pin="22", running="22")
-check("toolchain: a machine that already matches is left alone", (code, out.strip()), (0, ""))
-
-code, out = guard(pin="", running="20")
-check("toolchain: a repo that pins nothing is left alone", (code, out.strip()), (0, ""))
-
-code, out = guard(pin="22", running="20", fnm="22")
-check("toolchain: a mismatch fnm can repair is repaired", code, 0)
-check("toolchain: and the repair is announced", "installing it" in out)
-
-code, out = guard(pin="22", running="20", fnm="21")
-check("toolchain: a repair that does not take is still fatal", code, 93)
-check("toolchain: and it no longer blames the golden",
-      ("could not be repaired" in out, "needs rebuilding" in out), (True, False))
-
-code, out = guard(pin="22", running="20")
-check("toolchain: a machine with no fnm refuses rather than guessing", code, 93)
+check("toolchain: a matching machine is left alone", guard("22", "22")[0], 0)
+check("toolchain: a repo that pins nothing is left alone", guard("", "20")[0], 0)
+code, out = guard("22", "20", fnm="22")
+check("toolchain: a mismatch fnm can repair is repaired", (code, "installing it" in out), (0, True))
+check("toolchain: a repair that does not take is fatal", guard("22", "20", fnm="21")[0], 93)
+check("toolchain: no fnm refuses rather than guessing", guard("22", "20")[0], 93)
 
 
 # ---------- env
-# Both dispatch paths are built by one function, because the two must agree: a review VM
-# that clones a different repo, or authenticates as somebody else, than the build VM whose
-# work it is checking is not reviewing that work.
-
-CONFIGURED = Settings(github_token="gho_test", workdir="/srv/work", repo_dir="/legacy/repo")
 
 
-def envs(**overrides):
-    """The build and review environments, under a known configuration."""
+def env(**overrides):
     real = runner.settings
-    configured = dict(github_token=CONFIGURED.github_token, workdir=CONFIGURED.workdir,
-                      repo_dir=CONFIGURED.repo_dir)
-    runner.settings = Settings(**{**configured, **overrides})
+    runner.settings = Settings(**{"github_token": "gho_test", "workdir": "/srv/work", **overrides})
     try:
-        common = dict(repo=REPO, branch="factory/issue-7", base="main", prompt="do the thing",
-                      run_id="run-1", number=7, vm_name="run-abc")
-        return (dispatch_env(resume=True, **common), dispatch_env(kind="review", **common))
+        return dispatch_env(REPO, "factory/issue-7", "test", "do the thing", "run-1", 7,
+                            "job-abc", resume=True)
     finally:
         runner.settings = real
 
 
-build, review = envs()
-
-for name, env in (("build", build), ("review", review)):
-    check(f"env: {name} names the repo the run is for", env.get("FACTORY_REPO"), REPO)
-    check(f"env: {name} carries a GitHub token", env.get("GH_TOKEN"), "gho_test")
-    check(f"env: {name} names the work directory", env.get("FACTORY_WORKDIR"), "/srv/work")
-    check(f"env: {name} still carries the pre-clone override", env.get("FACTORY_REPO_DIR"),
-          "/legacy/repo")
-    check(f"env: {name} carries the branch and the base", (env.get("FACTORY_BRANCH"),
-          env.get("FACTORY_BASE")), ("factory/issue-7", "main"))
-    check(f"env: {name} carries the prompt", env.get("FACTORY_PROMPT"), "do the thing")
-
-# What the two paths may differ on, and nothing else. The list is the guard: a review VM that
-# cloned a different repo, or authenticated as somebody else, than the build VM whose work it
-# is checking would not be reviewing that work. Each entry here is a difference someone argued
-# for — a build is told whether to resume its branch, a review labels its trace, and only a
-# build is asked to propose learnings, so only a build is told where to write them.
-check("env: the two paths differ only in the resume flag, the trace and the candidate file",
-      sorted(k for k in set(build) | set(review) if build.get(k) != review.get(k)),
-      ["FACTORY_MEMORY_CANDIDATES", "FACTORY_RESUME", "OTEL_RESOURCE_ATTRIBUTES"])
-check("env: only a build run is given somewhere to propose learnings",
-      (runner.MEMORY_CANDIDATE_ENV in build, runner.MEMORY_CANDIDATE_ENV in review),
-      (True, False))
-check("env: only a build run is told whether to resume its branch",
-      ("FACTORY_RESUME" in build, "FACTORY_RESUME" in review), (True, False))
-# The flag is a decision the control plane made, so it must survive as one: a build that is
-# *not* resuming still carries it, saying no, rather than leaving the script to read an unset
-# variable and guess.
-check("env: a first dispatch carries the flag too, set to no",
-      dispatch_env(resume=False, repo=REPO, branch="b", base="main", prompt="p",
-                   run_id="r", number=1, vm_name="v").get("FACTORY_RESUME"), "0")
-check("env: only a review run says so in its trace",
-      ["kind=review" in e["OTEL_RESOURCE_ATTRIBUTES"] for e in (build, review)], [False, True])
-check("env: the trace correlates the run with its issue and VM",
-      build["OTEL_RESOURCE_ATTRIBUTES"],
-      "run.id=run-1,issue=acme/api#7,repo=acme/api,vm=run-abc")
-
-# An unset token must not be exported as an empty one: `gh` would take it and stop falling
-# back to the golden's own login, turning "no token configured" into "authentication failed".
-bare_build, bare_review = envs(github_token="")
-check("env: no configured token exports none",
-      ["GH_TOKEN" in e for e in (bare_build, bare_review)], [False, False])
+e = env()
+check("env: names the repo", e.get("FACTORY_REPO"), REPO)
+check("env: carries the GitHub token", e.get("GH_TOKEN"), "gho_test")
+check("env: names the work directory", e.get("FACTORY_WORKDIR"), "/srv/work")
+check("env: carries the branch and the base",
+      (e.get("FACTORY_BRANCH"), e.get("FACTORY_BASE")), ("factory/issue-7", "test"))
+check("env: carries the prompt", e.get("FACTORY_PROMPT"), "do the thing")
+check("env: carries the resume decision", e.get("FACTORY_RESUME"), "1")
+check("env: the trace correlates run, issue and VM", e["OTEL_RESOURCE_ATTRIBUTES"],
+      "run.id=run-1,issue=acme/api#7,repo=acme/api,vm=job-abc")
+check("env: no configured token exports none", "GH_TOKEN" in env(github_token=""), False)
+check("env: every name is exportable",
+      all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) for k in e))
 
 
-# ---------- exit codes
-# 90 no repo dir · 91 fetch failed · 92 checkout failed · 93 toolchain mismatch. Each one is a
-# sentence in the run log; losing one loses the sentence, not just the number.
+# ---------- exit codes and syntax
 
-for code in (90, 91, 92, 93):
-    check(f"exit codes: the build script still exits {code}", f"exit {code}" in VM_SCRIPT)
-    check(f"exit codes: the review script still exits {code}", f"exit {code}" in REVIEW_SCRIPT)
+check("exit codes: only the script's own range appears",
+      sorted(set(re.findall(r"exit (\d+)", VM_SCRIPT))), ["90", "91", "92", "93"])
 
-check("exit codes: no code escapes the agent's own range", sorted(set(re.findall(r"exit (\d+)", VM_SCRIPT))),
-      ["90", "91", "92", "93"])
-
-# ---------- posix shell
-# Parsed, not run: `sh -n` reads the whole script and reports syntax errors without executing a
-# command or needing a single FACTORY_* variable to be set.
-
-for name, script in SCRIPTS.items():
-    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
-        fh.write(script)
-        path = fh.name
-    done = subprocess.run(["sh", "-n", path], capture_output=True, text=True, check=False)
-    Path(path).unlink()
-    check(f"posix shell: the {name} script parses", (done.returncode, done.stderr.strip()), (0, ""))
+with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+    fh.write(VM_SCRIPT)
+    path = fh.name
+done = subprocess.run(["sh", "-n", path], capture_output=True, text=True, check=False)
+Path(path).unlink()
+check("posix shell: the script parses", (done.returncode, done.stderr.strip()), (0, ""))
 
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")

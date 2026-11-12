@@ -101,22 +101,25 @@ CREATE TABLE IF NOT EXISTS model_prices (
 );
 """
 
-# Published list prices per million tokens, as of 2026-08-17. Cache rates are the
-# documented multiples of the input rate: reads 0.1x, 5-minute writes 1.25x, 1-hour
-# writes 2x. This table is ours to edit — it is the reason cost is a join rather than a
-# column, and the reason a run on a flat-rate subscription can still be priced honestly
-# against what the same work would have cost metered.
+# Published list prices per million tokens. Cache writes are 1.25x input (5-minute) and 2x
+# (1-hour) on every model; cache reads are a per-model fraction of input — 0.1x on most, 0.05x
+# on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1 and 5.2 — so each row states its own.
+# This table is ours to edit — it is the reason cost is a join rather than a column, and the
+# reason a run on a flat-rate subscription can still be priced against metered rates.
 #
-# `valid_from` is what makes a price change non-destructive: add a row, never edit one,
-# and historical runs keep costing what they cost. Claude Sonnet 5's introductory rate
-# is the worked example — it reverts on 2026-09-01, and both rows live here today.
+# `valid_from` is what makes a price change non-destructive: add a row, never edit one, and
+# historical runs keep costing what they cost. A model with no row here prices at 0 in every
+# derived figure; `usage_for_run` reports such calls as `unpriced_calls` so that is visible.
 SEED_PRICES: tuple[tuple, ...] = (
     # model, valid_from, in, out, cache_read, cache_write_5m, cache_write_1h
+    ("claude-opus-5-5", "2026-01-01", 4.00, 20.00, 0.20, 5.00, 8.00),
     ("claude-opus-5", "2026-01-01", 5.00, 25.00, 0.50, 6.25, 10.00),
     ("claude-opus-4-8", "2026-01-01", 5.00, 25.00, 0.50, 6.25, 10.00),
     ("claude-opus-4-7", "2026-01-01", 5.00, 25.00, 0.50, 6.25, 10.00),
     ("claude-opus-4-6", "2026-01-01", 5.00, 25.00, 0.50, 6.25, 10.00),
     ("claude-opus-4-5", "2026-01-01", 5.00, 25.00, 0.50, 6.25, 10.00),
+    ("claude-fable-5-2", "2026-01-01", 8.00, 40.00, 0.20, 10.00, 16.00),
+    ("claude-fable-5-1", "2026-01-01", 10.00, 50.00, 0.25, 12.50, 20.00),
     ("claude-fable-5", "2026-01-01", 10.00, 50.00, 1.00, 12.50, 20.00),
     # Standard rates, not the published introductory $2/$10. Checked against 37 real
     # runs on 2026-08-17: with token counts matching the runtime exactly, the intro rate
@@ -124,7 +127,11 @@ SEED_PRICES: tuple[tuple, ...] = (
     # a few percent. Whatever the intro pricing applies to, it is not what these runs
     # were charged — so the table records what was observed, not what was advertised.
     ("claude-sonnet-5", "2026-01-01", 3.00, 15.00, 0.30, 3.75, 6.00),
+    ("claude-sonnet-5-5", "2026-01-01", 2.00, 10.00, 0.10, 2.50, 4.00),
     ("claude-sonnet-4-6", "2026-01-01", 3.00, 15.00, 0.30, 3.75, 6.00),
+    # Prompts up to 100K tokens; longer prompts bill $0.50 / $2.50, which a flat row cannot
+    # express, so very long Haiku 5.5 prompts are under-priced here.
+    ("claude-haiku-5-5", "2026-01-01", 0.10, 0.50, 0.01, 0.125, 0.20),
     ("claude-haiku-4-5", "2026-01-01", 1.00, 5.00, 0.10, 1.25, 2.00),
 )
 
@@ -179,46 +186,63 @@ async def init() -> None:
 
 async def write(rows: Sequence[LlmCall | ToolCall]) -> None:
     """Persist a batch. Called often and mid-run, which is the entire design."""
-    llm = [r for r in rows if isinstance(r, LlmCall)]
-    tools = [r for r in rows if isinstance(r, ToolCall)]
-    if not llm and not tools:
+    if not rows:
         return
     async with connect() as conn:
-        if llm:
-            await conn.executemany(
-                """INSERT INTO llm_calls
-                   (run_id, turn, ts, model, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
-                    parent_call_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                # Canonicalised on the way in, so the price join is a plain equality and
-                # every spelling of a model rolls up to one row in the by-model views.
-                [
-                    (
-                        r.run_id, r.turn, r.ts, canonical_model(r.model), r.input_tokens,
-                        r.output_tokens, r.cache_read_tokens, r.cache_write_5m_tokens,
-                        r.cache_write_1h_tokens, r.parent_call_id,
-                    )
-                    for r in llm
-                ],
-            )
-        if tools:
-            # REPLACE keyed on the runtime's own tool-use id, so replaying a transcript
-            # over rows the live stream already wrote converges instead of duplicating.
-            await conn.executemany(
-                """INSERT OR REPLACE INTO tool_calls
-                   (id, run_id, turn, ts, tool, ok, duration_ms, error, detail,
-                    parent_call_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    (
-                        r.id, r.run_id, r.turn, r.ts, r.tool, int(r.ok), r.duration_ms,
-                        r.error, r.detail, r.parent_call_id,
-                    )
-                    for r in tools
-                ],
-            )
+        await _insert(conn, rows)
         await conn.commit()
+
+
+async def replace_calls(run_id: str, rows: Sequence[LlmCall | ToolCall]) -> None:
+    """Swap a run's model and tool calls for `rows`, in one transaction. What a replay does.
+
+    Only the tables a transcript replay can rebuild. Memory and skill receipts are written by
+    the live stream alone, so clearing them here would delete history nothing can restore.
+    """
+    async with connect() as conn:
+        await conn.execute("DELETE FROM llm_calls WHERE run_id = ?", (run_id,))
+        await conn.execute("DELETE FROM tool_calls WHERE run_id = ?", (run_id,))
+        await _insert(conn, rows)
+        await conn.commit()
+
+
+async def _insert(conn, rows: Sequence[LlmCall | ToolCall]) -> None:
+    llm = [r for r in rows if isinstance(r, LlmCall)]
+    tools = [r for r in rows if isinstance(r, ToolCall)]
+    if llm:
+        await conn.executemany(
+            """INSERT INTO llm_calls
+               (run_id, turn, ts, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+                parent_call_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            # Canonicalised on the way in, so the price join is a plain equality and
+            # every spelling of a model rolls up to one row in the by-model views.
+            [
+                (
+                    r.run_id, r.turn, r.ts, canonical_model(r.model), r.input_tokens,
+                    r.output_tokens, r.cache_read_tokens, r.cache_write_5m_tokens,
+                    r.cache_write_1h_tokens, r.parent_call_id,
+                )
+                for r in llm
+            ],
+        )
+    if tools:
+        # REPLACE keyed on the runtime's own tool-use id, so replaying a transcript
+        # over rows the live stream already wrote converges instead of duplicating.
+        await conn.executemany(
+            """INSERT OR REPLACE INTO tool_calls
+               (id, run_id, turn, ts, tool, ok, duration_ms, error, detail,
+                parent_call_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    r.id, r.run_id, r.turn, r.ts, r.tool, int(r.ok), r.duration_ms,
+                    r.error, r.detail, r.parent_call_id,
+                )
+                for r in tools
+            ],
+        )
 
 
 async def clear_run(run_id: str) -> None:
@@ -444,7 +468,8 @@ async def usage_for_run(run_id: str) -> dict:
                COALESCE(SUM(c.cache_read_tokens), 0)     AS cache_read_tokens,
                COALESCE(SUM(c.cache_write_5m_tokens
                           + c.cache_write_1h_tokens), 0) AS cache_write_tokens,
-               COALESCE(SUM({COST_SQL}), 0)              AS derived_cost_usd
+               COALESCE(SUM({COST_SQL}), 0)              AS derived_cost_usd,
+               COALESCE(SUM(p.model IS NULL), 0)         AS unpriced_calls
         {PRICE_JOIN}
         WHERE c.run_id = ?
         """,
@@ -454,7 +479,8 @@ async def usage_for_run(run_id: str) -> dict:
         f"""
         SELECT c.model,
                COUNT(*) AS calls,
-               COALESCE(SUM({COST_SQL}), 0) AS derived_cost_usd
+               COALESCE(SUM({COST_SQL}), 0) AS derived_cost_usd,
+               MAX(p.model IS NOT NULL) AS priced
         {PRICE_JOIN}
         WHERE c.run_id = ?
         GROUP BY c.model ORDER BY derived_cost_usd DESC
@@ -598,12 +624,12 @@ async def skill_loads_by_repo(since: str | None = None) -> list[dict]:
 
 
 async def unit_economics() -> list[dict]:
-    """Cost per issue, and how much of it landed.
+    """Cost per issue, and how much of it produced a pull request.
 
-    The number the old ledger could not produce. An issue is the unit of work, not a
-    run: a single issue may cost a build, two retries, a review and a fix, and only the
-    sum of those divided by outcomes that actually merged is the factory's unit price.
-    `wasted` is the same figure from the other side — spend on runs that never shipped.
+    An issue is the unit of work, not a run: an issue may take several runs, and the sum of
+    their cost divided by the issues that reached a pull request is the factory's unit price.
+    `wasted` is spend on build runs that ended without one. Only `kind = 'build'` counts:
+    older kinds (review, plan, learn) had no issue of their own and are not waste.
 
     Joins `runs`, which this layer reads and never writes.
     """
@@ -624,6 +650,7 @@ async def unit_economics() -> list[dict]:
                                  THEN rc.cost ELSE 0 END), 0)        AS wasted
         FROM runs r
         LEFT JOIN run_cost rc ON rc.run_id = r.id
+        WHERE r.kind = 'build' AND r.issue_number > 0
         GROUP BY r.repo ORDER BY spend DESC
         """
     )

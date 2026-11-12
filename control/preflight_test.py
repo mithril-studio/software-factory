@@ -1,14 +1,7 @@
-"""Reading a probe's output, and deciding whether a repo may be dispatched to.
+"""Deciding whether a repo may be dispatched to.
 
-Both halves fail quietly if they are wrong: a probe key that stops being parsed reads as
-"absent" rather than as an error, and a verdict that counts the wrong checks says READY about
-a repo nothing can build.
-
-The probe half outlived the probe. `preflight` stopped `exec`ing into goldens when they
-became repo-agnostic snapshots with no checkout to inspect, but `probe.parse` is still how
-any `key=value` round trip is read back, and the parsing bug it guards against — a key the
-script never printed coming back as empty rather than absent — is silent in whichever caller
-comes next.
+A verdict that counts the wrong checks says READY about a repo nothing can build, and fails
+quietly. These pin which answers block and which only warn.
 
 Run it directly, no framework needed:
 
@@ -21,7 +14,6 @@ import httpx
 
 import control.github as gh
 from control.preflight import Check, golden_check, profile_checks, push_check, report
-from control.probe import parse
 
 fails: list[str] = []
 
@@ -32,23 +24,6 @@ def check(name, got, want):
     if not ok:
         fails.append(name)
 
-
-# ---------- the probe's output
-PROBE = """repo_dir=ok
-origin=mithril-studio/legal-ai-app
-branch=main
-head=fe128a9
-dirty=0
-fetch=ok
-behind=0
-skills=boxd memory
-"""
-p = parse(PROBE)
-check("keys and values are split on the first =", p["origin"], "mithril-studio/legal-ai-app")
-check("a value with spaces survives", p["skills"], "boxd memory")
-check("a key the probe never printed is absent, not empty", p.get("gh"), None)
-check("a line with no = is ignored", parse("noise\nk=v\n"), {"k": "v"})
-check("an empty value stays empty rather than becoming a key", parse("behind=\n")["behind"], "")
 
 # ---------- the verdict
 ok_ = Check("a", True, "")
@@ -128,8 +103,8 @@ check("golden: a repo with no golden of its own is ready anyway", cold.ok, True)
 check("golden: and it does not block", cold.fatal, True)
 check("golden: so the repo is reported ready", report(REPO, [cold]), True)
 check("golden: the detail says which tier answered", BASE in cold.detail, True)
-check("golden: and says provisioning is a speed-up rather than a repair",
-      "not a blocker" in cold.detail, True)
+check("golden: and says its runs install for themselves",
+      "install themselves" in cold.detail, True)
 
 check("golden: another repo's warm golden is never borrowed, the base answers instead",
       golden_check("acme/other", [BASE, WARM]).detail.startswith(BASE), True)

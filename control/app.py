@@ -1,9 +1,7 @@
 """FastAPI app: a JSON API plus the built React UI, served from one process.
 
-The API is the contract; the UI in `web/` is a Vite/React/Tailwind/shadcn SPA that consumes
-it and builds to `web/dist`. In production FastAPI serves those static assets and falls back
-to `index.html` for client-side routes. In development, run `vite dev` (it proxies `/api` and
-`/healthz` back here) so the SPA hot-reloads against this same process.
+In production FastAPI serves `web/dist` and falls back to `index.html` for client-side
+routes. In development, run `vite dev`, which proxies `/api` back here.
 """
 
 from __future__ import annotations
@@ -13,6 +11,7 @@ import contextlib
 import json
 import logging
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -22,27 +21,16 @@ from pydantic import BaseModel
 from telemetry import digest as telemetry_digest
 from telemetry import store as telemetry
 
-from . import (
-    accept, agents, auth, db, deploy, github, goldens, plan, poller, preflight, provision,
-    release, repos, runner,
-)
+from . import agents, auth, db, github, poller, preflight, repos, runner
 from .config import ROOT, settings
 
 DIST = ROOT / "web" / "dist"
 
-# Nothing configured logging, so every `log.info` in this package went nowhere. uvicorn sets up
-# its own `uvicorn.*` loggers and leaves the root alone, which is why the access log was the
-# only thing in `var/uvicorn.log` — a poller that halted a repo, a golden refresh that found
-# nothing, a reconciler destroying a leaked VM, all silent. Configured here rather than in each
-# module because a library that configures logging on import steals it from whoever imports it;
-# this module *is* the application.
 logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-# The libraries are noisy at INFO and say nothing about this system. Raise FACTORY_LOG_LEVEL to
-# DEBUG deliberately when the question is about HTTP or the database, not as a default.
 for noisy in ("httpx", "httpcore", "aiosqlite", "urllib3"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -53,20 +41,22 @@ log = logging.getLogger("factory.app")
 async def lifespan(app: FastAPI):
     await db.init()
     await telemetry.init()
-    # Before the poller, and before the first request: everything that asks which repos are
-    # watched reads a cache, and the cache is empty until this has run.
     await repos.seed()
+    # Before the poller: interrupted runs are closed and re-queued, and any VM they left
+    # behind is destroyed, so a re-queued issue never runs beside its predecessor's machine.
+    await runner.recover()
+    try:
+        await runner.reconcile()
+    except Exception:  # noqa: BLE001 - boxd unreachable at boot: the timer sweeps later
+        log.exception("startup reconcile failed")
     poller.start()
-    goldens.start()
     runner.start_reconciler()
-    await release.start()
     try:
         yield
     finally:
         await poller.stop()
-        await goldens.stop()
         await runner.stop_reconciler()
-        await release.stop()
+        await runner.shutdown()
 
 
 app = FastAPI(title="software factory", lifespan=lifespan)
@@ -74,10 +64,33 @@ app = FastAPI(title="software factory", lifespan=lifespan)
 
 # --------------------------------------------------------------------------- auth
 
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def cross_site(request: Request) -> bool:
+    """True for a state-changing request a browser sent from another site.
+
+    The session cookie is `SameSite=Lax`, which does not cover sibling subdomains of a host
+    that is not on the public suffix list (every `*.boxd.sh` machine is "same site"). So a
+    non-GET must come from this origin. Clients that send neither header (curl, the health
+    check) are not browsers and carry no ambient cookie to abuse.
+    """
+    if request.method in SAFE_METHODS:
+        return False
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site and fetch_site not in ("same-origin", "none"):
+        return True
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc != request.headers.get("host", ""):
+        return True
+    return False
+
 
 @app.middleware("http")
 async def require_session(request: Request, call_next):
-    """Gate every /api route behind a valid session cookie, save the auth endpoints."""
+    """Gate every /api route behind a session cookie, and refuse cross-site writes."""
+    if request.url.path.startswith("/api/") and cross_site(request):
+        return JSONResponse({"detail": "cross-site request refused"}, status_code=403)
     if not auth.is_public(request.url.path):
         if not auth.valid_token(request.cookies.get(auth.COOKIE_NAME)):
             return JSONResponse({"detail": "authentication required"}, status_code=401)
@@ -120,11 +133,7 @@ async def api_me(request: Request):
 
 
 async def _available() -> tuple[str, ...]:
-    """Golden snapshot names in the fleet, or nothing if the fleet cannot be reached.
-
-    Best-effort on purpose: this backs advice, and a boxd outage should degrade the advice
-    rather than take the API down with it.
-    """
+    """Golden snapshot names in the fleet, or nothing if the fleet cannot be reached."""
     boxd = runner.client()
     try:
         return await agents.available(boxd)
@@ -136,27 +145,18 @@ async def _available() -> tuple[str, ...]:
 
 @app.get("/api/config")
 async def api_config():
-    """What the shell needs: the repos being watched, limits, and what is wrong.
-
-    Two kinds of wrong, kept apart. `missing` is a setting nobody filled in; `problems` is a
-    configuration that is complete but has nothing to run on — no base image yet. The second
-    question needs the fleet, which is why it lives here (async) and not in
-    `settings.missing()`, which is synchronous and gates starting a run.
-    """
-    available = await _available()
     return {
         "repos": list(repos.watched()),
+        "target_branch": settings.target_branch,
+        "sequential": settings.sequential,
+        "run_budget_eur": settings.run_budget_eur,
         "max_concurrent": settings.max_concurrent,
-        "max_attempts": settings.max_attempts,
         "poll_enabled": settings.poll_enabled,
         "poll_interval": settings.poll_interval,
-        # Whether one stopped issue stops its whole repo. Exposed because it decides whether an
-        # open `agent:failed` is an outage or a single issue somebody will get to: with this on,
-        # the poller dispatches nothing for that repo until a human clears the label, and
-        # `scripts/factory-health.sh` has to be able to tell those two apart.
-        "halt_on_failure": settings.halt_on_failure,
+        # Nothing halts a repo any more: a failed issue is labelled and the queue moves on.
+        "halt_on_failure": False,
         "missing": settings.missing(),
-        "problems": settings.problems(available),
+        "problems": settings.problems(await _available()),
     }
 
 
@@ -164,19 +164,8 @@ async def api_config():
 
 
 @app.get("/api/runs")
-async def api_runs():
-    return await db.list_runs()
-
-
-@app.get("/api/attempts")
-async def api_attempts():
-    """The same runs as `/api/runs`, grouped into the units of work they belong to.
-
-    Both endpoints stay. A phase is still a run and still has its own page; this only answers
-    the other question — what happened to issue #77 on its second cycle — which the flat log
-    could not answer without a human matching timestamps by eye.
-    """
-    return await db.list_attempts()
+async def api_runs(limit: int = 100):
+    return await db.list_runs(min(max(limit, 1), 500))
 
 
 @app.get("/api/runs/{run_id}")
@@ -189,20 +178,11 @@ async def api_run(run_id: str):
 
 @app.get("/api/runs/{run_id}/telemetry")
 async def api_run_telemetry(run_id: str):
-    """Per-call detail for one run: token totals, spend by model, tool time."""
     return await telemetry.usage_for_run(run_id)
 
 
 @app.get("/api/telemetry")
 async def api_telemetry():
-    """The fleet view.
-
-    Five questions the run table alone could not answer: where the money goes by token
-    class, what it is costing over time, which tools eat the wall clock, what a merged
-    pull request actually costs, and whether memory is being read. All derived from the
-    event rows — nothing here
-    is a stored aggregate, so any of it can be re-cut without a migration.
-    """
     return {
         "composition": await telemetry.cost_composition(),
         "spend_by_day": await telemetry.spend_by_day(),
@@ -214,92 +194,29 @@ async def api_telemetry():
 
 @app.get("/api/digest")
 async def api_digest(repo: str | None = None, days: int = 14):
-    """What went wrong lately, ordered by what the improvement loop optimises.
-
-    The same evidence a learning run is handed, served to whoever asks. That is deliberate:
-    the loop must not be the only reader of its own inputs, or the first sign that it is
-    reasoning from a broken query is a proposal nobody can account for.
-
-    `days` is clamped rather than validated. A digest is a bounded document by construction
-    (`telemetry.digest` caps every section and reports what it dropped), so an absurd window
-    is a slow query, not an unsafe one — and refusing it would be the API deciding which
-    questions are worth asking.
-    """
-    return await telemetry_digest.build(repo=repo, days=max(1, min(days, 365)))
+    return await telemetry_digest.build(repo=repo, days=min(max(days, 1), 365))
 
 
 class StartRun(BaseModel):
     repo: str
     issue_number: int
-    # 'build', 'review' (of a pull request a build already opened), 'provision' (warm this
-    # repo's golden), 'plan' (compare the repo against its goal now, without waiting for the
-    # poller's cadence), or 'learn' (read the window's telemetry and propose improvements
-    # now, without waiting for FACTORY_LEARN_EVERY issues to finish). All five are runs on a
-    # restored VM, which is why one endpoint starts any of them. Provision, plan and learn
-    # ignore `issue_number`; there is no issue behind any of them — making issues is what the
-    # plan and learn runs do.
-    kind: str = "build"
-    pr_url: str | None = None
-    branch: str | None = None
-    # For a build: which attempt this is, so `VM_SCRIPT` resumes the branch instead of
-    # resetting it to the base and throwing the previous attempt's commits away. For a
-    # review: which review cycle.
-    attempt: int = 1
-    # Why this attempt is happening, and what the last one produced. The automatic paths — a
-    # retry after a failure, a fix run after a red CI or a reviewer that requested changes —
-    # already carry both into the next prompt (`runner._fix_cycle`, `runner._fail_run`). A run
-    # started by hand had no way to, so resuming an `agent:blocked` issue meant dispatching an
-    # agent onto the branch with "reason not captured" and no idea what it was meant to change.
-    # That made `agent:blocked` a dead end: the label halts the repo, and the only way past it
-    # was to fix the code yourself. With these, a human unblocks an issue by saying what to do.
-    prior_error: str | None = None
-    prior_log: str | None = None
 
 
 @app.post("/api/runs")
 async def api_start_run(body: StartRun):
-    """Start a run. This is the only supported way to dispatch one by hand.
-
-    It matters that this lives in the serving process: a run is an `asyncio` task holding a
-    VM, so a run started from a throwaway script dies with that script — leaving a machine
-    nobody reaps, a row that says `running` forever, and an issue mirroring a state that
-    stopped being true. Anything that needs to start a run talks to this.
-    """
+    """Start a run by hand. Same path as the poller, so the same one-per-repo rule holds."""
     gaps = settings.missing()
     if gaps:
         raise HTTPException(400, f"configuration incomplete: {', '.join(gaps)}")
     repo = body.repo.strip()
+    if repo not in repos.watched():
+        raise HTTPException(400, f"{repo} is not watched")
     try:
-        if body.kind == "review":
-            if not body.pr_url or not body.branch:
-                raise ValueError("a review needs pr_url and branch")
-            run_id = await runner.create_review(
-                repo, body.issue_number, body.pr_url, body.branch, cycle=body.attempt
-            )
-        elif body.kind == "build":
-            run_id = await runner.create(
-                repo,
-                body.issue_number,
-                attempt=body.attempt,
-                prior_error=body.prior_error,
-                prior_log=body.prior_log,
-            )
-        elif body.kind == "provision":
-            run_id = await provision.create(repo)
-        elif body.kind == "plan":
-            run_id = await plan.create(repo)
-        elif body.kind == "learn":
-            # Deliberately not gated on `FACTORY_LEARN`. That switch governs the *poller* —
-            # whether the factory decides on its own to spend money reading its own history.
-            # A human asking for one run now is the same override as hand-starting a build,
-            # and it is what makes the recommended rollout possible: read a cycle or two of
-            # proposals before letting the cadence and the queue label loose.
-            run_id = await runner.create_learn(repo)
-        else:
-            raise ValueError(f"unknown run kind {body.kind!r}")
+        return {"run_id": await runner.create(repo, body.issue_number)}
+    except runner.Busy as exc:
+        raise HTTPException(409, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not start run: {exc}") from exc
-    return {"run_id": run_id}
 
 
 @app.post("/api/runs/{run_id}/cancel")
@@ -308,26 +225,37 @@ async def api_cancel_run(run_id: str):
 
 
 @app.get("/api/runs/{run_id}/stream")
-async def stream_log(run_id: str):
-    """Tail a run's log over SSE until it reaches a terminal state."""
+async def stream_log(run_id: str, request: Request):
+    """Tail a run's log over SSE until the run is terminal.
+
+    Each event's id is the byte offset after it, so a reconnecting EventSource (which sends
+    `Last-Event-ID`) resumes where it left off instead of replaying the whole log.
+    """
     run = await db.get_run(run_id)
     if not run:
         raise HTTPException(404, "no such run")
     path = Path(run["log_path"])
+    try:
+        start = max(int(request.headers.get("last-event-id") or 0), 0)
+    except ValueError:
+        start = 0
 
     async def events():
-        position = 0
+        position = start
         idle = 0
         while True:
             if path.exists():
-                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                with path.open("rb") as handle:
                     handle.seek(position)
                     chunk = handle.read()
-                    position = handle.tell()
-                if chunk:
+                # Only whole lines, so an offset never splits one.
+                cut = chunk.rfind(b"\n") + 1
+                if cut:
                     idle = 0
-                    for line in chunk.splitlines():
-                        yield f"data: {json.dumps(line)}\n\n"
+                    for raw in chunk[:cut].splitlines(keepends=True):
+                        position += len(raw)
+                        line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                        yield f"id: {position}\ndata: {json.dumps(line)}\n\n"
                 else:
                     idle += 1
             current = await db.get_run(run_id)
@@ -343,12 +271,12 @@ async def stream_log(run_id: str):
     )
 
 
-# --------------------------------------------------------------------------- plan / projects
+# --------------------------------------------------------------------------- queue and repos
 
 
 @app.get("/api/issues")
 async def api_issues(repo: str):
-    """Open issues for the new-run picker."""
+    """Open issues for the start-a-run picker."""
     try:
         return await github.list_open_issues(repo)
     except Exception as exc:  # noqa: BLE001
@@ -357,33 +285,15 @@ async def api_issues(repo: str):
 
 @app.get("/api/plan")
 async def api_plan(repo: str | None = None):
-    """The work queue: open issues with their factory state.
-
-    One repo if `repo` is given, otherwise every watched repo, concatenated.
-    """
+    """The queue: open issues with their factory state, for one repo or every watched one."""
     targets = [repo] if repo else list(repos.watched())
     out: list[dict] = []
-    for r in targets:
+    for target in targets:
         try:
-            out.extend(await github.plan(r))
-        except Exception as exc:  # noqa: BLE001 - one bad repo shouldn't blank the page
-            out.append(
-                {
-                    "repo": r,
-                    "number": 0,
-                    "title": f"(could not load: {exc})",
-                    "url": "",
-                    "state": "error",
-                    "labels": [],
-                }
-            )
+            out.extend(await github.plan(target))
+        except Exception as exc:  # noqa: BLE001 - one unreadable repo must not blank the rest
+            log.warning("could not read issues for %s: %r", target, exc)
     return out
-
-
-@app.post("/api/goldens/refresh")
-async def api_goldens_refresh():
-    """Re-list the golden snapshots now, rather than waiting for the next refresh."""
-    return await goldens.refresh()
 
 
 def _checks_json(checks) -> list[dict]:
@@ -392,28 +302,15 @@ def _checks_json(checks) -> list[dict]:
 
 @app.get("/api/github/repos")
 async def api_github_repos():
-    """The repos this deployment's token can see, for the connect picker.
-
-    Never a gate and never a source of truth: connecting a repo takes an `owner/name` string
-    and preflight is what decides whether it can be dispatched to. This only spares the person
-    at the keyboard from typing a slug from memory, so a GitHub outage costs the dropdown and
-    nothing else — the error is returned beside an empty list rather than raised, and the form
-    falls back to free text.
-
-    Archived repos are dropped: they cannot take a pull request, so offering one is offering a
-    repo that will pass preflight and then fail at the end of its first run.
-    """
+    """The repos this token can see, for the connect picker. Never a gate."""
     watched = set(repos.watched())
     try:
         found = await github.list_repos()
     except Exception as exc:  # noqa: BLE001 - the message is what the picker shows
-        log.warning("could not list the token's repos: %r", exc)
         return {"repos": [], "error": f"could not list your GitHub repos: {exc}"}
     return {
         "repos": [
-            {**r, "connected": r["full_name"] in watched}
-            for r in found
-            if not r["archived"]
+            {**r, "connected": r["full_name"] in watched} for r in found if not r["archived"]
         ],
         "error": None,
     }
@@ -421,16 +318,6 @@ async def api_github_repos():
 
 @app.get("/api/preflight")
 async def api_preflight(repo: str):
-    """Whether `repo` is ready to be dispatched to, and a golden exists to boot for it.
-
-    Read-only: it reports, it never repairs. Answers here cost a second; the same answers
-    found during a run cost a VM and forty minutes.
-
-    Shape is validated and GitHub failures are caught, the same way `POST /api/repos` does
-    both. The two used to disagree: this one called `preflight.run` bare, so a typo'd or
-    private repo raised out of `github.default_branch` and the person who mistyped a slug got
-    "Internal Server Error" where the connect button would have told them what was wrong.
-    """
     repo = repo.strip()
     if not repos.valid(repo):
         raise HTTPException(400, f"{repo!r} is not owner/repo")
@@ -451,18 +338,7 @@ class ConnectRepo(BaseModel):
 
 @app.post("/api/repos")
 async def api_connect_repo(body: ConnectRepo):
-    """Watch a repo from now on. The only supported way to connect one.
-
-    Preflight runs first and a blocking failure refuses the connection, with its checks in the
-    response so the caller can say *which* one. That is stricter than it looks: warnings do not
-    block, and "no warm golden yet" is not a failure at all — a repo dispatches onto
-    `golden-copy` and installs for itself, so connecting one never waits on provisioning.
-    What does block is a repo the token cannot read or push to, which would spend a VM and an
-    agent's whole context to discover the same thing.
-
-    Preflight also creates the lifecycle labels on its way through, which makes this the whole
-    of connecting a repo: no restart, no `.env` edit, no shell on the box.
-    """
+    """Watch a repo from now on. A blocking preflight failure refuses the connection."""
     repo = body.repo.strip()
     if not repos.valid(repo):
         raise HTTPException(400, f"{repo!r} is not owner/repo")
@@ -470,7 +346,7 @@ async def api_connect_repo(body: ConnectRepo):
         raise HTTPException(409, f"{repo} is already watched")
     try:
         checks = await preflight.run(repo)
-    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not check {repo}: {exc}") from exc
     blocking = [c for c in checks if not c.ok and c.fatal]
     if blocking:
@@ -482,92 +358,19 @@ async def api_connect_repo(body: ConnectRepo):
             },
         )
     await repos.add(repo)
-    # Warm a golden for it. Best-effort and reported rather than awaited: the repo is
-    # dispatchable the moment it is registered, so provisioning that cannot start is a slower
-    # repo and not a failed connection. A repo that names no `## Setup` command still gets one
-    # — the clone without the install — so `provision_skipped` is now the unusual answer
-    # (a malformed profile, an unreachable GitHub) rather than the ordinary one.
-    provision_run, why = None, None
-    try:
-        provision_run = await provision.create(repo)
-    except Exception as exc:  # noqa: BLE001 - the message is what the caller shows
-        why = str(exc)
-    return {
-        "repo": repo,
-        "checks": _checks_json(checks),
-        "provision_run": provision_run,
-        "provision_skipped": why,
-    }
-
-
-@app.post("/api/repos/{owner}/{name}/golden")
-async def api_provision_golden(owner: str, name: str):
-    """Warm this repo's golden now: restore the base, clone, install, capture, destroy.
-
-    Also how a stale one is refreshed — provisioning always builds from `golden-copy` rather
-    than updating the repo's existing snapshot in place, so re-running this is the repair for a
-    golden that has gone wrong as well as the way to make one.
-    """
-    repo = f"{owner}/{name}"
-    if repo not in repos.watched():
-        raise HTTPException(404, f"{repo} is not watched")
-    try:
-        return {"run_id": await provision.create(repo)}
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, str(exc)) from exc
-
-
-@app.delete("/api/repos/{owner}/{name}/golden")
-async def api_delete_golden(owner: str, name: str):
-    """Delete this repo's golden. Its runs fall back to the base and install for themselves."""
-    repo = f"{owner}/{name}"
-    if repo not in repos.watched():
-        raise HTTPException(404, f"{repo} is not watched")
-    try:
-        return {"repo": repo, "deleted": await provision.unprovision(repo)}
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-# There is deliberately no set-goal endpoint anymore. The goal is `.factory/goal.md`,
-# committed in the repo itself — one file, one source of truth, and the only channel that can
-# carry the images and context a rich goal wants. The poller notices the commit within
-# `plan.GOAL_SYNC_INTERVAL` and arms the loop; nothing about that is an API write.
-
-
-@app.post("/api/repos/{owner}/{name}/replan")
-async def api_replan(owner: str, name: str):
-    """Put a `met` or `stalled` goal back to `active`, so the next dry tick plans again.
-
-    The way past a stall without editing the goal file, and the way to re-open a goal the
-    factory declared met. Re-activating an already-active goal is harmlessly idempotent.
-    """
-    repo = f"{owner}/{name}"
-    try:
-        row = await repos.reactivate(repo)
-    except ValueError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    return {"repo": repo, "goal_state": row.get("goal_state")}
+    return {"repo": repo, "checks": _checks_json(checks)}
 
 
 class RepoSettings(BaseModel):
-    # The integration branch: where runs branch from and merge into. Empty or null reverts to
-    # the repo's GitHub default branch.
+    # Where this repo's pull requests go. Empty or null reverts to FACTORY_TARGET_BRANCH.
     base_branch: str | None = None
 
 
 @app.patch("/api/repos/{owner}/{name}")
 async def api_repo_settings(owner: str, name: str, body: RepoSettings):
-    """Change how the factory works a watched repo. Today that is its integration branch.
-
-    Validated against GitHub before it is stored, so a typo is refused here rather than
-    discovered by the next run's checkout.
-    """
     repo = f"{owner}/{name}"
-    if repo not in repos.watched():
-        raise HTTPException(404, f"{repo} is not watched")
     try:
-        row = await repos.set_base_branch(repo, body.base_branch)
+        row = await repos.set_target_branch(repo, body.base_branch)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"repo": repo, "base_branch": row.get("base_branch")}
@@ -575,12 +378,6 @@ async def api_repo_settings(owner: str, name: str, body: RepoSettings):
 
 @app.delete("/api/repos/{owner}/{name}")
 async def api_disconnect_repo(owner: str, name: str):
-    """Stop watching a repo. Its runs stay — they are the ledger, not the configuration.
-
-    Two path segments rather than one encoded parameter, because `owner/repo` carries a slash
-    and a client that forgets to encode it would otherwise hit a route that does not exist and
-    read the 404 as "already gone".
-    """
     repo = f"{owner}/{name}"
     if not await repos.remove(repo):
         raise HTTPException(404, f"{repo} is not watched")
@@ -590,353 +387,67 @@ async def api_disconnect_repo(owner: str, name: str):
 @app.get("/api/projects")
 async def api_projects():
     """Watched repos with their run tallies and the snapshot their runs boot."""
-    watched = repos.rows()
     stats = await db.stats_by_repo()
-    pending = await db.pending_candidates_by_repo()
-    # Derived the same way a dispatch derives it, rather than by reading a name off a config
-    # value — otherwise this column would say what the repo was configured with where the
-    # fleet views say what would actually boot.
-    boxd = runner.client()
-    try:
-        sources = {r["repo"]: await runner.source_for(boxd, r["repo"]) for r in watched}
-    except Exception:  # noqa: BLE001 - a boxd outage costs a column, not the page
-        sources = {}
-    finally:
-        await boxd.close()
+    available = await _available()
     out = []
-    for row in watched:
+    for row in repos.rows():
         repo = row["repo"]
-        golden = sources.get(repo, "")
+        golden = agents.resolve_snapshot(repo, available) or ""
         s = stats.get(repo, {})
         out.append(
             {
                 "repo": repo,
                 "added_at": row.get("added_at"),
-                # What provisioning a warm golden for this repo did, which is not the same
-                # question as what its runs boot: a repo whose provisioning failed still
-                # dispatches onto the base, so this is a report and never a gate.
-                "provision_status": row.get("provision_status") or "none",
                 "golden": golden,
-                # Whether the snapshot that boots is this repo's own warm tier rather than
-                # the base image. Decided here, where the naming contract lives.
                 "warm": bool(golden) and golden == agents.golden_name(repo),
+                "target_branch": repos.target_branch(repo),
+                "base_branch": row.get("base_branch"),
                 "runs": s.get("runs", 0) or 0,
                 "succeeded": s.get("succeeded", 0) or 0,
                 "failed": s.get("failed", 0) or 0,
                 "active": s.get("active", 0) or 0,
                 "last_run": s.get("last_run"),
-                # Learnings this repo's runs proposed and nobody has decided on yet. Scoped by
-                # `repo`, so one project's queue never shows up under another's.
-                "pending_candidates": pending.get(repo, 0),
-                # The goal loop: non-null means a committed `.factory/goal.md` is the goal,
-                # and this is its blob SHA as of the last sync. `goal_state` is where the
-                # loop stands — `none`, `active`, `met`, or `stalled`. `plan_enabled` rides
-                # along so the UI can say when a goal exists but the loop is switched off.
-                "goal_sha": row.get("goal_sha"),
-                "goal_state": row.get("goal_state") or "none",
-                "plan_stalls": row.get("plan_stalls") or 0,
-                "last_planned_at": row.get("last_planned_at"),
-                "plan_enabled": settings.plan_enabled,
-                # The integration branch, or null when the repo follows its GitHub default.
-                "base_branch": row.get("base_branch"),
             }
         )
     return out
 
 
-# --------------------------------------------------------------------------- memory candidates
-
-# Triage, and only triage. Accepting a candidate says a human read it and thinks it is true;
-# it does not write it into any repository's `.mem/`. Promotion is a separate, deliberate
-# workflow — conflating the two would make the accept button a commit to someone else's repo.
-
-
-def _with_evidence(row: dict) -> dict:
-    """Any row carrying an `evidence` column, with that column decoded back into an object.
-
-    Stored as a JSON string because SQLite has no object column; handing that string to a
-    caller would make every consumer parse it again and one of them would forget.
-
-    Named for the column rather than the table because two tables have one — a memory
-    candidate and an improvement are both "a claim with the runs that back it", and the
-    decoding is the same job in both cases.
-    """
-    out = dict(row)
-    try:
-        out["evidence"] = json.loads(row.get("evidence") or "{}")
-    except (TypeError, ValueError):
-        # Kept verbatim rather than dropped: the original evidence is the point of the row,
-        # and a reviewer looking at something unparseable is better served than one shown
-        # nothing at all.
-        out["evidence"] = {"raw": row.get("evidence")}
-    return out
-
-
-@app.get("/api/memory/candidates")
-async def api_memory_candidates(repo: str | None = None, status: str | None = None):
-    """Pending learnings, oldest first, optionally scoped to one repo and/or one status."""
-    return [_with_evidence(row) for row in await db.list_candidates(repo=repo, status=status)]
-
-
-@app.get("/api/memory/candidates/{candidate_id}")
-async def api_memory_candidate(candidate_id: str):
-    row = await db.get_candidate(candidate_id)
-    if row is None:
-        raise HTTPException(404, f"no such memory candidate: {candidate_id}")
-    return _with_evidence(row)
-
-
-@app.post("/api/memory/candidates/{candidate_id}/{decision}")
-async def api_memory_candidate_decision(candidate_id: str, decision: str):
-    """Accept or reject a pending candidate, exactly once.
-
-    409 rather than 200 on a repeat: a candidate that has already been decided has not just
-    been decided again, and a reviewer whose click lost a race needs to be told so rather than
-    shown a success that overwrote someone else's decision.
-    """
-    if decision not in ("accept", "reject"):
-        raise HTTPException(404, f"no such decision: {decision}")
-    if await db.get_candidate(candidate_id) is None:
-        raise HTTPException(404, f"no such memory candidate: {candidate_id}")
-    try:
-        row = await db.transition_candidate(candidate_id, f"{decision}ed")
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    return _with_evidence(row)
-
-
-# --------------------------------------------------------------------------- improvements
-
-# What the loop changed and why, served so that its reasoning is auditable without reading a
-# database by hand. Read-only on purpose: a proposal's status is moved by the factory as work
-# actually happens to it, so an endpoint that let a status be set would be a way to mark
-# something `merged` that never merged, and the ledger's only value is that it is true.
-
-
-@app.get("/api/improvements")
-async def api_improvements(repo: str | None = None, status: str | None = None):
-    """The improvement ledger, newest first, optionally scoped."""
-    return [_with_evidence(row) for row in await db.list_improvements(repo=repo, status=status)]
-
-
-@app.get("/api/improvements/{improvement_id}")
-async def api_improvement(improvement_id: str):
-    row = await db.get_improvement(improvement_id)
-    if row is None:
-        raise HTTPException(404, f"no such improvement: {improvement_id}")
-    return _with_evidence(row)
-
-
-# --------------------------------------------------------------------------- releases
-
-# A release is one promotion of a repo's integration branch onto its release branch, and what
-# then happens to that version. The schedule makes them; these routes read them, start one out
-# of schedule, and let a human say they have read one — which is what lifts the freeze.
-
-
-@app.get("/api/releases")
-async def api_releases(repo: str | None = None):
-    """Releases newest first, optionally for one repo, each with its item count."""
-    return await db.list_releases(repo=repo)
-
-
-@app.get("/api/releases/{release_id}")
-async def api_release(release_id: int):
-    row = await db.get_release(release_id)
-    if row is None:
-        raise HTTPException(404, f"no such release: {release_id}")
-    return {**row, "items": await db.release_items(release_id)}
-
-
-class AssembleRelease(BaseModel):
-    repo: str
-
-
-@app.post("/api/releases/assemble")
-async def api_assemble_release(body: AssembleRelease):
-    """Assemble a release of `repo` now, without waiting for the next scheduled moment.
-
-    Not gated on FACTORY_RELEASE, for the reason a hand-started learning run is not: the switch
-    governs what the factory does on its own. The freeze still applies — 409 while the latest
-    release is unreviewed, because reviewing it is the only thing that lifts it. A repo with
-    nothing new to release answers 200 with no release and the reason.
-    """
-    repo = body.repo.strip()
-    if repo not in repos.watched():
-        raise HTTPException(404, f"{repo} is not watched")
-    try:
-        row, why = await release.assemble(repo)
-    except release.Frozen as exc:
-        raise HTTPException(409, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
-        raise HTTPException(400, f"could not assemble a release of {repo}: {exc}") from exc
-    return {"release": row, "reason": why}
-
-
-@app.get("/api/releases/{release_id}/packet")
-async def api_release_packet(release_id: int):
-    """Everything a human needs to review one release: what it carried and how each item was
-    verified, where it was deployed, what a browser made of it, and the feedback so far."""
-    body = await release.packet(release_id)
-    if body is None:
-        raise HTTPException(404, f"no such release: {release_id}")
-    return body
-
-
-class Feedback(BaseModel):
-    text: str
-
-
-@app.post("/api/releases/{release_id}/feedback")
-async def api_release_feedback(release_id: int, body: Feedback):
-    """Store a note on a release. Files nothing — that is a second, deliberate click.
-
-    The response says whether the note, filed as it stands, would be built: `gate_reason` is
-    what the poller would refuse it for, or null.
-    """
-    if await db.get_release(release_id) is None:
-        raise HTTPException(404, f"no such release: {release_id}")
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(400, "feedback is empty")
-    row = await db.add_release_feedback(release_id, text)
-    return {**row, "gate_reason": runner.gate_reason(text)}
-
-
-class FileFeedback(BaseModel):
-    title: str | None = None
-
-
-@app.post("/api/releases/{release_id}/feedback/{feedback_id}/file")
-async def api_file_feedback(release_id: int, feedback_id: int, body: FileFeedback | None = None):
-    """File one note as an issue on the release's repo. Exactly once: 409 after.
-
-    Never automatic. A note with a blocking acceptance criterion is filed `agent:queued`, which
-    the factory will build, so filing is a human's decision. One without is filed as a plain
-    issue — queued, the poller would block it and halt the repo — and the response carries
-    `gate_reason` to say why it was not queued.
-    """
-    rel = await db.get_release(release_id)
-    note = await db.get_release_feedback(feedback_id)
-    if rel is None or note is None or note["release_id"] != release_id:
-        raise HTTPException(404, f"no feedback {feedback_id} on release {release_id}")
-    if not await db.claim_feedback(feedback_id):
-        raise HTTPException(
-            409, f"feedback {feedback_id} was already filed{' as ' + note['issue_url'] if note['issue_url'] else ''}"
-        )
-    title, text = release.feedback_issue(rel, note["text"], body.title if body else None)
-    # Queued only when the poller would build it. A note without a blocking criterion filed as
-    # `agent:queued` is labelled `agent:blocked` on the next tick, and a blocked issue halts the
-    # repo's whole queue — so it is filed as a plain issue for a human to shape instead.
-    buildable = runner.gate_reason(note["text"]) is None
-    try:
-        issue = await github.create_issue(
-            rel["repo"], title, text, [github.LABEL_QUEUED] if buildable else []
-        )
-    except Exception as exc:  # noqa: BLE001 - GitHub refusing is a 400, not a 500
-        await db.unclaim_feedback(feedback_id)
-        raise HTTPException(400, f"could not file the issue: {exc}") from exc
-    await db.record_feedback_issue(feedback_id, issue.get("html_url"), issue.get("number"))
-    return {
-        **(await db.get_release_feedback(feedback_id)),
-        "gate_reason": runner.gate_reason(note["text"]),
-    }
-
-
-@app.post("/api/releases/{release_id}/deploy")
-async def api_release_deploy(release_id: int):
-    """Deploy a promoted release now — the human retry.
-
-    For a release the schedule did not deploy: FACTORY_DEPLOY is off, or the repo's `## Deploy`
-    section was missing or wrong when it was promoted. Clears the refusal noted on the release
-    and asks again; a release that is not `promoted` is a 409.
-    """
-    row = await db.get_release(release_id)
-    if row is None:
-        raise HTTPException(404, f"no such release: {release_id}")
-    if row["status"] != "promoted":
-        raise HTTPException(409, f"release {release_id} is {row['status']}, not promoted")
-    await db.set_release_error(release_id, None)
-    try:
-        return {"run_id": await deploy.create(release_id)}
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 - an unreachable GitHub is a 400, not a 500
-        raise HTTPException(400, f"could not deploy release {release_id}: {exc}") from exc
-
-
-@app.post("/api/releases/{release_id}/accept")
-async def api_release_accept(release_id: int):
-    """Check a deployed release in a browser now — the human trigger and retry.
-
-    For a release FACTORY_ACCEPT did not pick up, or one refused because `golden-tester` did
-    not exist yet. Clears the refusal and asks again; anything but `deployed` is a 409.
-    """
-    row = await db.get_release(release_id)
-    if row is None:
-        raise HTTPException(404, f"no such release: {release_id}")
-    if row["status"] != "deployed":
-        raise HTTPException(409, f"release {release_id} is {row['status']}, not deployed")
-    await db.set_release_error(release_id, None)
-    try:
-        return {"run_id": await accept.create(release_id)}
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 - an unreachable boxd is a 400, not a 500
-        raise HTTPException(400, f"could not start acceptance of release {release_id}: {exc}") from exc
-
-
-@app.post("/api/releases/{release_id}/reviewed")
-async def api_release_reviewed(release_id: int):
-    """A human has read this release. Lifts the freeze on its repo."""
-    if await db.get_release(release_id) is None:
-        raise HTTPException(404, f"no such release: {release_id}")
-    try:
-        return await release.mark_reviewed(release_id)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-
-
-# --------------------------------------------------------------------------- goldens / fleet
-
-# Two different questions, and they stopped having the same answer when goldens became
-# snapshots. What the factory *can boot* is a list of snapshots (`/api/goldens`); what is
-# *running* is a list of machines (`/api/machines`). The old endpoint answered the second and
-# was named for the first, which is why nothing in the fleet view could tell you a golden
-# existed until a run had already failed to find it.
+# --------------------------------------------------------------------------- fleet
 
 
 @app.get("/api/goldens")
 async def api_goldens():
-    """The golden snapshots this deployment can dispatch onto, as the refresh loop last saw them.
-
-    Served from the table rather than from boxd, so this stays cheap enough to poll and says
-    the same thing a dispatch would: `goldens.refresh()` is the one place that reads the fleet.
-    """
-    return agents.api_rows(await db.snapshots())
+    """Golden snapshots in the fleet, as boxd lists them right now."""
+    boxd = runner.client()
+    try:
+        names = await agents.listed(boxd)
+    finally:
+        await boxd.close()
+    return [
+        {"name": n, "repo": agents.parse_golden(n), "status": agents.status(n),
+         "version": agents.version(n)}
+        for n in names
+    ]
 
 
 @app.get("/api/machines")
 async def api_machines():
-    """Boxd machines: the VMs runs are happening on, plus anything else in the fleet."""
+    """Boxd machines: run VMs, plus anything else in the fleet."""
     boxd = runner.client()
     try:
         machines = await boxd.machines.list()
     finally:
         await boxd.close()
     active = {r["vm_name"] for r in await db.active_runs() if r.get("vm_name")}
-    out = []
-    for m in machines:
-        role = runner.vm_role(m.name)
-        out.append(
-            {
-                "name": m.name,
-                "status": getattr(m, "status", None),
-                "role": role,
-                # A run VM with no run behind it any more. What reconcile reaps.
-                "orphan": role != "other" and m.name not in active,
-            }
-        )
+    out = [
+        {
+            "name": m.name,
+            "status": getattr(m, "status", None),
+            "role": "run" if runner.is_ours(m.name) else "other",
+            "orphan": runner.is_ours(m.name) and m.name not in active,
+        }
+        for m in machines
+    ]
     out.sort(key=lambda m: (m["role"] == "other", m["name"]))
     return out
 
@@ -953,8 +464,6 @@ async def healthz():
 
 # --------------------------------------------------------------------------- static SPA
 
-# Mount built assets, then fall back to index.html for client-side routes. Registered last so
-# it never shadows an /api route. If the app hasn't been built, say so instead of 404ing.
 if (DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(DIST / "assets")), name="assets")
 

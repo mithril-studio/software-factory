@@ -35,3 +35,19 @@ jobs:
       # with what an agent is told to run before opening the pull request.
       - name: Verify
         run: scripts/verify.sh
+
+  # The dashboard. A TypeScript error here is a broken UI that no Python test catches, and
+  # deploy.sh would otherwise be the first thing to find it — after the checkout has moved.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm --prefix web ci
+      - run: npm --prefix web run build

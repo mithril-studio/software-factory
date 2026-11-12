@@ -283,38 +283,6 @@ async def _skills(where: str, params: list[Any]) -> list[dict]:
     )
 
 
-async def _candidates(repo: str | None) -> list[dict]:
-    """Learnings agents proposed and nobody has decided on.
-
-    A candidate is a paragraph an agent wrote when it noticed something but was not confident
-    enough to commit it (`docs/architecture.md` §3.3). They accumulate: accepting one records a
-    verdict and deliberately does not write `.mem/`, so a queue of accepted-but-unwritten
-    learnings is the normal state, and the thing that eventually writes them is a later agent.
-
-    Included here because a learning run is that agent, and because the queue is evidence in
-    its own right — a candidate filed four times by four different runs is a repo telling you
-    something about itself more clearly than any single failure does.
-
-    Not windowed. A candidate has no outcome and does not go stale the way a run does; one
-    filed two months ago and never decided is *more* worth surfacing, not less.
-    """
-    where = "WHERE status = 'pending'"
-    params: list[Any] = []
-    if repo:
-        where += " AND repo = ?"
-        params.append(repo)
-    return await _rows(
-        f"""
-        SELECT repo, domain, type, title, COUNT(*) AS filed, MAX(created_at) AS last_filed
-        FROM memory_candidates
-        {where}
-        GROUP BY repo, domain, type, title
-        ORDER BY filed DESC, last_filed DESC
-        """,
-        tuple(params),
-    )
-
-
 async def _cost(where: str, params: list[Any]) -> list[dict]:
     """Spend in the window, and how much of it bought nothing. Lowest-priority section."""
     return await _rows(
@@ -353,7 +321,6 @@ async def build(repo: str | None = None, days: int = 14) -> dict:
     failures, failures_dropped = _cap(await _failures(where, params))
     tool_errors, tool_dropped = _cap(await _tool_errors(where, params))
     skills, skills_dropped = _cap(await _skills(where, params))
-    candidates, candidates_dropped = _cap(await _candidates(repo))
 
     return {
         "window": {"days": days, "since": params[0], "repo": repo},
@@ -364,7 +331,6 @@ async def build(repo: str | None = None, days: int = 14) -> dict:
         "failures": failures,
         "tool_errors": tool_errors,
         "retrieval": await _retrieval(where, params),
-        "candidates": candidates,
         "skills": skills,
         "cost": await _cost(where, params),
         "truncated": {
@@ -373,7 +339,6 @@ async def build(repo: str | None = None, days: int = 14) -> dict:
                 ("failures", failures_dropped),
                 ("tool_errors", tool_dropped),
                 ("skills", skills_dropped),
-                ("candidates", candidates_dropped),
             ) if v
         },
     }

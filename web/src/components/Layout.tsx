@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom"
-import { Activity, Boxes, Bot, Bug, FolderGit2, ListChecks, BarChart3, Rocket, ScrollText, Sprout, Sun, Moon, LogOut, type LucideIcon } from "lucide-react"
+import { Activity, Boxes, Bot, FolderGit2, ListChecks, BarChart3, ScrollText, Sun, Moon, LogOut, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useTheme } from "@/lib/theme"
 import { logout } from "@/lib/api"
@@ -16,15 +16,14 @@ type NavGroup = { title: string | null; items: NavItem[] }
 
 /** The sidebar in groups. The first group is unlabelled — those pages are the daily path,
  *  and a header over them would only name what the reader is already looking at. Later
- *  groups carry a title, so the list reads as three destinations, not seven. */
+ *  groups carry a title. */
 const NAV: NavGroup[] = [
   {
     title: null,
     items: [
       { to: "/", label: "Runs", icon: Activity, end: true },
-      { to: "/plan", label: "Plan", icon: ListChecks },
+      { to: "/plan", label: "Queue", icon: ListChecks },
       { to: "/projects", label: "Projects", icon: FolderGit2 },
-      { to: "/releases", label: "Releases", icon: Rocket },
       { to: "/goldens", label: "Goldens", icon: Bot },
     ],
   },
@@ -33,14 +32,7 @@ const NAV: NavGroup[] = [
     items: [
       { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
       { to: "/digest", label: "Digest", icon: ScrollText },
-      { to: "/improvements", label: "Improvements", icon: Sprout },
     ],
-  },
-  {
-    title: "Monitoring",
-    // No route yet: the row is listed so the shape of the product is visible, but it
-    // stays inert until the page exists.
-    items: [{ to: null, label: "Bugs", icon: Bug }],
   },
 ]
 

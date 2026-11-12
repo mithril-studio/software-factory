@@ -74,7 +74,7 @@ Which adapter a run uses comes from the `events` string in the golden's manifest
 when the manifest arrives — before the first event, since an adapter is stateful over the
 stream it reads. A missing manifest or an absent `events` key defaults to `claude-code`;
 `backfill.py` does not consult the manifest at all — it replays every transcript through
-`ClaudeCodeAdapter`, and a replay is authoritative (`clear_run` first, then rewrite).
+`ClaudeCodeAdapter`, and a replay is authoritative for model and tool calls (`replace_calls` swaps them in one transaction; memory and skill receipts, which only the live stream writes, are left alone).
 
 `summary()` lives on the adapter for the same reason `feed()` does: Claude Code reports a
 run's own token and cost figures on a final event it calls `result`, and that sentence is
@@ -150,8 +150,8 @@ taken on faith — so the control plane parses the run's `FACTORY_MEMORY` line
 (`../docs/architecture.md` §3.3) and writes it through this layer: one `memory_reads` row per
 record the run opened, one `memory_receipts` row per run saying what it indexed and which
 domains it drew from. `usage_for_run` returns both under `memory` / `memory_receipt`, and
-`memory_metrics_by_repo` is the fifth key of `GET /api/telemetry`. `clear_run` clears these
-tables too, so a backfill stays idempotent.
+`memory_metrics_by_repo` is the fifth key of `GET /api/telemetry`. A backfill (`replace_calls`)
+leaves these tables alone: they are written by the live stream only and cannot be rebuilt.
 
 Two properties of the producer worth knowing: the `Recorder` never raises — every failure
 increments a `dropped` counter surfaced in the run log — and `Recorder.totals()` is what

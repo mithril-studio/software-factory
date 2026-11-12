@@ -9,17 +9,15 @@ export type Run = {
   issue_title: string | null
   branch: string | null
   status: string
-  /** Dispatches of this run inside its cycle. A crash retry increments it. */
-  attempt: number | null
-  /** Which pass over the pull request this run belongs to. A review that sends the change
-   *  back opens the next one. Not the same number as `attempt`, and it used to be. */
-  cycle: number | null
+  /** `build` for every v1 run; older rows may carry review, plan, learn and others. */
   kind: string
-  verdict: string | null
   agent: string | null
+  golden: string | null
   tokens_in: number | null
   tokens_out: number | null
   cost_usd: number | null
+  /** 1 when the run passed the soft per-run budget. It kept running. */
+  over_budget: number | null
   exit_code: number | null
   pr_url: string | null
   error: string | null
@@ -27,86 +25,6 @@ export type Run = {
   created_at: string
   started_at: string | null
   finished_at: string | null
-}
-
-/** What a review run's `error` column says happened, as written by `control/runner.py`.
- *  Keep in step with the constants there — `review_outcome_test.py` checks that they exist. */
-const REVIEW_OUTCOME: [string, string][] = [
-  ["changes requested: ", "changes requested"],
-  ["ci red: ", "ci red"],
-  ["not merged: ", "not merged"],
-]
-
-// A run's `status` is the *process* outcome — did the agent complete — which is not the same
-// question as whether the result was good. A reviewer that runs cleanly and rejects the pull
-// request records `succeeded` with the reason in `error`, so in the runs list a rejected
-// review was indistinguishable from an approved one: both green.
-//
-// This used to read "any error at all means the reviewer refused", which was wrong in the
-// worst available direction. An *approved* review whose pull request then failed CI also
-// writes to `error`, and so does one that could not be merged — both were rendered "changes
-// requested", saying the reviewer rejected a change it had signed off. Read the tag the
-// server writes instead of inferring from the column being non-empty. Folded in here rather
-// than at each call site, so the list and the detail page cannot disagree.
-export function runOutcome(r: Run): string {
-  // A CI phase never "ran" anywhere, so `failed` would be read as a dispatch that broke.
-  // Say what it actually is, in the same words the review path already uses for it, so the
-  // phase and the review that reports it do not describe one event two ways.
-  if (r.kind === "ci") return r.status === "failed" ? "ci red" : r.status
-  // A plan run that completed without filing issues or declaring the goal met records
-  // `succeeded` with the reason tagged in `error` — the same status/outcome split as a
-  // review that requested changes, read the same way.
-  if (r.kind === "plan" && r.status === "succeeded" && r.error?.startsWith("planned nothing: "))
-    return "planned nothing"
-  if (r.kind !== "review" || r.status !== "succeeded" || !r.error) return r.status
-  for (const [prefix, outcome] of REVIEW_OUTCOME) {
-    if (r.error.startsWith(prefix)) return outcome
-  }
-  // An older row, written before the tags existed. Every one of them is a refusal — the two
-  // approved-but-not-merged paths came later — so this stays the honest reading of history.
-  return "changes requested"
-}
-
-/** One unit of work: every dispatch that went into a single pass at a single issue.
- *  `key` groups them — see ATTEMPT_KEY in `control/db.py`. Phases ascend by time. */
-export type Attempt = {
-  key: string
-  phases: Run[]
-}
-
-// What the whole attempt amounts to, which is the question the dispatch log was not
-// answering. The rule is only "whatever its last phase came to", and that works because the
-// phases are appended in causal order: a build pushes, CI judges what was pushed, the review
-// decides what to do about it. So a green build under a red CI no longer reads as success —
-// the attempt takes the CI phase's verdict, because that is the one that came last and is
-// therefore the one that is still true.
-//
-// Anything unfinished wins over all of it. An attempt whose review is still running is
-// "running" even though its build succeeded twenty minutes ago; reporting the build's
-// outcome as the attempt's is exactly the confusion this replaces.
-export function attemptOutcome(a: Attempt): string {
-  // An unrecognised status counts as unfinished, deliberately: a live row is a better
-  // wrong answer than an outcome the run never actually reached.
-  if (a.phases.some((p) => !TERMINAL.includes(p.status))) return "running"
-  const last = a.phases[a.phases.length - 1]
-  return last ? runOutcome(last) : "unknown"
-}
-
-/** Sum a numeric column across an attempt's phases, or null when no phase reported one.
- *  Null rather than 0 because a provisioning run and a run that cost nothing are different
- *  facts, and the table renders the first as an em dash. */
-export function attemptTotal(a: Attempt, pick: (r: Run) => number | null): number | null {
-  const given = a.phases.map(pick).filter((n): n is number => n != null)
-  return given.length ? given.reduce((x, y) => x + y, 0) : null
-}
-
-/** The pull request the attempt produced. Later phases carry it and the build that opened it
- *  may not have by the time it was written, so read from the end. */
-export function attemptPr(a: Attempt): string | null {
-  for (let i = a.phases.length - 1; i >= 0; i--) {
-    if (a.phases[i].pr_url) return a.phases[i].pr_url
-  }
-  return null
 }
 
 export type PlanIssue = {
@@ -122,42 +40,21 @@ export type Project = {
   repo: string
   /** When it was connected. */
   added_at: string | null
-  /** What provisioning a warm golden for this repo did — `none`, `running`, `ready`,
-   *  `failed`. A report, never a gate: a repo dispatches onto `golden-copy` either way. */
-  provision_status: string
-  /** The snapshot this repo's runs actually boot. */
+  /** The snapshot this repo's runs boot. */
   golden: string
-  /** True when that snapshot is this repo's own warm tier rather than the `golden-copy` base.
-   *  A speed-up only — every run installs the repo for itself either way. */
+  /** True when that snapshot is this repo's own warm golden rather than `golden-copy`. */
   warm: boolean
+  /** Where its pull requests go: its own setting, else the factory default. */
+  target_branch: string
+  /** The repo's own setting, or null when it follows the factory default. */
+  base_branch: string | null
   runs: number
   succeeded: number
   failed: number
   active: number
   last_run: string | null
-  /** The goal is a committed `.factory/goal.md` in the repo; this is its git blob SHA as of
-   *  the factory's last check, or null when no goal file is known. Committing a change to
-   *  the file (re-)arms the goal loop; deleting it clears the goal. */
-  goal_sha: string | null
-  /** Where the goal loop stands: `none` (no goal), `active` (planning may fire when the
-   *  queue runs dry), `met` (a plan run verified the endstate against an empty queue), or
-   *  `stalled` (consecutive fruitless plans — a human decides what happens next). */
-  goal_state: "none" | "active" | "met" | "stalled"
-  /** Consecutive fruitless plan runs. Meaningful mostly beside `stalled`. */
-  plan_stalls: number
-  last_planned_at: string | null
-  /** Whether this deployment runs the goal loop at all (FACTORY_PLAN). A goal set while
-   *  this is false is a note on the register, and the UI should say so. */
-  plan_enabled: boolean
-  /** The integration branch: where runs branch from and merge into. Null means the repo's
-   *  GitHub default branch. */
-  base_branch: string | null
 }
 
-/** One preflight question and its answer.
- *
- *  `ok: false` with `fatal: false` is a warning, not a failure — a repo with no `.factory.md`
- *  still builds, it just builds with less context. Only a fatal one blocks connecting. */
 export type Check = {
   name: string
   ok: boolean
@@ -171,74 +68,38 @@ export type Preflight = {
   checks: Check[]
 }
 
-/** What `POST /api/repos` answers with.
- *
- *  `provision_run` is the golden-warming run it started, if it could start one.
- *  `provision_skipped` is why it could not — almost always "this repo names no setup command".
- *  Neither is a failure: the repo is watched and dispatchable either way, on `golden-copy`. */
 export type Connected = {
   repo: string
   checks: Check[]
-  provision_run: string | null
-  provision_skipped: string | null
 }
 
-/** A golden snapshot the factory can dispatch onto, as the refresh loop last saw it.
- *
- *  Not a machine. Goldens stopped being machines when they became snapshots, which is why
- *  this and `Machine` are two types served from two endpoints instead of one list that could
- *  answer neither question fully. */
 export type Golden = {
-  snapshot: string
-  /** The repo slug the name carries, null for the base image every run falls back to. */
+  name: string
+  /** The repo slug it was warmed for, `""` for the base image, null if not a golden. */
   repo: string | null
-  base: boolean
-  /** Which agent the image launches, from the manifest it announced into its last run — not
-   *  from its name, which says nothing about the agent any more. Null until a run has read one. */
-  agent: string | null
-  version: string | null
-  /** What boxd says the snapshot is doing: `ready`, `pending`. */
-  status: string | null
-  /** Whether a run could boot it *now*. Not `status === "ready"`: a re-save is `pending` while
-   *  its previous version stays restorable, and a first capture is `pending` with nothing
-   *  behind it at all. Having a version is the question. */
-  ready: boolean
-  /** The telemetry adapter this golden's stream is read with, from its manifest. */
-  events: string | null
-  agent_version: string | null
-  /** What the last run on this snapshot did. False with no error means no run has used it. */
-  ok: boolean
-  error: string | null
-  /** When a run last finished on it having produced usage — the only proof its credentials
-   *  still work. Null means unproven, not broken. */
-  verified_at: string | null
+  status: string
+  version: string
 }
 
-/** A boxd machine in the fleet. */
 export type Machine = {
   name: string
   status: string | null
-  /** From the VM name prefixes the reaper sweeps on. `other` is anything the factory did not
-   *  create — including a golden still held as a machine, which is now a rollback artefact. */
-  role: "run" | "review" | "provision" | "plan" | "learn" | "other"
-  /** A run VM with no run behind it any more. What Reconcile reaps. */
+  role: "run" | "other"
   orphan: boolean
 }
 
 export type Config = {
   repos: string[]
+  target_branch: string
+  sequential: boolean
+  run_budget_eur: number
   max_concurrent: number
-  max_attempts: number
   poll_enabled: boolean
   poll_interval: number
-  /** A setting nobody filled in. Blocks starting a run. */
   missing: string[]
-  /** A complete configuration with nothing to run on — no `golden-copy` to fall back to. */
   problems: string[]
 }
 
-/** Cost split by token class. Cache reads dominate real runs — that is the finding
- *  the old one-row-per-run ledger had no column to show. */
 export type Composition = {
   input: number
   output: number
@@ -255,8 +116,6 @@ export type ToolStat = {
   duration_ms: number
 }
 
-/** Per repo. `shipped` counts issues that produced a pull request; `wasted` is spend
- *  on runs that never did — the two halves of what a merged PR actually costs. */
 export type Economics = {
   repo: string
   issues: number
@@ -273,14 +132,6 @@ export type Telemetry = {
   economics: Economics[]
 }
 
-/** The evidence a learning run reads, served to whoever asks.
- *
- *  Rendered for one reason above the others: this is the loop's input, and a proposal built
- *  on a bad digest is wrong *and* plausible. Reading it here is how that gets caught before
- *  it becomes a merged rule that every later run pays for.
- *
- *  `truncated` names each section a cap shortened and by how much, which is what separates
- *  "nothing else happened" from "we stopped listing". */
 export type Digest = {
   window: { days: number; since: string; repo: string | null }
   rejections: DigestCluster[]
@@ -320,165 +171,6 @@ export type DigestCluster = {
   last_seen: string | null
 }
 
-/** One thing the improvement loop changed, and what it turned out to be worth.
- *
- *  `status` is the whole story in one field, and `merged` deliberately is not the end of
- *  it: a change that reached main is live, not finished, and `kept`/`reverted` are the two
- *  answers to the question it was created to ask. `observed` is null until it is graded. */
-export type Improvement = {
-  id: string
-  repo: string
-  run_id: string
-  artifact: "skill" | "factory_md" | "mem" | "candidate" | "harness" | "compose"
-  target: string | null
-  action: "add" | "edit" | "delete" | "revert"
-  rationale: string
-  evidence: { run_ids?: string[]; signature?: string; raw?: string }
-  metric: string
-  baseline: number | null
-  issue_url: string | null
-  issue_number: number | null
-  pr_url: string | null
-  status: "proposed" | "building" | "merged" | "kept" | "reverted" | "rejected" | "abandoned"
-  observed: number | null
-  graded_at: string | null
-  created_at: string
-}
-
-/** One promotion of a repo's integration branch onto its release branch, and what happened to
- *  that version afterwards. Any status but the last three freezes the repo's next release. */
-export type Release = {
-  id: number
-  repo: string
-  status:
-    | "assembling"
-    | "promoted"
-    | "deploying"
-    | "deployed"
-    | "accepting"
-    | "accepted"
-    | "rejected"
-    | "reviewed"
-    | "expired"
-    | "failed"
-  /** The integration-branch commit this release is pinned to. */
-  test_sha: string | null
-  /** Where the release branch pointed before; null on a repo's first release. */
-  base_sha_before: string | null
-  created_at: string
-  promoted_at: string | null
-  deployed_at: string | null
-  deployed_sha: string | null
-  test_url: string | null
-  accepted_at: string | null
-  reviewed_at: string | null
-  repair_issue: number | null
-  error: string | null
-  updated_at: string
-  item_count?: number
-}
-
-/** A factory-built change a release carried: one merged pull request. */
-export type ReleaseItem = {
-  release_id: number
-  issue_number: number
-  issue_title: string | null
-  pr_url: string | null
-  merged_sha: string
-  summary: string | null
-  /** The issue's criteria at promotion, as stored JSON. */
-  criteria?: string | null
-}
-
-export type ReleaseDetail = Release & { items: ReleaseItem[] }
-
-/** One acceptance criterion as the issue stated it at promotion, beside what was found. */
-export type PacketCriterion = {
-  id: string
-  mode: string | null
-  statement: string | null
-  verify: string | null
-  /** `met`, `not_met`, `cannot_verify`, or `not reported` — which counts as not met. */
-  status: string
-  evidence: string | null
-}
-
-export type PacketItem = Omit<ReleaseItem, "criteria"> & {
-  criteria: PacketCriterion[]
-  review: { run_id: string; verdict: string | null; findings: string[]; notes: string[] } | null
-}
-
-export type PacketRun = {
-  id: string
-  status: string
-  error: string | null
-  vm_name: string | null
-  exit_code: number | null
-  cost_usd: number | null
-  created_at: string
-  finished_at: string | null
-}
-
-/** What a browser made of the release on the test server, per item. */
-export type AcceptanceVerdict = {
-  verdict?: "accept" | "reject"
-  items?: { issue: number; status: string; evidence: string }[]
-  findings?: string[]
-  notes?: string[]
-}
-
-export type Feedback = {
-  id: number
-  release_id: number
-  text: string
-  created_at: string
-  issue_url: string | null
-  issue_number: number | null
-  filed_at: string | null
-  /** Why the poller would refuse this note as an issue, or null when it would build it. */
-  gate_reason: string | null
-}
-
-/** Everything a human needs to review one release. */
-export type Packet = {
-  release: Release
-  items: PacketItem[]
-  deploy: PacketRun | null
-  acceptance: (PacketRun & { verdict: AcceptanceVerdict }) | null
-  feedback: Feedback[]
-}
-
-/** Store a note on a release. Files nothing. */
-export function addFeedback(releaseId: number, text: string): Promise<Feedback> {
-  return post<Feedback>(`/api/releases/${releaseId}/feedback`, { text })
-}
-
-/** File a stored note as an `agent:queued` issue. Exactly once. */
-export function fileFeedback(releaseId: number, feedbackId: number): Promise<Feedback> {
-  return post<Feedback>(`/api/releases/${releaseId}/feedback/${feedbackId}/file`, {})
-}
-
-/** Assemble a release now. `release` is null when there is nothing new, with the reason;
- *  a frozen repo throws (409). */
-export function assembleRelease(repo: string): Promise<{ release: Release | null; reason: string }> {
-  return post<{ release: Release | null; reason: string }>("/api/releases/assemble", { repo })
-}
-
-/** Deploy a promoted release to its repo's test server now — the retry after a refusal. */
-export function deployRelease(id: number): Promise<{ run_id: string }> {
-  return post<{ run_id: string }>(`/api/releases/${id}/deploy`)
-}
-
-/** Check a deployed release in a browser on its test server now. */
-export function acceptRelease(id: number): Promise<{ run_id: string }> {
-  return post<{ run_id: string }>(`/api/releases/${id}/accept`)
-}
-
-/** Say a release has been read. Lifts its repo's freeze. */
-export function markReleaseReviewed(id: number): Promise<Release> {
-  return post<Release>(`/api/releases/${id}/reviewed`)
-}
-
 export type RunTelemetry = {
   totals: {
     calls?: number
@@ -488,8 +180,10 @@ export type RunTelemetry = {
     cache_read_tokens?: number
     cache_write_tokens?: number
     derived_cost_usd?: number
+    /** Model calls whose model has no price row: they count as $0 in every derived figure. */
+    unpriced_calls?: number
   }
-  by_model: { model: string; calls: number; derived_cost_usd: number }[]
+  by_model: { model: string; calls: number; derived_cost_usd: number; priced: number }[]
   tools: ToolStat[]
 }
 
@@ -502,11 +196,8 @@ function onUnauthorized() {
   }
 }
 
-/** The server's explanation of a refusal.
- *
- *  `POST /api/repos` answers a blocking preflight with `{detail: {message, checks}}` rather
- *  than a sentence, because the caller wants to render which check failed. Reading `.detail`
- *  blindly would put `[object Object]` in front of the user at exactly that moment. */
+/** The server's explanation of a refusal. `POST /api/repos` answers a blocking preflight
+ *  with `{detail: {message, checks}}`, so `.detail` is not always a string. */
 async function detail(resp: Response): Promise<string> {
   try {
     const body = (await resp.json()).detail
@@ -518,8 +209,8 @@ async function detail(resp: Response): Promise<string> {
   }
 }
 
-async function get<T>(url: string): Promise<T> {
-  const resp = await fetch(url)
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const resp = await fetch(url, init)
   if (!resp.ok) {
     if (resp.status === 401) onUnauthorized()
     throw new Error(await detail(resp))
@@ -527,45 +218,43 @@ async function get<T>(url: string): Promise<T> {
   return resp.json()
 }
 
-export async function post<T>(url: string, body?: unknown): Promise<T> {
-  const resp = await fetch(url, {
+function get<T>(url: string): Promise<T> {
+  return request<T>(url)
+}
+
+export function post<T>(url: string, body?: unknown): Promise<T> {
+  return request<T>(url, {
     method: "POST",
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (!resp.ok) {
-    if (resp.status === 401) onUnauthorized()
-    throw new Error(await detail(resp))
-  }
-  return resp.json()
 }
 
-export async function patch<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, {
+export function patch<T>(url: string, body: unknown): Promise<T> {
+  return request<T>(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   })
-  if (!resp.ok) {
-    if (resp.status === 401) onUnauthorized()
-    throw new Error(await detail(resp))
-  }
-  return resp.json()
 }
 
-export async function del<T>(url: string): Promise<T> {
-  const resp = await fetch(url, { method: "DELETE" })
-  if (!resp.ok) {
-    if (resp.status === 401) onUnauthorized()
-    throw new Error(await detail(resp))
-  }
-  return resp.json()
+export function del<T>(url: string): Promise<T> {
+  return request<T>(url, { method: "DELETE" })
+}
+
+// ---- runs ----
+
+export function startRun(repo: string, issueNumber: number): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>("/api/runs", { repo, issue_number: issueNumber })
+}
+
+export function cancelRun(runId: string): Promise<{ ok: boolean }> {
+  return post<{ ok: boolean }>(`/api/runs/${runId}/cancel`)
 }
 
 // ---- repos ----
 
-/** One repo the control plane's GitHub token can see. For the connect picker only — what a
- *  repo may actually do is what preflight asks, not what this says. */
+/** One repo the control plane's GitHub token can see. For the connect picker only. */
 export type GithubRepo = {
   full_name: string
   private: boolean
@@ -578,10 +267,7 @@ export type GithubRepo = {
   connected: boolean
 }
 
-/** The repos this deployment's token can see, most recently pushed first.
- *
- *  `error` rather than a throw: the picker is a convenience over a field that still accepts
- *  free text, so a GitHub outage should cost the dropdown and nothing else. */
+/** The repos this token can see. `error` rather than a throw: the picker still takes free text. */
 export function githubRepos(): Promise<{ repos: GithubRepo[]; error: string | null }> {
   return get<{ repos: GithubRepo[]; error: string | null }>("/api/github/repos")
 }
@@ -600,27 +286,9 @@ export function disconnectRepo(repo: string): Promise<{ removed: boolean }> {
   return del<{ removed: boolean }>(`/api/repos/${repo}`)
 }
 
-/** Warm this repo's golden now. Also how a stale one is refreshed — provisioning always
- *  rebuilds from the base rather than updating a snapshot in place. */
-export function warmGolden(repo: string): Promise<{ run_id: string }> {
-  return post<{ run_id: string }>(`/api/repos/${repo}/golden`)
-}
-
-/** Drop this repo's golden. Its runs fall back to the base and install for themselves. */
-export function dropGolden(repo: string): Promise<{ deleted: boolean }> {
-  return del<{ deleted: boolean }>(`/api/repos/${repo}/golden`)
-}
-
-/** Point a repo at an integration branch, or back at its default with an empty string.
- *  Refused with a message when the branch does not exist on GitHub. */
-export function setBaseBranch(repo: string, branch: string): Promise<{ base_branch: string | null }> {
+/** Point a repo's pull requests at another branch, or back at the default with "". */
+export function setTargetBranch(repo: string, branch: string): Promise<{ base_branch: string | null }> {
   return patch<{ base_branch: string | null }>(`/api/repos/${repo}`, { base_branch: branch })
-}
-
-/** Put a `met` or `stalled` goal back to `active`, so the next dry poll tick plans again.
- *  There is no set-goal call: the goal is `.factory/goal.md`, committed in the repo. */
-export function replan(repo: string): Promise<{ goal_state: string }> {
-  return post<{ goal_state: string }>(`/api/repos/${repo}/replan`)
 }
 
 // ---- auth ----
@@ -650,7 +318,10 @@ export async function checkAuth(): Promise<boolean> {
   }
 }
 
-/** Fetch `url` once, then re-poll every `intervalMs` if given. */
+/** Fetch `url` once, then re-poll every `intervalMs` if given.
+ *
+ *  A response is dropped if `url` changed while it was in flight, so a slow answer for the
+ *  previous filter can never overwrite the current one. */
 export function usePoll<T>(url: string, intervalMs?: number) {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -659,14 +330,17 @@ export function usePoll<T>(url: string, intervalMs?: number) {
   savedUrl.current = url
 
   const refresh = useCallback(async () => {
+    const asked = savedUrl.current
     try {
-      const d = await get<T>(savedUrl.current)
+      const d = await get<T>(asked)
+      if (asked !== savedUrl.current) return
       setData(d)
       setError(null)
     } catch (e) {
+      if (asked !== savedUrl.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (asked === savedUrl.current) setLoading(false)
     }
   }, [])
 
@@ -681,7 +355,10 @@ export function usePoll<T>(url: string, intervalMs?: number) {
   return { data, error, loading, refresh }
 }
 
-/** Subscribe to a run's SSE log stream; returns the accumulated lines and whether it's done. */
+/** Subscribe to a run's SSE log stream; returns the accumulated lines and whether it's done.
+ *
+ *  The server tags every line with its byte offset, and EventSource sends the last one back
+ *  when it reconnects, so a dropped connection resumes instead of duplicating the log. */
 export function useRunLog(runId: string) {
   const [lines, setLines] = useState<string[]>([])
   const [done, setDone] = useState(false)
@@ -690,18 +367,33 @@ export function useRunLog(runId: string) {
     setLines([])
     setDone(false)
     const source = new EventSource(`/api/runs/${runId}/stream`)
+    let pending: string[] = []
+    let frame = 0
+    // Batch lines per animation frame: a fast agent emits hundreds per second, and one state
+    // update per line re-renders the whole log each time.
+    const flush = () => {
+      frame = 0
+      const batch = pending
+      pending = []
+      setLines((prev) => prev.concat(batch))
+    }
     source.onmessage = (e) => {
-      const line = JSON.parse(e.data) as string
-      setLines((prev) => [...prev, line])
+      pending.push(JSON.parse(e.data) as string)
+      if (!frame) frame = requestAnimationFrame(flush)
     }
     source.addEventListener("done", () => {
+      if (frame) cancelAnimationFrame(frame)
+      flush()
       setDone(true)
       source.close()
     })
     source.onerror = () => {
-      /* EventSource retries on its own */
+      /* EventSource retries on its own, resuming from the last id */
     }
-    return () => source.close()
+    return () => {
+      if (frame) cancelAnimationFrame(frame)
+      source.close()
+    }
   }, [runId])
 
   return { lines, done }

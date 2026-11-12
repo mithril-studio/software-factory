@@ -70,8 +70,7 @@ export function Digest() {
   const outcomes = data?.outcomes ?? []
   const truncated = Object.entries(data?.truncated ?? {})
 
-  // Fleet-wide totals, in the order the loop's objective ranks them: what got sent back,
-  // what shipped nothing, and only then what it cost.
+  // Fleet-wide totals: what shipped, what shipped nothing, and what it cost.
   const issues = outcomes.reduce((n, o) => n + o.issues, 0)
   const shipped = outcomes.reduce((n, o) => n + o.shipped, 0)
   const wrong = outcomes.reduce((n, o) => n + o.failed_runs + o.shipped_nothing, 0)
@@ -86,9 +85,7 @@ export function Digest() {
         title="Digest"
         subtitle={
           <>
-            What the last {days} days actually cost in rejections and failures — the same
-            document a learning run is handed. Read it before trusting what the loop proposes
-            from it: a proposal built on a bad digest is wrong <em>and</em> plausible.
+            What the last {days} days of runs shipped, how they failed, and what it cost.
           </>
         }
         actions={
@@ -113,14 +110,9 @@ export function Digest() {
       {error && <ErrorNote message={error} />}
 
       <div className="mb-8 grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile
-          label="sent back"
-          value={String(rejections.reduce((n, r) => n + r.count, 0))}
-          note="reviews that rejected"
-          featured
-        />
+        <StatTile label="issues shipped" value={`${shipped}/${issues}`} note="reached a PR" featured />
         <StatTile label="shipped nothing" value={String(wrong)} note={`${retries} retries`} />
-        <StatTile label="issues shipped" value={`${shipped}/${issues}`} note="reached a PR" />
+        <StatTile label="failure patterns" value={String(failures.length)} note="distinct errors" />
         <StatTile label="spend" value={usd(spend)} note={`${usd(wasted)} bought nothing`} />
       </div>
 
@@ -133,13 +125,13 @@ export function Digest() {
         </div>
       )}
 
-      <div className="mb-8">
-        <SectionHead>Why reviews sent work back</SectionHead>
-        <Clusters
-          rows={rejections}
-          empty="No review rejected anything in this window."
-        />
-      </div>
+      {/* Only runs from before v1 carry review rejections; shown while they are in the window. */}
+      {rejections.length > 0 && (
+        <div className="mb-8">
+          <SectionHead>Why reviews sent work back</SectionHead>
+          <Clusters rows={rejections} empty="" />
+        </div>
+      )}
 
       <div className="mb-8">
         <SectionHead>How runs failed</SectionHead>
