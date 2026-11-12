@@ -114,7 +114,10 @@ async def _repo_checks(repo: str) -> list[Check]:
             else f"{target} does not exist yet; the first run creates it from {default}",
         ),
     ]
-    checks.extend(profile_checks(await github.file(repo, runner.PROFILE_PATH, default)))
+    # Read the profile from where a run reads it: the target branch once it exists. Checking
+    # the default branch warned "no .factory.md" about a repo whose runs had one.
+    profile_ref = target if exists else default
+    checks.extend(profile_checks(await github.file(repo, runner.PROFILE_PATH, profile_ref)))
     try:
         await github.ensure_labels(repo)
         checks.append(Check("lifecycle labels", True, "present or created"))

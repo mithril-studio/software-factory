@@ -195,6 +195,52 @@ check("push check: a repo whose token cannot push is not ready",
       report("r", [push_check(False, "nope")]), False)
 
 
+# ---------- the profile is read from the branch runs read it from
+from control import preflight as preflight_module  # noqa: E402
+from control import repos as repos_module  # noqa: E402
+
+
+def profile_ref(target_exists):
+    """Which ref `_repo_checks` reads `.factory.md` from, with GitHub stubbed."""
+    asked = []
+
+    async def repo_info(repo):
+        return {"default_branch": "main"}
+
+    async def can_push_stub(repo):
+        return True, "ok"
+
+    async def ref_sha(repo, ref):
+        return "abc12345" if target_exists else None
+
+    async def file(repo, path, ref):
+        asked.append(ref)
+        return "## Setup\n\n`npm ci`\n" if ref == "test" else None
+
+    async def ensure_labels(repo):
+        return None
+
+    names = ("repo_info", "can_push", "ref_sha", "file", "ensure_labels")
+    saved = {n: getattr(gh, n) for n in names}
+    saved_target = repos_module.target_branch
+    gh.repo_info, gh.can_push, gh.ref_sha, gh.file, gh.ensure_labels = (
+        repo_info, can_push_stub, ref_sha, file, ensure_labels)
+    repos_module.target_branch = lambda repo: "test"
+    try:
+        found = {c.name: c for c in asyncio.run(preflight_module._repo_checks("o/r"))}
+    finally:
+        for n, f in saved.items():
+            setattr(gh, n, f)
+        repos_module.target_branch = saved_target
+    return asked, found
+
+
+asked, found = profile_ref(target_exists=True)
+check("profile ref: read from the target branch once it exists", asked, ["test"])
+check("profile ref: so a profile only on test counts as present", found["has .factory.md"].ok, True)
+asked, _ = profile_ref(target_exists=False)
+check("profile ref: from the default branch before the target exists", asked, ["main"])
+
 print()
 print(f"{len(fails)} failed" if fails else "ALL PASS")
 sys.exit(1 if fails else 0)
