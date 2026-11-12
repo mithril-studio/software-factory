@@ -42,7 +42,8 @@ def freeze(profile: str, issue: dict, max_cycles: int) -> dict:
     for c in criteria:
         if (not isinstance(c, dict) or not isinstance(c.get("id"), str)
                 or not re.fullmatch(r"[\w-]+", c["id"])
-                or c["id"] in ids or c.get("mode") not in {"test", "probe", "structure", "inspect"}
+                or c["id"] in ids or not isinstance(c.get("mode"), str)
+                or c["mode"] not in {"test", "probe", "structure", "inspect"}
                 or not isinstance(c.get("statement"), str) or not c["statement"].strip()):
             raise ValueError("invalid or duplicate acceptance criterion")
         ids.add(c["id"])
@@ -109,7 +110,7 @@ def decide(plan, sha, results, *, attempt=1, cycle=1, completed=False):
             problems["missing"].append(cid)
             continue
         if (len(current) != 1 or any(r.get("verifier") != check["verifier"]
-                or r.get("outcome") not in OUTCOMES
+                or not isinstance(r.get("outcome"), str) or r["outcome"] not in OUTCOMES
                 or type(r.get("attempt")) is not int or not 1 <= r["attempt"] <= attempt
                 or not isinstance(r.get("evidence"), list)
                 or any(not isinstance(e, str) or not e.strip() for e in r["evidence"])
@@ -146,7 +147,7 @@ def review_results(plan, sha, attempt, verdict, exit_code=0):
             out.append(result(plan, sha, attempt, check, "error", reason="review did not finish"))
             continue
         if check["id"] == "review:approval":
-            outcome = {"approve": "pass", "request_changes": "fail"}.get(verdict.get("verdict"), "error")
+            outcome = {"approve": "pass", "request_changes": "fail"}.get(str(verdict.get("verdict")), "error")
             findings = verdict.get("findings", [])
             if outcome == "fail" and not findings:
                 outcome = "inconclusive"
@@ -160,7 +161,7 @@ def review_results(plan, sha, attempt, verdict, exit_code=0):
                    and "review:" + str(a.get("id")) == check["id"]]
         for answer in matches:
             outcome = {"met": "pass", "not_met": "fail", "cannot_verify": "inconclusive"}.get(
-                answer.get("status"), "error")
+                str(answer.get("status")), "error")
             evidence = answer.get("evidence")
             if not isinstance(evidence, str) or not evidence.strip():
                 outcome, evidence = "inconclusive", "no evidence supplied"
@@ -179,7 +180,7 @@ def e2e_results(plan, sha, attempt, flow, verdict, step_ids):
         for answer in matches:
             steps = answer.get("steps", [])
             outcome = {"pass": "pass", "fail": "fail", "not_enough_evidence": "inconclusive"}.get(
-                answer.get("verdict"), "error")
+                str(answer.get("verdict")), "error")
             if (not isinstance(steps, list) or not steps
                     or any(type(s) is not int or s not in step_ids for s in steps)):
                 outcome, steps = "inconclusive", []

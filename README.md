@@ -9,6 +9,11 @@ live in a web UI and can start runs yourself.
 The control plane is deterministic and contains no LLM. All intelligence lives in the agent,
 inside the VM.
 
+Opt-in [deterministic verification](docs/verification.md) freezes required checks before a
+build, collects review and browser evidence, and routes to merge eligibility, a bounded fix,
+retry, or human escalation. Existing repositories keep their current review policy until
+they add a `Verification` section to `.factory.md`.
+
 > **Status:** V0, in progress. Second attempt — the first failed on scope, see
 > `../learnings.md`. The governing constraint of this build is *smallness*.
 

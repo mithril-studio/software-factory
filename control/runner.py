@@ -23,7 +23,7 @@ from boxd import AsyncBoxd, _mappers as _boxd_mappers
 from telemetry import store as telemetry_store
 from telemetry.recorder import Recorder
 
-from . import agents, db, github, memory
+from . import agents, db, github, memory, verification
 from .config import settings
 
 # boxd reports a snapshot's timestamps in **milliseconds**, but the SDK's snapshot mapper reads
@@ -1566,6 +1566,7 @@ async def _merge(
     issue: dict,
     branch: str,
     cycle: int = 1,
+    expected_sha: str | None = None,
 ) -> MergeAttempt:
     """Merge a PR once its checks are green. Never raises — a merge we skip is always safer
     than one we force, and the PR simply stays open for a human.
@@ -1587,19 +1588,21 @@ async def _merge(
     """
     try:
         pr_number = int(pr_url.rstrip("/").split("/")[-1])
-        sha: str | None = None
+        sha: str | None = expected_sha
         green, why, failed = True, "checks not required", []
         # Bound before the branch below: with `merge_require_checks` off nothing is fetched
         # and nothing is recorded, and both return paths still read this.
         ci_log: str | None = None
         for reconciled in (False, True):
+            if expected_sha and await github.pr_head_sha(repo, pr_number) != expected_sha:
+                return MergeAttempt(False, None, "PR head changed; fresh verification required", expected_sha)
             started_at = db.utcnow()
             if settings.merge_require_checks:
                 # The merge API waits for nothing, so without this the PR is merged seconds
                 # after `gh pr create` — before CI has even started. Every run forks from main,
                 # so a red main propagates into all of them.
                 log.write(f"[factory] waiting for checks on PR #{pr_number}")
-                sha = await github.pr_head_sha(repo, pr_number)
+                sha = expected_sha or await github.pr_head_sha(repo, pr_number)
                 green, why, failed = await github.checks_green(
                     repo, sha, timeout=settings.merge_check_timeout
                 )
@@ -1612,7 +1615,7 @@ async def _merge(
             try:
                 await github.merge_pr(repo, pr_number, sha=sha)
             except Exception as exc:  # noqa: BLE001 - re-raised below unless it is repairable
-                if reconciled or not github.is_merge_conflict(exc):
+                if expected_sha or reconciled or not github.is_merge_conflict(exc):
                     raise
                 log.write(f"[factory] PR #{pr_number} is conflicted; reconciling {branch}")
                 ok, detail = await github.merge_base_into_branch(repo, branch, base, log.write)
@@ -1699,6 +1702,8 @@ async def _fail_run(
     the next issue in the sequence jump the queue.
     """
     number = issue["number"]
+    saved = await db.get_run(run_id)
+    frozen = json.loads(saved["verification_plan"]) if saved and saved.get("verification_plan") else None
     scheduled = False
     if attempt < settings.max_attempts:
         try:
@@ -1712,6 +1717,8 @@ async def _fail_run(
                 # a cycle-1 run, and the review that followed it would have been allowed a
                 # fix cycle the budget had already spent.
                 review_cycle=review_cycle,
+                verification_plan=frozen,
+                verification_source=json.loads(saved.get("verification") or "{}").get("source_run") if saved else None,
             )
             scheduled = True
         except Exception as exc:  # noqa: BLE001 - can't retry -> fall through and halt
@@ -1751,6 +1758,9 @@ async def create(
     prior_error: str | None = None,
     prior_log: str | None = None,
     review_cycle: int = 1,
+    verification_plan: dict | None = None,
+    dispatch_key: str | None = None,
+    verification_source: str | None = None,
 ) -> str:
     """Register a run and schedule it. Returns the run id immediately.
 
@@ -1771,12 +1781,12 @@ async def create(
     its predecessor did not fail. They are stored in separate columns for that reason.
     """
     issue = await github.get_issue(repo, issue_number)
-    run_id = uuid.uuid4().hex
+    run_id = uuid.uuid5(uuid.NAMESPACE_URL, dispatch_key).hex if dispatch_key else uuid.uuid4().hex
     branch = f"factory/issue-{issue_number}"
     log_path = settings.log_dir / f"{run_id}.log"
     log_path.touch()
 
-    await db.create_run(
+    inserted = await db.create_run_once(
         id=run_id,
         repo=repo,
         issue_number=issue_number,
@@ -1788,7 +1798,12 @@ async def create(
         agent=agents.DEFAULT_AGENT,
         log_path=str(log_path),
         created_at=db.utcnow(),
+        verification_plan=json.dumps(verification_plan) if verification_plan is not None else None,
+        verification=json.dumps({"source_run": verification_source}) if verification_source else None,
     )
+
+    if not inserted:
+        return run_id
 
     task = asyncio.create_task(
         _guarded(
@@ -1807,14 +1822,20 @@ async def create_review(
     pr_url: str,
     branch: str,
     cycle: int = 1,
+    verification_plan: dict | None = None,
+    dispatch_key: str | None = None,
 ) -> str:
     """Register and schedule a review of the pull request a build run opened."""
     issue = await github.get_issue(repo, issue_number)
-    run_id = uuid.uuid4().hex
+    if verification_plan is None:
+        base = await github.default_branch(repo)
+        profile = await github.file(repo, PROFILE_PATH, base, strict=True) or DEFAULT_PROJECT_NOTES
+        verification_plan = verification.freeze(profile, issue, settings.max_review_cycles)
+    run_id = uuid.uuid5(uuid.NAMESPACE_URL, dispatch_key).hex if dispatch_key else uuid.uuid4().hex
     log_path = settings.log_dir / f"{run_id}.log"
     log_path.touch()
 
-    await db.create_run(
+    inserted = await db.create_run_once(
         id=run_id,
         repo=repo,
         issue_number=issue_number,
@@ -1830,7 +1851,11 @@ async def create_review(
         pr_url=pr_url,
         log_path=str(log_path),
         created_at=db.utcnow(),
+        verification_plan=json.dumps(verification_plan) if verification_plan is not None else None,
     )
+
+    if not inserted:
+        return run_id
 
     task = asyncio.create_task(
         _guarded_review(run_id, repo, issue, branch, pr_url, cycle)
@@ -1901,12 +1926,16 @@ async def _guarded_review(
         # `_tasks`, and this task is one until `_guarded_review` returns.
         await db.update_run(run_id, status="succeeded", finished_at=db.utcnow())
     except asyncio.CancelledError:
+        from .verification_runner import interrupted
+        await interrupted(run_id, "cancelled")
         log.write("[factory] review cancelled")
         await db.update_run(run_id, status="cancelled", finished_at=db.utcnow())
         raise
     except Exception as exc:  # noqa: BLE001
         # A review that crashes must not merge anything, and must not silently strand the PR
         # either. Leave it open, labelled, for a human.
+        from .verification_runner import interrupted
+        await interrupted(run_id, "review_crashed")
         log.write(f"[factory] review failed: {exc!r}")
         reason = (
             f"timed out after {settings.run_timeout}s"
@@ -1984,7 +2013,18 @@ async def _execute(
     number = issue["number"]
     try:
         base = await github.default_branch(repo)
-        notes = await project_notes(repo, base)
+        saved = await db.get_run(run_id)
+        frozen = json.loads(saved["verification_plan"]) if saved and saved.get("verification_plan") else None
+        if frozen is None:
+            notes = await github.file(repo, PROFILE_PATH, base, strict=True) or DEFAULT_PROJECT_NOTES
+            frozen = verification.freeze(notes, issue, settings.max_review_cycles)
+            await db.update_run(run_id, verification_plan=json.dumps(frozen))
+        elif frozen.get("enabled"):
+            notes = frozen["profile"]
+        else:
+            notes = await project_notes(repo, base)
+        if frozen.get("enabled"):
+            issue = frozen["issue"]
         prompt = build_prompt(
             repo, issue, branch, base, notes, attempt, prior_error, prior_log, review_cycle
         )
@@ -2033,6 +2073,12 @@ async def _execute(
         await boxd.machines.wait_until_ready(machine.id, timeout=180)
         log.write(f"[factory] {machine.name} ready ({machine.id})")
 
+        evidence_source = json.loads(saved.get("verification") or "{}").get("source_run") if saved else None
+        if evidence_source:
+            from .verification_runner import transfer_evidence
+            await transfer_evidence(boxd, machine.id, evidence_source)
+            prompt += "\nVerification evidence (including screenshots) is in /tmp/factory-evidence/. Read receipt.json first."
+
         # ---- run the agent
         await db.update_run(run_id, status="running")
         env = dispatch_env(
@@ -2077,7 +2123,7 @@ async def _execute(
         review_next = False
         if ok:
             criteria = parse_criteria(issue.get("body") or "")
-            review_next = settings.review_enabled and bool(criteria)
+            review_next = frozen.get("enabled") or (settings.review_enabled and bool(criteria))
             merged = False
             if review_next:
                 # Hand the PR to a reviewing agent instead of merging on the builder's word.
@@ -2096,7 +2142,8 @@ async def _execute(
                     )
                 ).merged
             await db.update_run(
-                run_id, status="succeeded", pr_url=pr_url, error=None, finished_at=db.utcnow()
+                run_id, status="running" if review_next else "succeeded", pr_url=pr_url,
+                error=None, finished_at=None if review_next else db.utcnow()
             )
             outcome = f"Factory run finished. Pull request: {pr_url}"
             if merged:
@@ -2129,9 +2176,12 @@ async def _execute(
         # ---- hand off to review, once this run's VM is gone and its slot is free
         if ok and review_next:
             try:
-                await create_review(repo, number, pr_url, branch, cycle=review_cycle)
+                await create_review(repo, number, pr_url, branch, cycle=review_cycle,
+                                    verification_plan=frozen, dispatch_key=f"{run_id}:review")
+                await db.update_run(run_id, status="succeeded", finished_at=db.utcnow())
             except Exception as exc:  # noqa: BLE001 - an unreviewed PR beats a lost one
                 log.write(f"[factory] could not queue review: {exc!r}")
+                raise
     finally:
         # Everything above can raise: `wait_until_ready` times out, the stream drops, the run
         # hits `FACTORY_RUN_TIMEOUT`, a GitHub call fails after the agent finished. Each of
@@ -2158,6 +2208,12 @@ async def _execute_review(
     cycle: int,
 ) -> None:
     """Fork a VM, review the PR against the issue's criteria, then merge it or send it back."""
+    saved = await db.get_run(run_id)
+    frozen = json.loads(saved["verification_plan"]) if saved and saved.get("verification_plan") else None
+    if frozen and frozen.get("enabled"):
+        from .verification_runner import execute
+        await execute(run_id, repo, frozen, branch, pr_url, log, cycle)
+        return
     number = issue["number"]
     base = await github.default_branch(repo)
     criteria = parse_criteria(issue.get("body") or "")
@@ -2610,6 +2666,26 @@ async def reconcile() -> dict:
         names = {m.name for m in machines}
         stranded = []
         for run in active:
+            if run.get("verification_plan") and run["id"] not in _tasks:
+                frozen = json.loads(run["verification_plan"])
+                if frozen.get("enabled"):
+                    from .verification_runner import persist
+                    receipt = json.loads(run.get("verification") or "{}")
+                    decision = {**receipt.get("decision", {}), "action": "escalate",
+                                "reason": "controller_interrupted", "plan_version": frozen["version"]}
+                    await persist(run["id"], frozen, receipt.get("results", []), decision,
+                                  receipt.get("artifacts", []))
+                    await db.update_run(run["id"], status="failed", finished_at=db.utcnow(),
+                                        error="verification blocked: controller_interrupted")
+                    stranded.append(run["id"])
+                    recovery_log = RunLog(settings.log_dir / f"{run['id']}.log")
+                    try:
+                        await _mirror_issue(run["repo"], run["issue_number"], github.LABEL_BLOCKED,
+                                            [github.LABEL_RUNNING, github.LABEL_QUEUED], recovery_log)
+                    finally:
+                        recovery_log.close()
+                    # Do not replay an uncertain merge/dispatch after a process restart.
+                    continue
             if run.get("vm_name") and run["vm_name"] not in names and run["id"] not in _tasks:
                 await db.update_run(
                     run["id"],

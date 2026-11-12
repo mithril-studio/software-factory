@@ -181,6 +181,19 @@ async def api_run(run_id: str):
     return run
 
 
+@app.get("/api/runs/{run_id}/verification/{artifact:path}")
+async def api_verification_artifact(run_id: str, artifact: str):
+    if not await db.get_run(run_id):
+        raise HTTPException(404, "run not found")
+    root = (settings.log_dir / f"{run_id}-verification").resolve()
+    path = (root / artifact).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(404, "artifact not found")
+    # Never execute HTML captured from an app under the factory's origin.
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream",
+                        headers={"X-Content-Type-Options": "nosniff"})
+
+
 @app.get("/api/runs/{run_id}/telemetry")
 async def api_run_telemetry(run_id: str):
     """Per-call detail for one run: token totals, spend by model, tool time."""

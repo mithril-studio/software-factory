@@ -128,7 +128,7 @@ async def find_pr(repo: str, branch: str) -> str | None:
     return data[0]["html_url"] if data else None
 
 
-async def file(repo: str, path: str, ref: str) -> str | None:
+async def file(repo: str, path: str, ref: str, *, strict: bool = False) -> str | None:
     """Fetch one file's raw contents from `repo` at `ref`. None when it is not there.
 
     Used for a repo's `.factory.md` profile, which is why a missing file is an ordinary
@@ -141,6 +141,8 @@ async def file(repo: str, path: str, ref: str) -> str | None:
             params={"ref": ref},
             follow_redirects=True,
         )
+    if strict and resp.status_code != 404:
+        resp.raise_for_status()
     if resp.status_code != 200:
         return None
     return resp.text
