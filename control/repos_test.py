@@ -53,6 +53,8 @@ def seed(*entries):
 
 check("seed: FACTORY_REPOS fills an empty register",
       seed("acme/api", "acme/web"), ("acme/api", "acme/web"))
+for r in repos.watched():
+    run(repos.remove(r))
 check("seed: a repo nobody could parse is skipped rather than watched",
       seed("acme/api", "not a repo", "acme/web"), ("acme/api", "acme/web"))
 run(repos.add("connected/through-the-api"))
@@ -60,6 +62,11 @@ check("seed: a repo connected through the UI survives a restart",
       "connected/through-the-api" in seed("acme/api", "acme/web"))
 check("seed: dropping an entry from FACTORY_REPOS does not unwatch it",
       "acme/web" in seed("acme/api"))
+run(repos.remove("acme/web"))
+check("seed: a repo disconnected through the UI stays disconnected after a restart",
+      "acme/web" in seed("acme/api", "acme/web"), False)
+check("seed: a new FACTORY_REPOS entry is ignored once the register has repos",
+      "late/entry" in seed("acme/api", "late/entry"), False)
 
 # ---------- add, remove, and the cache over them
 before = repos.watched()
