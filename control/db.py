@@ -130,6 +130,8 @@ CREATE INDEX IF NOT EXISTS memory_candidates_status_idx ON memory_candidates (st
 # Additive migrations for databases created before a column existed. Each is tried once at
 # startup and the "duplicate column" error on an already-migrated database is ignored.
 MIGRATIONS = (
+    "ALTER TABLE runs ADD COLUMN verification_plan TEXT",
+    "ALTER TABLE runs ADD COLUMN verification TEXT",
     "ALTER TABLE runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE runs ADD COLUMN agent TEXT",
     "ALTER TABLE runs ADD COLUMN tokens_in INTEGER",
@@ -217,6 +219,18 @@ async def create_run(**fields: Any) -> None:
     async with connect() as conn:
         await conn.execute(f"INSERT INTO runs ({cols}) VALUES ({marks})", tuple(fields.values()))
         await conn.commit()
+
+
+async def create_run_once(**fields: Any) -> bool:
+    """A deterministic child id makes replaying a persisted decision safe."""
+    cols = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    async with connect() as conn:
+        cur = await conn.execute(
+            f"INSERT OR IGNORE INTO runs ({cols}) VALUES ({marks})", tuple(fields.values())
+        )
+        await conn.commit()
+        return cur.rowcount == 1
 
 
 async def update_run(run_id: str, **fields: Any) -> None:
