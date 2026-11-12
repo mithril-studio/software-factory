@@ -240,8 +240,9 @@ same name. The Goldens page lists what the fleet holds and whether each one has 
    success the repo is in the register, its lifecycle labels exist, and the poller picks it up
    on its next tick — **no restart and no `.env` edit.** Disconnecting keeps the repo's runs.
 
-   `FACTORY_REPOS` is the *seed* for that register: entries are added on boot if they are
-   not already there, and removing one does not unwatch the repo.
+   `FACTORY_REPOS` only seeds an empty register, on first boot. Once any repo is in the
+   register, the Projects page owns the list: a disconnected repo stays disconnected across
+   restarts, and a new `FACTORY_REPOS` entry is ignored.
 3. Optionally point its pull requests somewhere other than `FACTORY_TARGET_BRANCH` —
    **Projects → PRs go into**, or `PATCH /api/repos/{owner}/{name} {"base_branch": "develop"}`.
    The first run creates the branch from the default branch if it does not exist. Because

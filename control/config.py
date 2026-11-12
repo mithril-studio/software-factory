@@ -44,7 +44,7 @@ def _github_token() -> str:
 
 
 def _repos() -> tuple[str, ...]:
-    """Parse FACTORY_REPOS into repo names: the seed for the repo register.
+    """Parse FACTORY_REPOS into repo names: the first-boot seed for an empty repo register.
 
     A legacy `owner/repo=agent` entry still parses; the agent half is dropped.
     """

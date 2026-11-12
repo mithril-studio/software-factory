@@ -52,12 +52,18 @@ async def load() -> tuple[str, ...]:
 
 
 async def seed() -> None:
-    """Bring `FACTORY_REPOS` into the register, then load it. Additive and idempotent."""
-    for repo in settings.repos:
-        if not valid(repo):
-            log.warning("FACTORY_REPOS entry %r is not owner/repo; skipped", repo)
-            continue
-        await db.add_repo(repo)
+    """Fill an empty register from `FACTORY_REPOS`, then load it.
+
+    Only an empty one. Once a repo is in the register the Projects page owns the list, and a
+    seed applied on every boot re-added each repo a human had disconnected: two deploys on
+    2026-11-12 put foundation-e-learning and specter-ai back on the watch list.
+    """
+    if not await db.list_repos():
+        for repo in settings.repos:
+            if not valid(repo):
+                log.warning("FACTORY_REPOS entry %r is not owner/repo; skipped", repo)
+                continue
+            await db.add_repo(repo)
     await load()
     log.info("watching %s repo(s): %s", len(_cache), ", ".join(_cache) or "none")
 
