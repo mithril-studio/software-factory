@@ -43,6 +43,14 @@ The passwords above are the app's existing disposable test credentials. The gold
 Docker available for `db_test`. This example is documentation, not an enabled configuration.
 Do not apply it indiscriminately to unrelated issues whose `AC1` describes another behavior.
 
-First run a correct baseline, then a branch that deliberately awards 0 points, then the
+First run a correct baseline, then a branch that deliberately awards 5 instead of 10 points, then the
 fixed commit. Confirm the evidence shows the expected behavior, count false or inconclusive
 results across repeated runs, and only then switch E2E to required for a new pilot run.
+
+Use 5 rather than 0: the database requires positive point awards, so 0 would introduce a
+database error as well as the intended incorrect reward.
+
+The [isolated v0.1.0 pilot](https://github.com/mithril-studio/e2e-agent-harness/blob/main/docs/pilots/2026-11-12.md)
+passed the baseline, caught that reward fault, and passed after reverting it. The real worker
+ran in disposable VMs; required/advisory decisions were replayed offline. A queued factory
+issue is still the next rollout check.
