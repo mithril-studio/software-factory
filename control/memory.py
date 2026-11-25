@@ -1,6 +1,6 @@
 """A deterministic validator for `.mem/`, the repository memory store.
 
-The memory skill (`memory-skills/memory/SKILL.md` in mithril-studio/agent-skills, installed
+The memory skill (`engineering-skills/memory/SKILL.md` in mithril-studio/agent-skills, installed
 into every golden) describes a schema by convention: one
 short line per record in `.mem/index.jsonl`, the full record in `.mem/domains/<domain>.jsonl`,
 and retired records moved wholesale into `.mem/archive/<domain>.jsonl`. Nothing enforces that
