@@ -9,11 +9,9 @@ Skills the agent uses live in a separate repo,
 **into the VM**, not onto the server — the agent's code, not the factory's — so they are
 installed when a golden is built rather than deployed with the control plane.
 
-The skill that *fills* this repo's queue lives there too: **`factory-compose`** turns a brief
-into the ordered backlog the factory builds. It is the one skill that runs outside a VM —
-on a laptop, or on the `planner` box over SSH — so it is installed like any other skill
-rather than shipped with a golden. It is not vendored here; there is one copy, in
-agent-skills, because two would drift.
+The queue is filled by hand: write each issue from [ISSUE_TEMPLATE.md](ISSUE_TEMPLATE.md) and
+label it `agent:queued` when it is ready. The `factory-compose` skill that used to draft a
+backlog from a brief is no longer in agent-skills, and nothing here depends on it.
 
 ## Quickstart
 
@@ -363,7 +361,7 @@ The exhaustive list is `control/app.py`.
 | `factory-health.sh` | External monitor; runs from a GitHub Actions cron every 10 minutes and manages an alert issue. |
 | `provision-boxd.sh` | Build the control-plane machine from nothing: deploy key, checkout, build, `.env`, a minted boxd key, systemd, the proxy, backups. |
 | `factory-secrets.sh` | Hand the control plane its GitHub and agent credentials, hidden, straight into its `.env`. |
-| `planner-setup.sh` | Provision the `planner` box that runs `factory-compose`. |
+| `planner-setup.sh` | Provision the `planner` box: read-only clones and an issue-writing token. |
 
 ## The UI
 
