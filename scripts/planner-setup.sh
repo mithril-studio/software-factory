@@ -67,5 +67,5 @@ else
   echo "    FAIL: cannot read issues — the token is missing the Issues permission."; exit 1
 fi
 echo
-echo "==> done. Issue-write is proven the first time factory-compose creates one;"
+echo "==> done. Issue-write is proven the first time the planner creates one;"
 echo "    create_backlog.sh checks write access itself and fails early if it is missing."
